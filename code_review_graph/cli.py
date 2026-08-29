@@ -64,6 +64,25 @@ class _EmbeddingRefreshKwargs(TypedDict, total=False):
     embedding_model: str
 
 
+def _print_erlang_integration_status(result: dict) -> None:
+    """Print optional Erlang lifecycle status and bounded diagnostics."""
+    integration = result.get("erlang_integration")
+    if not isinstance(integration, dict):
+        return
+    status = integration.get("status")
+    if status:
+        print(f"Erlang integration: {status}")
+    diagnostics = integration.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        code = diagnostic.get("code", "unknown")
+        message = diagnostic.get("message", "")
+        print(f"Erlang diagnostic [{code}]: {message}")
+
+
 def _get_version() -> str:
     """Get the installed package version.
 
@@ -1635,6 +1654,7 @@ def main() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
+            _print_erlang_integration_status(result)
         finally:
             store.close()
         return
@@ -1781,6 +1801,7 @@ def main() -> None:
                 )
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
+                _print_erlang_integration_status(result)
 
         elif args.command == "update":
             pp = (
@@ -1826,6 +1847,7 @@ def main() -> None:
                         f"{nodes} nodes, {edges} edges"
                         f" (postprocess={pp})"
                     )
+                _print_erlang_integration_status(result)
 
             # --brief: append a one-line change-impact summary with the same
             # estimated context-savings approximation that detect-changes uses.

@@ -1654,6 +1654,186 @@ class TestBuildPostprocess:
         )
         assert capsys.readouterr().out == ""
 
+    @staticmethod
+    def _degraded_erlang_result():
+        return {
+            "status": "degraded",
+            "diagnostics": [{"code": "elp_unavailable", "message": "missing"}],
+            "counts": {"queries": 0, "diagnostics": 1},
+        }
+
+    def test_build_propagates_degraded_erlang_status_and_diagnostics(self, monkeypatch):
+        import code_review_graph.tools.build as build_module
+
+        store = MagicMock()
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "_invoke_full_build",
+            lambda _root, _store, _config: {
+                "files_parsed": 1,
+                "total_nodes": 1,
+                "total_edges": 0,
+                "errors": [],
+                "erlang_integration": self._degraded_erlang_result(),
+            },
+        )
+        monkeypatch.setattr(build_module, "_run_postprocess", lambda *_args, **_kwargs: [])
+
+        result = build_module.build_or_update_graph(
+            full_rebuild=True, repo_root=str(self.root), postprocess="none"
+        )
+
+        assert result["status"] == "degraded"
+        assert result["diagnostics"][0]["code"] == "elp_unavailable"
+
+    def test_incremental_noop_and_update_propagate_degraded_erlang_status(
+        self, monkeypatch
+    ):
+        import code_review_graph.tools.build as build_module
+
+        store = MagicMock()
+        store.has_nodes.return_value = True
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "resolve_incremental_base",
+            lambda _root, _store: "HEAD~1",
+        )
+        monkeypatch.setattr(build_module, "_run_postprocess", lambda *_args, **_kwargs: [])
+
+        degraded = self._degraded_erlang_result()
+        monkeypatch.setattr(
+            build_module,
+            "incremental_update",
+            lambda *_args, **_kwargs: {
+                "files_updated": 0,
+                "total_nodes": 0,
+                "total_edges": 0,
+                "changed_files": [],
+                "dependent_files": [],
+                "erlang_integration": degraded,
+            },
+        )
+        no_op = build_module.build_or_update_graph(
+            full_rebuild=False, repo_root=str(self.root), postprocess="none"
+        )
+        assert no_op["status"] == "degraded"
+        assert no_op["diagnostics"][0]["code"] == "elp_unavailable"
+
+        monkeypatch.setattr(
+            build_module,
+            "incremental_update",
+            lambda *_args, **_kwargs: {
+                "files_updated": 1,
+                "total_nodes": 1,
+                "total_edges": 0,
+                "changed_files": ["sample.py"],
+                "dependent_files": [],
+                "erlang_integration": degraded,
+            },
+        )
+        updated = build_module.build_or_update_graph(
+            full_rebuild=False, repo_root=str(self.root), postprocess="none"
+        )
+        assert updated["status"] == "degraded"
+        assert updated["diagnostics"][0]["code"] == "elp_unavailable"
+
+    def test_standalone_postprocess_propagates_degraded_erlang_status(
+        self, monkeypatch
+    ):
+        import code_review_graph.tools.build as build_module
+
+        db_path = self.root / "standalone.db"
+        store = GraphStore(db_path)
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "_ensure_erlang_identity_current",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            build_module,
+            "_run_erlang_lifecycle",
+            lambda *_args, **_kwargs: self._degraded_erlang_result(),
+        )
+
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "degraded"
+        assert result["diagnostics"][0]["code"] == "elp_unavailable"
+
+    def test_standalone_identity_rebuild_preserves_generic_parse_error(
+        self, monkeypatch
+    ):
+        """A non-Erlang parse error is reported without a false migration error."""
+        import code_review_graph.tools.build as build_module
+
+        store = MagicMock()
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "_ensure_erlang_identity_current",
+            lambda *_args, **_kwargs: {
+                "files_parsed": 1,
+                "total_nodes": 1,
+                "total_edges": 0,
+                "errors": [{"file": "broken.py", "error": "syntax"}],
+            },
+        )
+
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "ok"
+        assert result["errors"][0]["file"] == "broken.py"
+        assert any(
+            "broken.py: syntax" in warning for warning in result["warnings"]
+        )
+        assert not any(
+            "Erlang identity rebuild failed" in warning
+            for warning in result["warnings"]
+        )
+
+    def test_standalone_identity_rebuild_keeps_erlang_marker_pending(
+        self, monkeypatch
+    ):
+        """An Erlang parse error degrades the result and remains retryable."""
+        import code_review_graph.tools.build as build_module
+
+        store = MagicMock()
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "_ensure_erlang_identity_current",
+            lambda *_args, **_kwargs: {
+                "files_parsed": 1,
+                "total_nodes": 1,
+                "total_edges": 0,
+                "errors": [{"file": "src/broken.erl", "error": "syntax"}],
+            },
+        )
+
+        result = build_module.run_postprocess(
+            flows=False,
+            communities=False,
+            fts=False,
+            repo_root=str(self.root),
+        )
+
+        assert result["status"] == "degraded"
+        assert result["errors"][0]["file"] == "src/broken.erl"
+        assert any("remains pending" in warning for warning in result["warnings"])
+
 
 class TestBuildPostprocessResolvesBareEndpoints:
     """Every explicit build/postprocess path applies safe endpoint resolution."""

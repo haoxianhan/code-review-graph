@@ -5,9 +5,17 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from ..incremental import (
+    _ERLANG_CONFIG_UNSET,
+    _clear_erlang_identity,
+    _ensure_erlang_identity_current,
+    _erlang_result_requires_derived_refresh,
+    _invoke_full_build,
+    _result_has_erlang_errors,
+    _run_erlang_lifecycle,
     full_build,
     incremental_update,
     resolve_incremental_base,
@@ -15,6 +23,31 @@ from ..incremental import (
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
+
+
+def _propagate_erlang_result_status(result: dict[str, Any]) -> dict[str, Any]:
+    """Expose optional Erlang failures at the lifecycle result boundary.
+
+    Generic indexing remains usable when an adapter is unavailable, but a
+    caller must not mistake that degraded result for a clean build.  Disabled
+    and skipped integration are intentional non-failure states.
+    """
+    integration = result.get("erlang_integration")
+    if not isinstance(integration, Mapping):
+        return result
+
+    status = integration.get("status")
+    if status not in {"ok", "disabled", "skipped"}:
+        result["status"] = "degraded"
+
+    diagnostics = integration.get("diagnostics")
+    if isinstance(diagnostics, list) and diagnostics:
+        existing = result.get("diagnostics")
+        if isinstance(existing, list):
+            existing.extend(diagnostics)
+        elif existing is None:
+            result["diagnostics"] = list(diagnostics)
+    return result
 
 
 def _run_embedding_refresh(
@@ -470,6 +503,7 @@ def build_or_update_graph(
     recurse_submodules: bool | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> dict[str, Any]:
     """Build or incrementally update the code knowledge graph.
 
@@ -516,7 +550,19 @@ def build_or_update_graph(
                 full_rebuild = True
 
         if full_rebuild:
-            result = full_build(root, store, recurse_submodules)
+            if recurse_submodules is None:
+                result = _invoke_full_build(root, store, erlang_config)
+            elif erlang_config is _ERLANG_CONFIG_UNSET:
+                # Preserve the historical positional call shape for callers
+                # that explicitly select submodule recursion.
+                result = full_build(root, store, recurse_submodules)
+            else:
+                result = full_build(
+                    root,
+                    store,
+                    recurse_submodules,
+                    erlang_config=erlang_config,
+                )
             build_result = {
                 **result,
                 "status": "ok",
@@ -529,16 +575,29 @@ def build_or_update_graph(
                 ),
             }
         else:
-            result = incremental_update(root, store, base=base_resolved)
-            if result["files_updated"] == 0:
-                return {
+            result = incremental_update(
+                root,
+                store,
+                base=base_resolved,
+                erlang_config=erlang_config,
+            )
+            # A layout-only Erlang change can refresh semantic evidence and
+            # projected edges without re-parsing a source file.  Keep the
+            # normal no-op fast path for ordinary updates, but run the
+            # requested derived stages when the lifecycle bridge did work.
+            if (
+                result["files_updated"] == 0
+                and not result.get("identity_rebuild")
+                and not _erlang_result_requires_derived_refresh(result)
+            ):
+                return _propagate_erlang_result_status({
                     **result,
                     "status": "ok",
                     "build_type": "incremental",
                     "base_resolved": base_resolved,
                     "summary": "No changes detected. Graph is up to date.",
                     "postprocess_level": postprocess,
-                }
+                })
             build_result = {
                 **result,
                 "status": "ok",
@@ -566,7 +625,7 @@ def build_or_update_graph(
         )
         if warnings:
             build_result["warnings"] = warnings
-        return build_result
+        return _propagate_erlang_result_status(build_result)
     finally:
         store.close()
 
@@ -578,6 +637,7 @@ def run_postprocess(
     repo_root: str | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> dict[str, Any]:
     """Run post-processing steps on an existing graph.
 
@@ -594,6 +654,8 @@ def run_postprocess(
             supplied with ``embedding_model``. Default: disabled.
         embedding_model: Exact model for an explicit refresh. Must be supplied
             with ``embedding_provider``. Default: disabled.
+        erlang_config: Optional Erlang integration configuration. Omitted
+            configuration uses ``CRG_ERLANG_*`` opt-in settings.
 
     Returns:
         Summary of what was computed.
@@ -603,6 +665,63 @@ def run_postprocess(
     warnings: list[str] = []
 
     try:
+        # Standalone postprocess is an independent lifecycle boundary.  A
+        # legacy/missing identity marker must be migrated first; full_build
+        # already runs the optional bridge, so do not invoke it a second time
+        # in the same call (exactly-once reconciliation).
+        rebuilt = _ensure_erlang_identity_current(
+            _root,
+            store,
+            erlang_config=erlang_config,
+        )
+        if rebuilt is not None:
+            result["identity_rebuild"] = True
+            # Preserve the full-build summary under the standalone lifecycle
+            # contract.  In particular, parse errors must remain attributable
+            # to their original file instead of being relabelled as an Erlang
+            # migration failure.
+            for key in ("files_parsed", "total_nodes", "total_edges", "errors"):
+                if key in rebuilt:
+                    result[key] = rebuilt[key]
+            if rebuilt.get("erlang_integration") is not None:
+                result["erlang_integration"] = rebuilt["erlang_integration"]
+            rebuild_errors = rebuilt.get("errors") or []
+            if rebuild_errors:
+                details = "; ".join(
+                    f"{error.get('file', 'unknown')}: "
+                    f"{error.get('error', 'unknown error')}"
+                    for error in rebuild_errors
+                    if isinstance(error, dict)
+                ) or "unknown error"
+                warnings.append(
+                    "Identity rebuild reported parse errors: " + details
+                )
+                if _result_has_erlang_errors(rebuilt):
+                    # Keep the marker pending so the next invocation retries,
+                    # while still returning a usable Generic graph and the
+                    # original structured errors to the caller.
+                    result["status"] = "degraded"
+                    warnings.append(
+                        "Erlang identity remains pending because one or more "
+                        "Erlang files could not be parsed."
+                    )
+        else:
+            try:
+                erlang_result = _run_erlang_lifecycle(
+                    _root,
+                    store,
+                    config=erlang_config,
+                    changed_files=(),
+                    force=True,
+                )
+            except BaseException:
+                # Optional lifecycle interruption can leave projections
+                # half-reconciled.  Make the next standalone call retryable.
+                _clear_erlang_identity(store)
+                raise
+            if erlang_result is not None:
+                result["erlang_integration"] = erlang_result
+
         try:
             resolved = store.resolve_bare_call_targets()
             resolved += store.resolve_bare_tested_by_sources()
@@ -697,6 +816,6 @@ def run_postprocess(
         result["summary"] = "Post-processing complete."
         if warnings:
             result["warnings"] = warnings
-        return result
+        return _propagate_erlang_result_status(result)
     finally:
         store.close()

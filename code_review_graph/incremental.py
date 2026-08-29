@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Mapping, NamedTuple, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -77,6 +77,474 @@ logger = logging.getLogger(__name__)
 
 CPP_IDENTITY_VERSION = "1"
 _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
+
+# Erlang node identities changed when the Generic parser started persisting
+# module/export metadata.  Keep this marker independent from the optional
+# ELP/xref/Dialyzer bridge: a toolchain outage must not make a sound Generic
+# graph look unmigrated forever.
+ERLANG_IDENTITY_VERSION = "5"
+_ERLANG_IDENTITY_METADATA_KEY = "erlang_identity_version"
+_ERLANG_IDENTITY_METADATA_PREFIX = f"{_ERLANG_IDENTITY_METADATA_KEY}:"
+_ERLANG_IDENTITY_DIGEST_LENGTH = 32
+_ERLANG_SOURCE_SUFFIXES = (".erl", ".hrl", ".app.src")
+
+# Lifecycle callers opt into the optional Erlang bridge explicitly or through
+# CRG_ERLANG_* environment variables.  A sentinel keeps an omitted argument
+# distinct from ``ErlangIntegrationConfig(enabled=False)``, which is an
+# intentional cleanup request.
+_ERLANG_CONFIG_UNSET = object()
+_WATCH_POSTPROCESS_PENDING_METADATA_KEY = "watch_postprocess_pending"
+_WATCH_PENDING_LEGACY_WILDCARD = "*"
+_ERLANG_LAYOUT_BASENAMES = frozenset(
+    {
+        "rebar.config",
+        "rebar.config.script",
+        "erlang_ls.config",
+        "rebar.lock",
+    }
+)
+
+
+def _is_erlang_layout_path(path: str | Path) -> bool:
+    """Return whether *path* can change Erlang semantic project layout."""
+    value = str(path).replace("\\", "/")
+    basename = value.rsplit("/", 1)[-1].casefold()
+    return basename in _ERLANG_LAYOUT_BASENAMES or basename.endswith(".app.src")
+
+
+def _is_erlang_source_path(path: str | Path) -> bool:
+    """Return whether *path* participates in Generic Erlang identity."""
+    value = str(path).replace("\\", "/").casefold()
+    return value.endswith(_ERLANG_SOURCE_SUFFIXES)
+
+
+def _is_erlang_relevant_path(path: str | Path) -> bool:
+    value = str(path).replace("\\", "/").casefold()
+    return _is_erlang_source_path(value) or _is_erlang_layout_path(value)
+
+
+def _erlang_identity_key(repo_root: Path) -> str:
+    """Return the metadata key for one canonical repository root."""
+    canonical = Path(repo_root).expanduser().resolve(strict=False)
+    identity = normalize_file_path(canonical)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{_ERLANG_IDENTITY_METADATA_PREFIX}{digest[:_ERLANG_IDENTITY_DIGEST_LENGTH]}"
+
+
+def _path_belongs_to_root(path: str | Path, repo_root: Path) -> bool:
+    """Return whether a stored graph path can belong to *repo_root*.
+
+    Graph paths are normally absolute and separator-normalized.  Relative
+    paths are legacy rows and are interpreted in the requested checkout, but
+    traversal components are rejected so a foreign ``../`` row cannot pass
+    the ownership check.
+    """
+    value = normalize_file_path(path)
+    if not value:
+        return False
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    root_value = normalize_file_path(root).rstrip("/")
+    # Keep Windows drive paths comparable when the graph was produced on a
+    # different host than the one reading it.
+    if re.match(r"^[A-Za-z]:/", value):
+        folded = value.casefold()
+        expected = root_value.casefold()
+        return folded == expected or folded.startswith(expected + "/")
+    candidate = Path(value)
+    if candidate.is_absolute():
+        try:
+            candidate.resolve(strict=False).relative_to(root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+    parts = PurePosixPath(value).parts
+    return ".." not in parts
+
+
+def _graph_has_foreign_roots(store: GraphStore, repo_root: Path) -> bool:
+    """Return whether authoritative File markers name another checkout."""
+    try:
+        return any(
+            not _path_belongs_to_root(path, repo_root)
+            for path in store.get_file_marker_paths()
+        )
+    except Exception as exc:  # pragma: no cover - defensive metadata boundary
+        logger.debug("Could not inspect graph repository markers: %s", exc)
+        return True
+
+
+def _erlang_identity_is_current(store: GraphStore, repo_root: Path) -> bool:
+    """Check a scoped marker, upgrading a trustworthy legacy scalar marker."""
+    if store.get_metadata(_erlang_identity_key(repo_root)) == ERLANG_IDENTITY_VERSION:
+        return True
+    # ``erlang_identity_version`` predates shared GraphStores.  It is safe to
+    # promote only when every authoritative File marker belongs to this root;
+    # otherwise another checkout may have written the same scalar value.
+    if (
+        store.get_metadata(_ERLANG_IDENTITY_METADATA_KEY) == ERLANG_IDENTITY_VERSION
+        and not _graph_has_foreign_roots(store, repo_root)
+    ):
+        _set_erlang_identity_current(store, repo_root)
+        return True
+    return False
+
+
+def _clear_erlang_identity(
+    store: GraphStore,
+    repo_root: Path | None = None,
+) -> None:
+    """Persist a pending Erlang migration marker.
+
+    Full and incremental parsing commit file replacements independently.  A
+    direct ``DELETE`` without a commit would let a later transaction restore a
+    stale marker after an interrupted update, so marker cleanup is committed at
+    the lifecycle boundary just like :meth:`GraphStore.set_metadata`.
+    """
+    if repo_root is None:
+        # Compatibility for external callers that used the old helper without
+        # a root.  Lifecycle code always supplies a root and therefore leaves
+        # other repositories' scoped markers untouched.
+        store._conn.execute(
+            "DELETE FROM metadata WHERE key = ? OR key LIKE ?",
+            (_ERLANG_IDENTITY_METADATA_KEY, f"{_ERLANG_IDENTITY_METADATA_PREFIX}%"),
+        )
+    else:
+        key = _erlang_identity_key(repo_root)
+        store._conn.execute(
+            "DELETE FROM metadata WHERE key = ?",
+            (key,),
+        )
+        # A scalar marker cannot express repository ownership.  Once a scoped
+        # lifecycle pass touches the store, remove it so a later checkout can
+        # never mistake another repository's value for its own.
+        store._conn.execute(
+            "DELETE FROM metadata WHERE key = ?",
+            (_ERLANG_IDENTITY_METADATA_KEY,),
+        )
+    store._conn.commit()
+
+
+def _set_erlang_identity_current(
+    store: GraphStore,
+    repo_root: Path | None = None,
+) -> None:
+    """Persist the current Generic Erlang identity version."""
+    if repo_root is None:
+        store.set_metadata(_ERLANG_IDENTITY_METADATA_KEY, ERLANG_IDENTITY_VERSION)
+        return
+    store.set_metadata(_erlang_identity_key(repo_root), ERLANG_IDENTITY_VERSION)
+    # Do not write the ambiguous legacy scalar.  It remains readable for one
+    # migration pass, but all new state is repository-scoped.
+    store._conn.execute(
+        "DELETE FROM metadata WHERE key = ?",
+        (_ERLANG_IDENTITY_METADATA_KEY,),
+    )
+    store._conn.commit()
+
+
+def _invoke_full_build(
+    repo_root: Path,
+    store: GraphStore,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
+) -> dict[str, Any]:
+    """Call :func:`full_build` while preserving legacy omitted arguments.
+
+    The helper is used by identity migrations as well as the public build
+    wrapper.  Keep the no-option path as ``full_build(root, store)`` because
+    callers and tests commonly patch that shape; add optional arguments only
+    when the caller explicitly supplied them.
+    """
+    if erlang_config is _ERLANG_CONFIG_UNSET:
+        return full_build(repo_root, store)
+    return full_build(repo_root, store, erlang_config=erlang_config)
+
+
+def _error_is_erlang_related(error: Any) -> bool:
+    """Classify a build error that invalidates Erlang identity metadata."""
+    if not isinstance(error, Mapping):
+        return False
+    path = str(error.get("file", "")).replace("\\", "/").casefold()
+    return (
+        _is_erlang_source_path(path)
+        or "erlang" in path
+        or "relation_reconciliation" in path
+    )
+
+
+def _result_has_erlang_errors(result: Mapping[str, Any] | None) -> bool:
+    """Return whether a full-build result contains a fatal Erlang parse error."""
+    if not isinstance(result, Mapping):
+        return False
+    errors = result.get("errors", ())
+    if not isinstance(errors, (list, tuple)):
+        return False
+    return any(_error_is_erlang_related(error) for error in errors)
+
+
+def _identity_rebuild_result(
+    rebuilt: Mapping[str, Any],
+    changed_files: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Adapt a full-build result to the incremental result contract."""
+    result: dict[str, Any] = {
+        "files_updated": int(rebuilt.get("files_parsed", 0) or 0),
+        "total_nodes": rebuilt.get("total_nodes", 0),
+        "total_edges": rebuilt.get("total_edges", 0),
+        "changed_files": list(changed_files or ()),
+        "dependent_files": [],
+        "errors": list(rebuilt.get("errors", ()) or ()),
+        "identity_rebuild": True,
+        "graph_changed": True,
+        "relation_layout_changed": False,
+    }
+    for key in (
+        "python_resolution",
+        "rescript_resolution",
+        "spring_resolution",
+        "event_resolution",
+        "temporal_resolution",
+        "hcl_resolution",
+        "scoped_resolution",
+        "erlang_integration",
+    ):
+        if key in rebuilt:
+            result[key] = rebuilt[key]
+    return result
+
+
+def _repo_contains_erlang_sources(repo_root: Path) -> bool:
+    """Probe the authoritative parse inventory for Erlang source files.
+
+    ``collect_all_files`` applies VCS and ignore rules used by a real full
+    build.  This avoids triggering migration for an ignored or merely
+    untracked ``.erl`` file while still recognizing legacy custom-language
+    graph rows by their path suffix.
+    """
+    try:
+        return any(
+            _is_erlang_source_path(path)
+            for path in collect_all_files(_canonical_repo_root(repo_root))
+        )
+    except Exception as exc:  # pragma: no cover - defensive inventory boundary
+        logger.debug("Could not probe Erlang source inventory: %s", exc)
+        return False
+
+
+def _ensure_erlang_identity_current(
+    repo_root: Path,
+    store: GraphStore,
+    *,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
+) -> dict[str, Any] | None:
+    """Rebuild a stale Erlang graph before an independent lifecycle pass.
+
+    The marker is intentionally checked against the exact current version;
+    missing, malformed, and every older value (including native v1/v4
+    databases) are migration candidates.  A repository source inventory is
+    required so a Python-only graph does not trigger an expensive rebuild.
+    """
+    root = _canonical_repo_root(repo_root)
+    if _erlang_identity_is_current(store, root):
+        return None
+    if not store.has_nodes() or not _repo_contains_erlang_sources(root):
+        return None
+
+    logger.info("Erlang graph identity is stale; rebuilding before postprocessing")
+    # Clear before entering the file replacement loop.  If parsing or an
+    # optional lifecycle callback is interrupted, the next invocation retries.
+    _clear_erlang_identity(store, root)
+    try:
+        rebuilt = _invoke_full_build(root, store, erlang_config)
+    except BaseException:
+        _clear_erlang_identity(store, root)
+        raise
+
+    if _result_has_erlang_errors(rebuilt):
+        _clear_erlang_identity(store, root)
+    else:
+        # Real full_build writes this marker itself.  Reassert it here as a
+        # boundary guarantee for custom/mocked builders and future callers.
+        _set_erlang_identity_current(store, root)
+    return rebuilt
+
+
+def _append_untracked_erlang_layout_files(
+    repo_root: Path,
+    changed_files: list[str],
+) -> list[str]:
+    """Add untracked Erlang layout files to automatic incremental changes.
+
+    ``git diff <base>`` intentionally omits untracked paths.  A newly-created
+    ``rebar.config`` or ``*.app.src`` can nevertheless change semantic
+    resolution, so include those paths when the caller did not provide an
+    explicit change list.  Source files keep the historical Git-diff behavior;
+    watch mode and a full build remain the mechanisms for discovering them.
+    """
+    if detect_vcs(repo_root) != "git":
+        return changed_files
+    try:
+        working_tree = get_staged_and_unstaged(repo_root)
+    except Exception as exc:  # pragma: no cover - defensive VCS boundary
+        logger.debug("Could not inspect working-tree Erlang layout: %s", exc)
+        return changed_files
+    seen = {str(path).replace("\\", "/") for path in changed_files}
+    for path in working_tree:
+        normalized = str(path).replace("\\", "/")
+        if not _is_erlang_layout_path(normalized) or normalized in seen:
+            continue
+        changed_files.append(path)
+        seen.add(normalized)
+    return changed_files
+
+
+def _run_erlang_lifecycle(
+    repo_root: Path,
+    store: GraphStore,
+    *,
+    config: Any = _ERLANG_CONFIG_UNSET,
+    changed_files: list[str] | tuple[str, ...] | None = None,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Run one optional Erlang integration pass for a lifecycle boundary."""
+    from .erlang_integration import (
+        erlang_integration_requested,
+        maybe_run_erlang_integration,
+    )
+
+    effective_config = None if config is _ERLANG_CONFIG_UNSET else config
+    if not erlang_integration_requested(effective_config):
+        return None
+    paths = [str(path) for path in (changed_files or ())]
+    if not force and not any(_is_erlang_relevant_path(path) for path in paths):
+        # An explicit disabled setting is a cleanup request, even when the
+        # current change is unrelated (or the update is otherwise a no-op).
+        # Enabled settings still avoid tool discovery until a relevant Erlang
+        # path is changed.
+        try:
+            from .erlang_integration import ErlangIntegrationConfig
+
+            explicitly_disabled = not ErlangIntegrationConfig.from_value(
+                effective_config
+            ).enabled
+        except Exception:
+            explicitly_disabled = False
+        if not explicitly_disabled:
+            return None
+    result = maybe_run_erlang_integration(
+        repo_root,
+        store,
+        config=effective_config,
+        changed_files=paths,
+    )
+    return result.to_dict() if result is not None else None
+
+
+def _erlang_result_requires_derived_refresh(result: Mapping[str, Any] | None) -> bool:
+    """Return whether semantic reconciliation changed graph-derived state."""
+    if not isinstance(result, Mapping):
+        return False
+    integration = result.get("erlang_integration")
+    if not isinstance(integration, Mapping):
+        return False
+    counts = integration.get("counts")
+    if not isinstance(counts, Mapping):
+        return False
+    # Query, diagnostic, and cache counters alone do not alter derived graph
+    # tables. Evidence/projection reconciliation and cleanup do.
+    for key in (
+        "evidence",
+        "persisted_evidence",
+        "persisted_diagnostics",
+        "persisted_runs",
+        "projected_edges",
+        "cleared_edges",
+        "cleared_evidence",
+        "cleared_diagnostics",
+        "cleared_runs",
+        "stale_removed",
+    ):
+        try:
+            if int(counts.get(key, 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return False
+
+
+def _watch_repository_identity(repo_root: Path) -> str:
+    """Return the canonical, separator-stable identity used by watch state."""
+    return normalize_file_path(_canonical_repo_root(repo_root))
+
+
+def _watch_pending_repositories(store: GraphStore) -> set[str]:
+    """Read roots whose derived post-processing still needs a retry.
+
+    The value is intentionally a small JSON object rather than a process-local
+    flag: daemon restarts can then recover a failed callback.  Accept a plain
+    string/list as a defensive migration path for early development builds.
+    """
+    raw = store.get_metadata(_WATCH_POSTPROCESS_PENDING_METADATA_KEY)
+    if not raw:
+        return set()
+    try:
+        payload: Any = json.loads(raw)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        payload = raw
+    if isinstance(payload, Mapping):
+        values = payload.get("roots", ())
+    elif isinstance(payload, (list, tuple, set, frozenset)):
+        values = payload
+    else:
+        values = (payload,)
+    roots = {
+        str(value).replace("\\", "/")
+        for value in values
+        if isinstance(value, str) and value
+    }
+    # Early watch builds persisted a process-independent boolean ``"1"``.
+    # It had no repository identity, so treat it as a conservative wildcard
+    # for the current lifecycle pass instead of silently losing the retry.
+    if payload == 1 or payload is True or (isinstance(payload, str) and payload.strip() == "1"):
+        roots.add(_WATCH_PENDING_LEGACY_WILDCARD)
+    return roots
+
+
+def _set_watch_postprocess_pending(
+    store: GraphStore,
+    repo_root: Path,
+    pending: bool,
+) -> None:
+    """Mark or clear a repository's derived post-processing retry state."""
+    identity = _watch_repository_identity(repo_root)
+    roots = _watch_pending_repositories(store)
+    if pending:
+        roots.add(identity)
+    else:
+        roots.discard(identity)
+        roots.discard(_WATCH_PENDING_LEGACY_WILDCARD)
+    if roots:
+        store.set_metadata(
+            _WATCH_POSTPROCESS_PENDING_METADATA_KEY,
+            json.dumps({"roots": sorted(roots)}, separators=(",", ":")),
+        )
+        return
+    # Keep the metadata table free of an empty marker.  GraphStore does not
+    # expose a delete_metadata method, so use its already-open transaction
+    # connection for this tiny lifecycle row.
+    store._conn.execute(
+        "DELETE FROM metadata WHERE key = ?",
+        (_WATCH_POSTPROCESS_PENDING_METADATA_KEY,),
+    )
+    store._conn.commit()
+
+
+def _watch_postprocess_pending(store: GraphStore, repo_root: Path) -> bool:
+    """Return whether *repo_root* has a callback that must be retried."""
+    roots = _watch_pending_repositories(store)
+    return (
+        _WATCH_PENDING_LEGACY_WILDCARD in roots
+        or _watch_repository_identity(repo_root) in roots
+    )
 
 
 def _run_python_resolver(store: GraphStore) -> Optional[dict]:
@@ -1078,8 +1546,38 @@ def _reconcile_stale_files(
     store: GraphStore,
     current_files: list[str] | None = None,
 ) -> list[str]:
-    """Remove graph files absent from the current parseable repository inventory."""
-    stored_files = set(store.get_all_files())
+    """Remove current-root files absent from the parseable inventory.
+
+    A GraphStore can intentionally be shared by more than one checkout.  In
+    that case a repository-wide ``get_all_files() - current_files`` diff would
+    mistake the other checkout for stale data and delete it.  File markers are
+    the authoritative ownership signal: when any marker is foreign, scope
+    cleanup to paths under the requested root and leave all foreign rows alone.
+    With no foreign marker we retain the historical orphan purge, including
+    edge-only rows whose ownership cannot be recovered.
+    """
+    all_stored_files = set(store.get_all_files())
+    marker_paths = store.get_file_marker_paths()
+    root_prefix = normalize_file_path(repo_root).rstrip("/") + "/"
+
+    def belongs_to_root(path: str) -> bool:
+        normalized = normalize_file_path(path)
+        if normalized.startswith(root_prefix):
+            return True
+        # Relative rows occur in legacy databases and are interpreted in the
+        # context of the requested checkout.  This also preserves the prior
+        # Windows-path behavior where a drive-qualified spelling is normalized
+        # textually rather than by the host OS Path implementation.
+        if not Path(normalized).is_absolute() and ":/" not in normalized:
+            return True
+        return False
+
+    foreign_markers = [path for path in marker_paths if not belongs_to_root(path)]
+    stored_files = (
+        {path for path in all_stored_files if belongs_to_root(path)}
+        if foreign_markers
+        else all_stored_files
+    )
     current_paths: set[str]
     if current_files is not None:
         current_paths = {
@@ -1131,6 +1629,22 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
         "repository root. Rebuild it, or retry with the root it was built "
         "with, instead of reconciling every file away."
     )
+
+
+def _assert_changed_files_belong_to_root(
+    repo_root: Path, changed_files: list[str] | tuple[str, ...]
+) -> None:
+    """Reject explicit incremental inputs outside the requested checkout."""
+    foreign = [
+        str(path)
+        for path in changed_files
+        if str(path).strip() and not _path_belongs_to_root(path, repo_root)
+    ]
+    if foreign:
+        raise ValueError(
+            f"changed_files contains a path outside repository root "
+            f"{repo_root!s}: {foreign[0]!r}"
+        )
 
 
 _MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
@@ -1278,6 +1792,8 @@ def full_build(
     repo_root: Path,
     store: GraphStore,
     recurse_submodules: bool | None = None,
+    *,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> dict:
     """Full rebuild of the entire graph.
 
@@ -1288,6 +1804,10 @@ def full_build(
             When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
     """
     repo_root = _canonical_repo_root(repo_root)
+    # Full builds replace files one transaction at a time.  Mark the Erlang
+    # identity as pending before the first replacement so an interruption can
+    # never leave a stale v5 marker attached to a partially rebuilt graph.
+    _clear_erlang_identity(store, repo_root)
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
     stale_files = _reconcile_stale_files(repo_root, store, files)
@@ -1296,6 +1816,7 @@ def full_build(
     total_edges = 0
     errors = []
     cpp_errors: set[str] = set()
+    erlang_errors: set[str] = set()
     file_count = len(files)
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
@@ -1315,11 +1836,15 @@ def full_build(
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
                     cpp_errors.add(str(rel_path))
+                if _is_erlang_source_path(rel_path):
+                    erlang_errors.add(str(rel_path))
             except Exception as e:
                 logger.warning("Error parsing %s: %s", rel_path, e)
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
                     cpp_errors.add(str(rel_path))
+                if _is_erlang_source_path(rel_path):
+                    erlang_errors.add(str(rel_path))
             if i % 50 == 0 or i == file_count:
                 logger.info("Progress: %d/%d files parsed", i, file_count)
     else:
@@ -1339,6 +1864,8 @@ def full_build(
                     errors.append({"file": rel_path, "error": error})
                     if parser.detect_language(repo_root / rel_path) == "cpp":
                         cpp_errors.add(str(rel_path))
+                    if _is_erlang_source_path(rel_path):
+                        erlang_errors.add(str(rel_path))
                     continue
                 full_path = repo_root / rel_path
                 store.store_file_nodes_edges(
@@ -1367,7 +1894,7 @@ def full_build(
     hcl_stats = _run_hcl_resolver(store)
     scoped_stats = _run_scoped_resolver(store)
 
-    return {
+    result = {
         "files_parsed": len(files),
         "stale_files_removed": len(stale_files),
         "total_nodes": total_nodes,
@@ -1381,6 +1908,24 @@ def full_build(
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
     }
+    try:
+        erlang_result = _run_erlang_lifecycle(
+            repo_root,
+            store,
+            config=erlang_config,
+            changed_files=(),
+            force=True,
+        )
+    except BaseException:
+        _clear_erlang_identity(store, repo_root)
+        raise
+    if erlang_result is not None:
+        result["erlang_integration"] = erlang_result
+    if erlang_errors:
+        _clear_erlang_identity(store, repo_root)
+    else:
+        _set_erlang_identity_current(store, repo_root)
+    return result
 
 
 def incremental_update(
@@ -1389,11 +1934,28 @@ def incremental_update(
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
     reconcile_stale: bool = True,
+    *,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     repo_root = _canonical_repo_root(repo_root)
     if reconcile_stale:
         _assert_graph_matches_root(repo_root, store)
+    if changed_files is not None:
+        _assert_changed_files_belong_to_root(repo_root, changed_files)
+
+    # Upgrade legacy/missing Erlang identities before considering the diff.
+    # This is deliberately first: a no-op diff must not allow an old graph to
+    # bypass the migration gate, and a successful full build makes the rest of
+    # this lifecycle exactly-once.
+    rebuilt = _ensure_erlang_identity_current(
+        repo_root,
+        store,
+        erlang_config=erlang_config,
+    )
+    if rebuilt is not None:
+        return _identity_rebuild_result(rebuilt, changed_files)
+
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
 
@@ -1404,30 +1966,30 @@ def incremental_update(
         logger.info(
             "C++ identity format changed; rebuilding the graph before incremental update",
         )
-        rebuilt = full_build(repo_root, store)
-        return {
-            "files_updated": rebuilt["files_parsed"],
-            "total_nodes": rebuilt["total_nodes"],
-            "total_edges": rebuilt["total_edges"],
-            "changed_files": list(changed_files or []),
-            "dependent_files": [],
-            "errors": rebuilt["errors"],
-            "identity_rebuild": True,
-            "python_resolution": rebuilt["python_resolution"],
-            "rescript_resolution": rebuilt["rescript_resolution"],
-            "spring_resolution": rebuilt["spring_resolution"],
-            "event_resolution": rebuilt["event_resolution"],
-            "temporal_resolution": rebuilt["temporal_resolution"],
-            "hcl_resolution": rebuilt["hcl_resolution"],
-        }
+        rebuilt = _invoke_full_build(repo_root, store, erlang_config)
+        return _identity_rebuild_result(rebuilt, changed_files)
 
-    # Determine changed files
+    # Determine changed files.  Automatic Git diffs do not include untracked
+    # paths; add only Erlang layout manifests from the working tree so a new
+    # rebar/app configuration still refreshes semantic evidence without
+    # changing the established discovery behavior for other languages.
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
+        changed_files = _append_untracked_erlang_layout_files(repo_root, changed_files)
     stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
 
+    layout_changed = any(_is_erlang_layout_path(path) for path in changed_files)
+    erlang_changed = any(
+        _is_erlang_relevant_path(path)
+        for path in set(changed_files) | set(stale_files)
+    )
+    # Clear before any file replacement.  The explicit commit is required
+    # because GraphStore's replacement helpers begin their own transaction and
+    # would otherwise roll back an uncommitted marker deletion.
+    if erlang_changed:
+        _clear_erlang_identity(store, repo_root)
     if not changed_files and not stale_files:
-        return {
+        result = {
             "files_updated": 0,
             "total_nodes": 0,
             "total_edges": 0,
@@ -1435,7 +1997,19 @@ def incremental_update(
             "dependent_files": [],
             "stale_files_removed": 0,
             "errors": [],
+            "graph_changed": False,
+            "relation_layout_changed": False,
         }
+        erlang_result = _run_erlang_lifecycle(
+            repo_root,
+            store,
+            config=erlang_config,
+            changed_files=changed_files,
+            force=layout_changed,
+        )
+        if erlang_result is not None:
+            result["erlang_integration"] = erlang_result
+        return result
 
     # Find dependent files (files that import from changed files)
     dependent_files: set[str] = set()
@@ -1443,6 +2017,11 @@ def incremental_update(
         full_path = normalize_file_path(repo_root / rel_path)
         deps = find_dependents(store, full_path)
         for d in deps:
+            if not _path_belongs_to_root(d, repo_root):
+                logger.warning(
+                    "Ignoring dependent file outside repository root: %s", d
+                )
+                continue
             # Convert back to relative path if needed
             try:
                 dependent_files.add(str(Path(d).relative_to(repo_root)))
@@ -1455,10 +2034,12 @@ def incremental_update(
     total_nodes = 0
     total_edges = 0
     errors = []
+    erlang_errors: set[str] = set()
     missing_paths: set[str] = set()
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
+    snapshots: dict[str, tuple[bytes, str]] = {}
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
             continue
@@ -1467,12 +2048,22 @@ def incremental_update(
             if normalize_file_path(abs_path) not in stale_files:
                 missing_paths.add(normalize_file_path(abs_path))
             continue
-        if parser.detect_language(abs_path) is None:
-            continue
-        # Quick hash check to skip unchanged files
         try:
             raw = abs_path.read_bytes()
+            # Language detection must use the same byte snapshot as hashing
+            # and parsing.  A separate shebang probe can observe an editor's
+            # truncate window and make an otherwise valid extensionless file
+            # look unsupported (issue #746).
+            if parser.detect_language(abs_path, raw) is None:
+                continue
             fhash = hashlib.sha256(raw).hexdigest()
+            # Extensionless files need the pre-read bytes again during the
+            # parse stage: their language is inferred from a shebang, and a
+            # second path-only probe can race an editor save.  For ordinary
+            # extension-based files retain the historical parse-stage read so
+            # the stored hash continues to describe the bytes actually parsed.
+            if abs_path.suffix == "":
+                snapshots[rel_path] = (raw, fhash)
             existing_nodes = store.get_nodes_by_file(str(abs_path))
             # Dependents must be re-parsed even when their own bytes are
             # unchanged: an included header/module may have changed the
@@ -1496,8 +2087,12 @@ def incremental_update(
         for rel_path in to_parse:
             abs_path = repo_root / rel_path
             try:
-                source = abs_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
+                snapshot = snapshots.get(rel_path)
+                if snapshot is None:
+                    source = abs_path.read_bytes()
+                    fhash = hashlib.sha256(source).hexdigest()
+                else:
+                    source, fhash = snapshot
                 nodes, edges = parser.parse_bytes(abs_path, source)
                 store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
                 parsed_files += 1
@@ -1505,9 +2100,13 @@ def incremental_update(
                 total_edges += len(edges)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
+                if _is_erlang_source_path(rel_path):
+                    erlang_errors.add(str(rel_path))
             except Exception as e:
                 logger.warning("Error parsing %s: %s", rel_path, e)
                 errors.append({"file": rel_path, "error": str(e)})
+                if _is_erlang_source_path(rel_path):
+                    erlang_errors.add(str(rel_path))
     else:
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
@@ -1520,6 +2119,8 @@ def incremental_update(
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
+                    if _is_erlang_source_path(rel_path):
+                        erlang_errors.add(str(rel_path))
                     continue
                 store.store_file_nodes_edges(
                     str(repo_root / rel_path),
@@ -1571,7 +2172,7 @@ def incremental_update(
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
-    return {
+    result = {
         "files_updated": files_updated,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
@@ -1586,7 +2187,29 @@ def incremental_update(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "graph_changed": bool(files_updated or layout_changed),
+        "relation_layout_changed": layout_changed,
     }
+    try:
+        erlang_result = _run_erlang_lifecycle(
+            repo_root,
+            store,
+            config=erlang_config,
+            changed_files=list(changed_files),
+            force=layout_changed,
+        )
+    except BaseException:
+        if erlang_changed:
+            _clear_erlang_identity(store, repo_root)
+        raise
+    if erlang_result is not None:
+        result["erlang_integration"] = erlang_result
+    if erlang_changed:
+        if erlang_errors:
+            _clear_erlang_identity(store, repo_root)
+        else:
+            _set_erlang_identity_current(store, repo_root)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1617,6 +2240,44 @@ def _raise_watch_postprocess_warnings(result: object) -> None:
     if warnings:
         details = "; ".join(str(warning) for warning in warnings)
         raise RuntimeError(f"post-processing reported warnings: {details}")
+
+
+def _watch_postprocess_required(
+    repo_root: Path,
+    store: GraphStore,
+    result: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether a watch batch needs its derived callback run."""
+    if isinstance(result, Mapping):
+        try:
+            if int(result.get("files_updated", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if _erlang_result_requires_derived_refresh(result):
+            return True
+    return _watch_postprocess_pending(store, repo_root)
+
+
+def _run_watch_postprocess(
+    repo_root: Path,
+    store: GraphStore,
+    callback: Optional[Callable],
+    result: Mapping[str, Any] | None,
+) -> bool:
+    """Run and durably track one watch post-processing attempt.
+
+    The marker is written *before* invoking the callback.  A callback failure
+    therefore survives a daemon restart even when the source file hash makes
+    the next incremental reconciliation a no-op.
+    """
+    if callback is None or not _watch_postprocess_required(repo_root, store, result):
+        return False
+    _set_watch_postprocess_pending(store, repo_root, True)
+    postprocess_result = callback(store)
+    _raise_watch_postprocess_warnings(postprocess_result)
+    _set_watch_postprocess_pending(store, repo_root, False)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2184,6 +2845,9 @@ def _create_watch_handler(
     repo_root: Path,
     store: GraphStore,
     on_files_updated: Optional[Callable],
+    *,
+    initializing: bool = False,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ):
     """Create the debounced watchdog handler for one repository."""
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -2199,6 +2863,10 @@ def _create_watch_handler(
             self.failure: BaseException | None = None
             self.last_event_at: float | None = None
             self.events_seen: int = 0
+            self._state_lock = threading.Lock()
+            self._work_lock = threading.Lock()
+            self._initializing = initializing
+            self._pending_events: list[FileSystemEvent] = []
 
         def _relative_path(self, path: str) -> str | None:
             candidate = Path(os.path.abspath(path))
@@ -2248,6 +2916,12 @@ def _create_watch_handler(
                 and not _is_binary(absolute_path)
             )
 
+        def _relevant_file(self, relative_path: str) -> bool:
+            """Include non-parseable Erlang manifests in watch batches."""
+            return self._parseable_file(relative_path) or _is_erlang_layout_path(
+                relative_path
+            )
+
         def _parseable_descendants(self, relative_directory: str) -> set[str]:
             directory = repo_root / relative_directory
             if not directory.is_dir() or directory.is_symlink():
@@ -2255,7 +2929,7 @@ def _create_watch_handler(
             return {
                 str(path.relative_to(repo_root))
                 for path in directory.rglob("*")
-                if self._parseable_file(str(path.relative_to(repo_root)))
+                if self._relevant_file(str(path.relative_to(repo_root)))
                 and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
             }
 
@@ -2278,9 +2952,9 @@ def _create_watch_handler(
             else:
                 if source is not None and event.event_type in {"deleted", "moved"}:
                     paths.add(source)
-                elif source is not None and self._parseable_file(source):
+                elif source is not None and self._relevant_file(source):
                     paths.add(source)
-                if destination is not None and self._parseable_file(destination):
+                if destination is not None and self._relevant_file(destination):
                     paths.add(destination)
             return paths
 
@@ -2289,24 +2963,54 @@ def _create_watch_handler(
             # from a watcher whose repository is simply quiet.
             self.last_event_at = time.time()
             self.events_seen += len(events)
-            try:
-                changed_files = sorted(
-                    {path for event in events for path in self._event_paths(event)}
-                )
-                if not changed_files:
+            with self._state_lock:
+                if self._initializing:
+                    self._pending_events.extend(events)
                     return
-                result = incremental_update(
-                    repo_root,
-                    store,
-                    changed_files=changed_files,
-                    reconcile_stale=False,
-                )
-                _raise_watch_update_errors(result, "incremental update")
-                if result["files_updated"] > 0 and on_files_updated is not None:
-                    postprocess_result = on_files_updated(store)
-                    _raise_watch_postprocess_warnings(postprocess_result)
-            except BaseException as exc:
-                self.failure = exc
+            self._process_now(events)
+
+        def _process_now(self, events: list[FileSystemEvent]) -> None:
+            with self._work_lock:
+                try:
+                    changed_files = sorted(
+                        {path for event in events for path in self._event_paths(event)}
+                    )
+                    if not changed_files:
+                        return
+                    result = incremental_update(
+                        repo_root,
+                        store,
+                        changed_files=changed_files,
+                        reconcile_stale=False,
+                        erlang_config=erlang_config,
+                    )
+                    _raise_watch_update_errors(result, "incremental update")
+                    _run_watch_postprocess(
+                        repo_root,
+                        store,
+                        on_files_updated,
+                        result,
+                    )
+                except BaseException as exc:
+                    self.failure = exc
+
+        def finish_initialization(self) -> None:
+            """Enable live processing and drain events captured during startup."""
+            if not initializing:
+                return
+            while True:
+                with self._state_lock:
+                    if not self._pending_events:
+                        self._initializing = False
+                        return
+                    events = self._pending_events
+                    self._pending_events = []
+                self._process_now(events)
+
+        def abort_initialization(self) -> None:
+            with self._state_lock:
+                self._initializing = False
+                self._pending_events.clear()
 
         def raise_if_failed(self) -> None:
             if self.failure is not None:
@@ -2332,6 +3036,12 @@ def _create_watch_handler(
 
         def process(self, events: list[FileSystemEvent]) -> None:
             processor.process(events)
+
+        def finish_initialization(self) -> None:
+            processor.finish_initialization()
+
+        def abort_initialization(self) -> None:
+            processor.abort_initialization()
 
         def raise_if_failed(self) -> None:
             processor.raise_if_failed()
@@ -2394,6 +3104,8 @@ def watch(
     store: GraphStore,
     on_files_updated: Optional[Callable] = None,
     stop_event: threading.Event | None = None,
+    *,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
@@ -2425,6 +3137,10 @@ def watch(
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
     repo_root = _canonical_repo_root(repo_root)
+    # Refuse a clearly foreign graph before creating an observer or writing a
+    # transient health record.  A valid shared store may contain mixed roots;
+    # the guard only rejects the total-mismatch case.
+    _assert_graph_matches_root(repo_root, store)
     supervisor = _WatchSupervisor(
         None,
         repo_root,
@@ -2436,22 +3152,44 @@ def watch(
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
 
-    initial = incremental_update(repo_root, store, changed_files=[])
-    _raise_watch_update_errors(initial, "initial watch reconciliation")
-    if initial["files_updated"] > 0 and on_files_updated is not None:
-        postprocess_result = on_files_updated(store)
-        _raise_watch_postprocess_warnings(postprocess_result)
+    # Subscribe before reconciling the graph.  A repository can change while
+    # the initial update is running; the handler holds those events in a
+    # pending batch and drains it after the initial state is known.
     observer = Observer()
     supervisor.attach(observer)
-    handler = _create_watch_handler(repo_root, store, on_files_updated)
-    supervisor.schedule_initial(handler)
-    handler.start()
-    observer.start()
-    supervisor.report_health(observer_alive=True, force=True)
-
-    logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
+    handler = _create_watch_handler(
+        repo_root,
+        store,
+        on_files_updated,
+        initializing=True,
+        erlang_config=erlang_config,
+    )
     restore_sigterm = _install_sigterm_interrupt()
+    initialization_complete = False
     try:
+        supervisor.schedule_initial(handler)
+        handler.start()
+        observer.start()
+        supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
+
+        initial = incremental_update(
+            repo_root,
+            store,
+            changed_files=[],
+            erlang_config=erlang_config,
+        )
+        _raise_watch_update_errors(initial, "initial watch reconciliation")
+        _run_watch_postprocess(repo_root, store, on_files_updated, initial)
+
+        # Flip the gate only after the initial callback has succeeded.  Any
+        # event delivered concurrently is either still pending or is handled
+        # by the normal live path after the lock transition.
+        handler.finish_initialization()
+        handler.raise_if_failed()
+        initialization_complete = True
+        supervisor.report_health(observer_alive=True, phase="watching", force=True)
+
+        logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
         import time as _time
 
         while True:
@@ -2471,8 +3209,12 @@ def watch(
                 # keeps its rows, and the creation contributes what is on disk
                 # now.  Watch batches run with reconcile_stale=False, so
                 # nothing else would ever catch the stale side.
-                handler.dispatch(DirDeletedEvent(path))
-                handler.dispatch(DirCreatedEvent(path))
+                # This reconciliation is correctness-critical: queueing the
+                # synthetic events through the debounce thread can leave them
+                # unprocessed when shutdown follows immediately after the
+                # repair tick.  Process both halves as one serialized batch;
+                # ordinary filesystem events remain debounced.
+                handler.process([DirDeletedEvent(path), DirCreatedEvent(path)])
             if dead:
                 names = ", ".join(dead)
                 supervisor.report_health(
@@ -2497,7 +3239,15 @@ def watch(
         supervisor.clear_health()
     except KeyboardInterrupt:
         supervisor.clear_health()
-        _run_time_boxed(observer.stop, "observer stop")
+        handler.abort_initialization()
+    except BaseException:
+        # Keep an unhealthy health record after a live watcher failure so the
+        # daemon can report why it stopped.  Startup failures have no usable
+        # watcher to diagnose and should remove their transient record.
+        if not initialization_complete:
+            supervisor.clear_health()
+        handler.abort_initialization()
+        raise
     finally:
         restore_sigterm()
         _run_time_boxed(observer.stop, "observer stop")
@@ -2510,6 +3260,8 @@ def start_watch_thread(
     repo_root: Path,
     store: GraphStore,
     daemon: bool = True,
+    *,
+    erlang_config: Any = _ERLANG_CONFIG_UNSET,
 ) -> threading.Thread | None:
     """Start watch mode in a background thread.
 
@@ -2525,7 +3277,7 @@ def start_watch_thread(
         # A thread cannot take the process down, so the one thing it must not
         # do is die quietly: the server would keep serving a frozen graph.
         try:
-            watch(repo_root, store)
+            watch(repo_root, store, erlang_config=erlang_config)
         except RuntimeError as exc:
             logger.error("Auto-watch for %s stopped: %s", repo_root, exc)
 

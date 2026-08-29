@@ -28,7 +28,7 @@ import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .erlang_semantic import (
@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ErlangIntegrationConfig",
     "ErlangIntegrationResult",
+    "erlang_integration_requested",
+    "maybe_run_erlang_integration",
     "run_erlang_integration",
 ]
 
@@ -68,6 +70,8 @@ _MAX_METADATA_CHARS = 32_000
 _PROJECTION_MARKER = "_crg_erlang_semantic"
 _PROJECTION_OWNED = "_crg_erlang_projection_owned"
 _PROJECTION_ORIGINAL_EXTRA = "_crg_erlang_original_extra"
+_STATUS_METADATA_KEY = "erlang_integration_status"
+_SUMMARY_METADATA_KEY = "erlang_integration_summary"
 _PROJECTION_ORIGINAL_TARGET = "_crg_erlang_original_target"
 _PROJECTION_ORIGINAL_CONFIDENCE = "_crg_erlang_original_confidence"
 _PROJECTION_ORIGINAL_TIER = "_crg_erlang_original_tier"
@@ -75,6 +79,19 @@ _PROJECTION_RELATIONS = frozenset(
     {"CALLS", "TESTED_BY", "IMPLEMENTS", "REFERENCES", "DEPENDS_ON"}
 )
 _ERLANG_TOOLS = frozenset({"elp", "xref", "dialyzer"})
+_ERLANG_ENV_KEYS = frozenset(
+    {
+        "CRG_ERLANG_ENABLED",
+        "CRG_ERLANG_QUERIES",
+        "CRG_ERLANG_XREF",
+        "CRG_ERLANG_DIALYZER",
+        "CRG_ERLANG_CACHE_DIR",
+        "CRG_ERLANG_TIMEOUT",
+        "CRG_ERLANG_EXPECTED_OTP",
+        "CRG_ERLANG_EXPECTED_OTP_VERSION",
+        "CRG_ERLANG_PLT_PATH",
+    }
+)
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
 _MFA_RE = re.compile(r"^(?:(?P<module>[^:/]+):)?(?P<name>[^/]+)/(?P<arity>\d+)$")
@@ -85,6 +102,13 @@ def _canonical_root(value: str | Path) -> Path:
         return Path(value).expanduser().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         return Path(value).expanduser().absolute()
+
+
+def _scoped_metadata_key(base: str, root: Path) -> str:
+    """Return a collision-resistant metadata key for one repository root."""
+    identity = normalize_file_path(_canonical_root(root))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{base}:{digest[:32]}"
 
 
 def _bounded_timeout(value: Any) -> float:
@@ -328,6 +352,69 @@ class ErlangIntegrationResult:
         return value
 
 
+def erlang_integration_requested(
+    config: ErlangIntegrationConfig | Mapping[str, Any] | None = None,
+    *,
+    run_erlang: bool | None = None,
+) -> bool:
+    """Return whether a lifecycle caller explicitly requested Erlang work.
+
+    An omitted configuration is deliberately different from an explicit
+    disabled config.  This lets ordinary Generic builds preserve semantic
+    state while still allowing ``CRG_ERLANG_ENABLED=0`` (or
+    ``ErlangIntegrationConfig(enabled=False)``) to perform cleanup.
+    """
+    if run_erlang is not None:
+        return bool(run_erlang)
+    if config is not None:
+        return True
+    # Configuration knobs other than ENABLED are inert until the caller makes
+    # an explicit opt-in.  Treating (for example) a timeout-only environment
+    # as an invocation would parse the default ``enabled=False`` config and
+    # destructively clear valid semantic evidence.  An explicit ENABLED=0 is
+    # still a requested lifecycle pass so it can perform intentional cleanup.
+    return "CRG_ERLANG_ENABLED" in os.environ
+
+
+def maybe_run_erlang_integration(
+    repo_root: str | Path,
+    store: GraphStore,
+    *,
+    config: ErlangIntegrationConfig | Mapping[str, Any] | None = None,
+    run_erlang: bool | None = None,
+    changed_files: Iterable[str] | None = None,
+    query_targets: str | Sequence[str] | None = None,
+    toolchain: ToolchainIdentity | None = None,
+    runner: Any | None = None,
+) -> ErlangIntegrationResult | None:
+    """Run the optional bridge only when a caller explicitly opts in.
+
+    Adapter failures are represented as a degraded result so a Generic build
+    remains usable.  ``KeyboardInterrupt``/``SystemExit`` are intentionally
+    allowed to reach the caller.
+    """
+    if not erlang_integration_requested(config, run_erlang=run_erlang):
+        return None
+    try:
+        return run_erlang_integration(
+            repo_root,
+            store,
+            config=config,
+            changed_files=changed_files,
+            query_targets=query_targets,
+            toolchain=toolchain,
+            runner=runner,
+        )
+    except Exception as exc:  # Optional enrichment must not break Generic data.
+        root = _canonical_root(repo_root)
+        logger.warning("Erlang integration failed at lifecycle boundary: %s", exc)
+        return _failure_result(
+            root,
+            code="erlang_lifecycle_failed",
+            message=f"Erlang integration failed: {type(exc).__name__}: {exc}",
+        )
+
+
 def _bounded_json_value(value: Any, max_chars: int) -> Any:
     """Keep metadata summaries finite without affecting typed evidence."""
     try:
@@ -519,16 +606,46 @@ def _module_name(node: GraphNode) -> str | None:
     return node.name or None
 
 
+def _node_belongs_to_root(node: GraphNode, root: Path | None) -> bool:
+    """Return whether an Erlang graph node belongs to the requested checkout."""
+    if root is None:
+        return True
+    raw_path = getattr(node, "file_path", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    expected = _canonical_root(root)
+    value = normalize_file_path(raw_path)
+    # ``Path.is_absolute`` on POSIX does not recognize a Windows drive path;
+    # compare those spellings textually so a graph moved between hosts still
+    # cannot leak same-named MFA endpoints across repositories.
+    if re.match(r"^[A-Za-z]:/", value):
+        expected_value = normalize_file_path(expected).casefold().rstrip("/")
+        value_folded = value.casefold().rstrip("/")
+        return value_folded == expected_value or value_folded.startswith(expected_value + "/")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        if ".." in PurePosixPath(value).parts:
+            return False
+        candidate = expected / candidate
+    try:
+        candidate.resolve(strict=False).relative_to(expected)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 class _ErlangNodeIndex:
     """Indexes only repository Erlang nodes for unique endpoint resolution."""
 
     def __init__(self, nodes: Iterable[GraphNode], root: Path | None = None) -> None:
-        self.root = root
+        self.root = _canonical_root(root) if root is not None else None
         self.exact: dict[str, GraphNode] = {}
         self.modules: dict[str, list[GraphNode]] = {}
         self.symbols: dict[tuple[str | None, str, int | None], list[GraphNode]] = {}
         for node in nodes:
             if getattr(node, "language", "").casefold() != "erlang":
+                continue
+            if not _node_belongs_to_root(node, self.root):
                 continue
             self.exact[str(node.qualified_name)] = node
             declared_module = _module_name(node)
@@ -677,8 +794,59 @@ def _projection_provenance(record: EvidenceRecord) -> dict[str, Any]:
     return _bounded_json_value(value, _MAX_PROVENANCE_CHARS)
 
 
-def _clear_projection(store: GraphStore) -> int:
-    """Restore Generic edges that were enriched in a prior integration run."""
+def _projection_belongs_to_root(row: Any, extra: Mapping[str, Any], root: Path | None) -> bool:
+    """Return whether a marked edge belongs to the requested checkout."""
+    if root is None:
+        return True
+    expected = _canonical_root(root)
+    explicit_repositories: list[str] = []
+    for key in ("_crg_erlang_repository", "repository"):
+        value = extra.get(key)
+        if isinstance(value, str) and value:
+            explicit_repositories.append(value)
+    provenance = extra.get("semantic_provenance")
+    if isinstance(provenance, Mapping):
+        value = provenance.get("repository")
+        if isinstance(value, str) and value:
+            explicit_repositories.append(value)
+
+    # A repository marker is authoritative.  Do not reinterpret a relative
+    # source path against the requested root when the marker explicitly names
+    # another checkout; that is the cross-repository deletion hazard this
+    # guard exists to prevent.
+    if explicit_repositories:
+        ownership: list[bool] = []
+        for value in explicit_repositories:
+            try:
+                ownership.append(_canonical_root(value) == expected)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                ownership.append(False)
+        return all(ownership)
+
+    candidates: list[str] = []
+    for key in ("file_path", "source_qualified"):
+        value = row[key] if key in row.keys() else None
+        if isinstance(value, str) and value:
+            candidates.append(value.split("::", 1)[0])
+    ownership: list[bool] = []
+    for value in candidates:
+        try:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = expected / candidate
+            candidate = candidate.resolve(strict=False)
+            candidate.relative_to(expected)
+            ownership.append(True)
+        except (OSError, RuntimeError, ValueError):
+            ownership.append(False)
+    # Legacy rows have no authoritative repository marker.  When both source
+    # fields are present they must agree; otherwise a foreign source path can
+    # be paired with a relative local file path and get deleted during cleanup.
+    return bool(ownership) and all(ownership)
+
+
+def _clear_projection(store: GraphStore, root: Path | None = None) -> int:
+    """Restore Generic edges enriched in a prior run for *root* only."""
     conn = store._conn
     rows = conn.execute(
         "SELECT id, target_qualified, extra, confidence, confidence_tier "
@@ -689,6 +857,8 @@ def _clear_projection(store: GraphStore) -> int:
     for row in rows:
         extra = _safe_extra(row["extra"])
         if not extra.get(_PROJECTION_MARKER):
+            continue
+        if not _projection_belongs_to_root(row, extra, root):
             continue
         if bool(extra.get(_PROJECTION_OWNED, False)):
             conn.execute("DELETE FROM edges WHERE id = ?", (row["id"],))
@@ -738,7 +908,10 @@ def _clear_projection(store: GraphStore) -> int:
     return changed
 
 
-def _clear_projection_safely(store: GraphStore) -> tuple[int, Exception | None]:
+def _clear_projection_safely(
+    store: GraphStore,
+    root: Path | None = None,
+) -> tuple[int, Exception | None]:
     """Clear integration-owned edges in one transaction.
 
     This is used by lifecycle disable paths, where a corrupt/locked optional
@@ -748,7 +921,7 @@ def _clear_projection_safely(store: GraphStore) -> tuple[int, Exception | None]:
     """
     try:
         store._begin_immediate()
-        changed = _clear_projection(store)
+        changed = _clear_projection(store, root)
         store._conn.commit()
         store._invalidate_cache()
         return changed, None
@@ -905,7 +1078,7 @@ def _project_evidence(
     merged = 0
     store._begin_immediate()
     try:
-        _clear_projection(store)
+        _clear_projection(store, root)
         for key in sorted(grouped):
             kind, source, target, file_path, line = key
             records = sorted(grouped[key], key=lambda item: item.evidence_id)
@@ -914,6 +1087,7 @@ def _project_evidence(
             metadata: dict[str, Any] = {
                 _PROJECTION_MARKER: True,
                 _PROJECTION_OWNED: True,
+                "_crg_erlang_repository": normalize_file_path(root) if root else None,
                 "semantic_evidence_id": primary.evidence_id,
                 "semantic_evidence_ids": evidence_ids,
                 "semantic_provenance": _projection_provenance(primary),
@@ -1190,7 +1364,10 @@ def _disable_integration(
     errors: list[Exception] = []
     had_state = False
     try:
-        had_state = bool(store.get_metadata("erlang_integration_status"))
+        had_state = bool(
+            store.get_metadata(_scoped_metadata_key(_STATUS_METADATA_KEY, root))
+        )
+        had_state = had_state or bool(store.get_metadata(_STATUS_METADATA_KEY))
         had_state = had_state or bool(
             store._conn.execute(
                 "SELECT 1 FROM edges WHERE extra LIKE ? LIMIT 1",
@@ -1202,7 +1379,7 @@ def _disable_integration(
         # disabled invocation; cleanup itself remains best effort.
         logger.debug("Could not inspect prior Erlang integration state: %s", exc)
 
-    cleared_edges, edge_error = _clear_projection_safely(store)
+    cleared_edges, edge_error = _clear_projection_safely(store, root)
     counts["cleared_edges"] = cleared_edges
     if edge_error is not None:
         errors.append(edge_error)
@@ -1348,6 +1525,7 @@ def _lifecycle_diagnostic(
 def _save_integration_metadata(
     store: GraphStore,
     *,
+    root: Path,
     status: str,
     summary: Mapping[str, Any] | None = None,
 ) -> Exception | None:
@@ -1355,14 +1533,48 @@ def _save_integration_metadata(
     try:
         if summary is not None:
             store.set_metadata(
-                "erlang_integration_summary",
+                _scoped_metadata_key(_SUMMARY_METADATA_KEY, root),
                 json.dumps(
                     _bounded_json_value(dict(summary), _MAX_METADATA_CHARS),
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
             )
-        store.set_metadata("erlang_integration_status", status)
+        store.set_metadata(_scoped_metadata_key(_STATUS_METADATA_KEY, root), status)
+        # Keep the old scalar keys for standalone stores.  A shared store has
+        # no unambiguous scalar status, so remove them instead of letting the
+        # most recently processed checkout overwrite another one's status.
+        try:
+            expected_root = _canonical_root(root)
+            has_foreign = False
+            for path in store.get_file_marker_paths():
+                candidate = Path(path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = expected_root / candidate
+                try:
+                    candidate.resolve(strict=False).relative_to(expected_root)
+                except (OSError, RuntimeError, ValueError):
+                    has_foreign = True
+                    break
+        except (OSError, RuntimeError, ValueError):
+            has_foreign = True
+        if has_foreign:
+            store._conn.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (_STATUS_METADATA_KEY, _SUMMARY_METADATA_KEY),
+            )
+            store._conn.commit()
+        else:
+            store.set_metadata(_STATUS_METADATA_KEY, status)
+            if summary is not None:
+                store.set_metadata(
+                    _SUMMARY_METADATA_KEY,
+                    json.dumps(
+                        _bounded_json_value(dict(summary), _MAX_METADATA_CHARS),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
     except Exception as exc:
         logger.warning("Could not save Erlang integration metadata: %s", exc)
         return exc
@@ -1424,6 +1636,7 @@ def run_erlang_integration(
         if had_state or cleanup_errors:
             _save_integration_metadata(
                 store,
+                root=root,
                 status=result.status,
                 summary={
                     "status": result.status,
@@ -1452,16 +1665,51 @@ def run_erlang_integration(
             message=f"Could not inspect Generic Erlang nodes: {type(exc).__name__}: {exc}",
         )
     if not has_erlang_nodes:
+        # A forget or a repository switch can leave semantic rows behind after
+        # the last Erlang node disappears.  Reconcile that optional state while
+        # keeping the Generic graph untouched; table cleanup is repository
+        # scoped and projection cleanup is root-aware.
+        cleanup_counts, cleanup_errors, had_state = _disable_integration(store, root)
+        diagnostics = tuple(
+            _lifecycle_diagnostic(
+                root,
+                code="erlang_no_nodes_cleanup_failed",
+                message=(
+                    "Could not clear Erlang state after the Generic graph became "
+                    f"Erlang-free: {type(exc).__name__}: {exc}"
+                ),
+                metadata={"exception": type(exc).__name__},
+            )
+            for exc in cleanup_errors
+        )
+        counts = {
+            "queries": 0,
+            "changed_targets": 0,
+            "evidence": 0,
+            "diagnostics": len(diagnostics),
+            "projected_edges": 0,
+            **cleanup_counts,
+        }
+        if had_state or cleanup_errors:
+            _save_integration_metadata(
+                store,
+                root=root,
+                status="degraded" if cleanup_errors else "skipped",
+                summary={
+                    "status": "degraded" if cleanup_errors else "skipped",
+                    "repository": normalize_file_path(root),
+                    "counts": counts,
+                },
+            )
         return ErlangIntegrationResult(
-            status="skipped",
-            provenance=_base_provenance(root, status="skipped", toolchain=None),
-            counts={
-                "queries": 0,
-                "changed_targets": 0,
-                "evidence": 0,
-                "diagnostics": 0,
-                "projected_edges": 0,
-            },
+            status="degraded" if cleanup_errors else "skipped",
+            diagnostics=diagnostics,
+            provenance=_base_provenance(
+                root,
+                status="degraded" if cleanup_errors else "skipped",
+                toolchain=None,
+            ),
+            counts=counts,
         )
 
     changed_targets = _collect_changed_targets(store, root, changed_files)
@@ -1684,5 +1932,5 @@ def run_erlang_integration(
         "toolchain_fingerprint": toolchain.fingerprint,
         "counts": dict(result.counts),
     }
-    _save_integration_metadata(store, status=result.status, summary=summary)
+    _save_integration_metadata(store, root=root, status=result.status, summary=summary)
     return result

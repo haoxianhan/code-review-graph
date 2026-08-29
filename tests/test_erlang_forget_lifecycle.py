@@ -12,6 +12,7 @@ import pytest
 import code_review_graph.incremental as incremental_module
 from code_review_graph.erlang_integration import (
     ErlangIntegrationConfig,
+    _scoped_metadata_key,
     run_erlang_integration,
 )
 from code_review_graph.erlang_semantic import CommandResult, ToolchainIdentity
@@ -258,6 +259,65 @@ def test_disabling_one_repository_keeps_shared_store_state_for_another(
             "SELECT DISTINCT repository FROM semantic_evidence ORDER BY repository"
         ).fetchall()
         assert [row["repository"] for row in repositories] == [repo_b.resolve().as_posix()]
+        assert store.get_metadata("erlang_integration_status") is None
+        assert store.get_metadata(
+            _scoped_metadata_key("erlang_integration_status", repo_a)
+        ) == "disabled"
+        assert store.get_metadata(
+            _scoped_metadata_key("erlang_integration_status", repo_b)
+        ) == "ok"
+    finally:
+        store.close()
+
+
+def test_same_named_mfa_projection_is_scoped_to_requested_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Bare MFA resolution must ignore same-named nodes in another root."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    _write_fixture(repo_a)
+    _write_fixture(repo_b)
+    store = GraphStore(tmp_path / "shared.db")
+    config = ErlangIntegrationConfig(
+        enabled=True,
+        queries={"callers_of": "worker:run/0"},
+        cache_dir=tmp_path / "cache",
+    )
+    try:
+        _populate_shared_store(repo_a, store)
+        _populate_shared_store(repo_b, store)
+
+        first = run_erlang_integration(
+            repo_a,
+            store,
+            config=config,
+            toolchain=_toolchain(repo_a),
+            runner=_evidence_runner,
+        )
+        second = run_erlang_integration(
+            repo_b,
+            store,
+            config=config,
+            toolchain=_toolchain(repo_b),
+            runner=_evidence_runner,
+        )
+
+        assert first.counts["projected_edges"] == 1
+        assert second.counts["projected_edges"] == 1
+        rows = store._conn.execute(
+            "SELECT file_path, target_qualified FROM edges "
+            "WHERE extra LIKE '%_crg_erlang_semantic%' ORDER BY file_path"
+        ).fetchall()
+        assert [row["file_path"] for row in rows] == [
+            str(repo_a / "src" / "caller.erl"),
+            str(repo_b / "src" / "caller.erl"),
+        ]
+        assert rows[0]["target_qualified"].startswith(str(repo_a))
+        assert rows[1]["target_qualified"].startswith(str(repo_b))
     finally:
         store.close()
 
@@ -361,6 +421,120 @@ def test_forget_refuses_a_shared_store_from_another_repository(
 
         assert store.get_all_files() == before
         assert store.get_nodes_by_file(target)
+    finally:
+        store.close()
+
+
+def test_forget_refuses_a_foreign_target_in_a_mixed_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A valid mixed store must still reject a target from another root."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    _write_fixture(repo_a)
+    _write_fixture(repo_b)
+    store = GraphStore(tmp_path / "shared.db")
+    try:
+        _populate_shared_store(repo_a, store)
+        _populate_shared_store(repo_b, store)
+        before = store.get_all_files()
+
+        with pytest.raises(ValueError, match="outside repository root"):
+            forget_files(store, repo_a, [str(repo_b / "src" / "worker.erl")])
+
+        assert store.get_all_files() == before
+        assert store.get_nodes_by_file(str(repo_b / "src" / "worker.erl"))
+    finally:
+        store.close()
+
+
+def test_legacy_projection_cleanup_requires_all_paths_to_be_local(
+    tmp_path: Path,
+) -> None:
+    """Malformed legacy projection rows are left untouched during cleanup."""
+    from code_review_graph.erlang_integration import _clear_projection
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        source = str(repo / "src" / "caller.erl")
+        store._conn.execute(
+            "INSERT INTO edges "
+            "(kind, source_qualified, target_qualified, file_path, line, extra, "
+            "confidence, confidence_tier, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "CALLS",
+                source + "::caller.run/0",
+                "worker:run/0",
+                source,
+                1,
+                json.dumps({"_crg_erlang_semantic": True}),
+                0.9,
+                "INFERRED",
+                0.0,
+            ),
+        )
+        row = store._conn.execute("SELECT id FROM edges").fetchone()
+        assert row is not None
+        store._conn.execute(
+            "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+            (
+                str(tmp_path / "foreign" / "caller.erl") + "::caller.run/0",
+                json.dumps({"_crg_erlang_semantic": True}),
+                row["id"],
+            ),
+        )
+        store.commit()
+
+        assert _clear_projection(store, repo) == 0
+        assert store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+def test_projection_cleanup_rejects_conflicting_repository_markers(
+    tmp_path: Path,
+) -> None:
+    """Conflicting explicit ownership markers must fail closed."""
+    from code_review_graph.erlang_integration import _clear_projection
+
+    repo = tmp_path / "repo"
+    foreign = tmp_path / "foreign"
+    repo.mkdir()
+    foreign.mkdir()
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        source = str(repo / "caller.erl")
+        store._conn.execute(
+            "INSERT INTO edges "
+            "(kind, source_qualified, target_qualified, file_path, line, extra, "
+            "confidence, confidence_tier, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "CALLS",
+                source + "::caller.run/0",
+                "worker:run/0",
+                source,
+                1,
+                json.dumps(
+                    {
+                        "_crg_erlang_semantic": True,
+                        "_crg_erlang_repository": str(repo),
+                        "semantic_provenance": {"repository": str(foreign)},
+                    }
+                ),
+                0.9,
+                "INFERRED",
+                0.0,
+            ),
+        )
+        store.commit()
+
+        assert _clear_projection(store, repo) == 0
+        assert store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 1
     finally:
         store.close()
 

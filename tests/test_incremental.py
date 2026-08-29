@@ -1411,7 +1411,13 @@ class TestWatchReconciliation:
             ):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
 
-            observer.assert_not_called()
+            # Startup subscribes before reconciliation so events cannot be
+            # lost.  The failed callback must still stop and join the
+            # observer before the error reaches the caller.
+            observer.assert_called_once()
+            observer.return_value.start.assert_called_once()
+            observer.return_value.stop.assert_called_once()
+            observer.return_value.join.assert_called_once()
         finally:
             store.close()
 

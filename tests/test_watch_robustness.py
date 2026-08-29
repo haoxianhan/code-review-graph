@@ -32,7 +32,9 @@ from code_review_graph.daemon import (
 )
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
+    _WATCH_POSTPROCESS_PENDING_METADATA_KEY,
     _WATCH_SPLIT_MIN_DIRS,
+    _create_watch_handler,
     _load_ignore_patterns,
     _plan_watch_paths,
     _should_ignore,
@@ -868,6 +870,48 @@ class TestWatchLoop:
         # src is watched, node_modules is not.
         assert (str(tmp_path / "src"), True) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
+
+    def test_postprocess_failure_is_retried_after_hash_only_replay(self, tmp_path):
+        """A failed derived pass must survive restart even when parsing is skipped."""
+        from watchdog.events import FileModifiedEvent
+
+        source = tmp_path / "src" / "app.py"
+        source.parent.mkdir()
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        (tmp_path / ".git").mkdir()
+        store = GraphStore(tmp_path / "graph.db")
+        first_calls: list[int] = []
+
+        def failed_callback(_store):
+            first_calls.append(1)
+            raise RuntimeError("postprocess down")
+
+        try:
+            first = _create_watch_handler(tmp_path, store, failed_callback)
+            first.process([FileModifiedEvent(str(source))])
+            assert first_calls == [1]
+            assert store.get_metadata(_WATCH_POSTPROCESS_PENDING_METADATA_KEY)
+
+            # The marker is durable, not merely state on the old handler.
+            store.close()
+            store = GraphStore(tmp_path / "graph.db")
+
+            second_calls: list[int] = []
+
+            def recovered_callback(_store):
+                second_calls.append(1)
+                return {}
+
+            # A fresh handler models a daemon restart.  The source hash is
+            # unchanged, so incremental_update reports no parsed files.
+            second = _create_watch_handler(tmp_path, store, recovered_callback)
+            second.process([FileModifiedEvent(str(source))])
+
+            assert second_calls == [1]
+            assert store.get_metadata(_WATCH_POSTPROCESS_PENDING_METADATA_KEY) is None
+            second.raise_if_failed()
+        finally:
+            store.close()
 
     def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(
         self, tmp_path, monkeypatch

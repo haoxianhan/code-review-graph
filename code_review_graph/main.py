@@ -107,6 +107,7 @@ async def build_or_update_graph_tool(
     recurse_submodules: Optional[bool] = None,
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    erlang_config: Optional[dict] = None,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -136,6 +137,9 @@ async def build_or_update_graph_tool(
             refresh. Must be supplied with embedding_model. Default: disabled.
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
+        erlang_config: Optional Erlang integration mapping. Omitted uses
+            ``CRG_ERLANG_*`` opt-in settings; ``{"enabled": false}`` clears
+            prior derived state for this repository.
     """
     root = _resolve_repo_root(repo_root)
 
@@ -145,6 +149,7 @@ async def build_or_update_graph_tool(
             postprocess=postprocess, recurse_submodules=recurse_submodules,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            erlang_config=erlang_config,
         ), root)
 
     return await asyncio.to_thread(_run)
@@ -158,6 +163,7 @@ async def run_postprocess_tool(
     repo_root: Optional[str] = None,
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    erlang_config: Optional[dict] = None,
 ) -> dict:
     """Run post-processing on existing graph (flows, communities, FTS index).
 
@@ -177,6 +183,8 @@ async def run_postprocess_tool(
             Must be supplied with embedding_model. Default: disabled.
         embedding_model: Exact model for an explicit embedding refresh.
             Must be supplied with embedding_provider. Default: disabled.
+        erlang_config: Optional Erlang integration mapping. Omitted uses
+            ``CRG_ERLANG_*`` opt-in settings.
     """
     root = _resolve_repo_root(repo_root)
 
@@ -185,6 +193,7 @@ async def run_postprocess_tool(
             flows=flows, communities=communities, fts=fts, repo_root=root,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            erlang_config=erlang_config,
         ), root)
 
     return await asyncio.to_thread(_run)

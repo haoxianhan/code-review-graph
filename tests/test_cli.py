@@ -162,6 +162,78 @@ def test_visualize_json_uses_local_export(tmp_path, capsys):
 
 
 class TestBuildUpdateCommands:
+    @staticmethod
+    def _degraded_result(**counts):
+        return {
+            **counts,
+            "status": "degraded",
+            "erlang_integration": {
+                "status": "degraded",
+                "diagnostics": [
+                    {"code": "elp_unavailable", "message": "missing"}
+                ],
+            },
+        }
+
+    def test_build_reports_erlang_status_and_diagnostics(self, capsys):
+        argv = ["code-review-graph", "build", "--skip-postprocess", "--repo", "repo-root"]
+        result = self._degraded_result(files_parsed=1, total_nodes=2, total_edges=1)
+
+        with patch.object(sys, "argv", argv):
+            with patch("code_review_graph.graph.GraphStore") as mock_store:
+                mock_store.return_value = MagicMock()
+                with patch("code_review_graph.incremental.get_db_path") as mock_db:
+                    mock_db.return_value = MagicMock()
+                    with patch(
+                        "code_review_graph.tools.build.build_or_update_graph",
+                        return_value=result,
+                    ):
+                        cli.main()
+
+        output = capsys.readouterr().out
+        assert "Erlang integration: degraded" in output
+        assert "elp_unavailable" in output
+
+    def test_update_reports_erlang_status_and_diagnostics(self, capsys):
+        argv = ["code-review-graph", "update", "--skip-postprocess", "--repo", "repo-root"]
+        result = self._degraded_result(
+            files_updated=1, total_nodes=2, total_edges=1, build_type="incremental"
+        )
+
+        with patch.object(sys, "argv", argv):
+            with patch("code_review_graph.graph.GraphStore") as mock_store:
+                mock_store.return_value = MagicMock()
+                with patch("code_review_graph.incremental.get_db_path") as mock_db:
+                    mock_db.return_value = MagicMock()
+                    with patch(
+                        "code_review_graph.tools.build.build_or_update_graph",
+                        return_value=result,
+                    ):
+                        cli.main()
+
+        output = capsys.readouterr().out
+        assert "Erlang integration: degraded" in output
+        assert "elp_unavailable" in output
+
+    def test_postprocess_reports_erlang_status_and_diagnostics(self, capsys):
+        argv = ["code-review-graph", "postprocess", "--repo", "repo-root"]
+        result = self._degraded_result()
+
+        with patch.object(sys, "argv", argv):
+            with patch("code_review_graph.graph.GraphStore") as mock_store:
+                mock_store.return_value = MagicMock()
+                with patch("code_review_graph.incremental.get_db_path") as mock_db:
+                    mock_db.return_value = MagicMock()
+                    with patch(
+                        "code_review_graph.tools.build.run_postprocess",
+                        return_value=result,
+                    ):
+                        cli.main()
+
+        output = capsys.readouterr().out
+        assert "Erlang integration: degraded" in output
+        assert "elp_unavailable" in output
+
     def test_build_skip_postprocess_does_not_run_extra_cli_postprocess(self):
         argv = [
             "code-review-graph",

@@ -78,6 +78,26 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     )
 
 
+def _assert_targets_belong_to_root(repo_root: Path, targets: list[str]) -> None:
+    """Reject forget targets that resolve outside the requested checkout."""
+    expected_root = _canonical_path(repo_root)
+    foreign: list[str] = []
+    for raw in targets:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = expected_root / candidate
+        try:
+            candidate.resolve(strict=False).relative_to(expected_root)
+        except (OSError, RuntimeError, ValueError):
+            foreign.append(str(raw))
+    if foreign:
+        sample = foreign[0]
+        raise ValueError(
+            f"forget target {sample!r} is outside repository root "
+            f"{expected_root!s}; refusing to mutate a foreign checkout"
+        )
+
+
 def _referrer_files(
     store: GraphStore,
     deleted_qualified_names: set[str],
@@ -324,6 +344,7 @@ def forget_files(
     # anchored to another checkout. Empty/legacy stores without File markers
     # intentionally keep the historical behavior.
     _assert_graph_matches_root(Path(repo_root), store)
+    _assert_targets_belong_to_root(Path(repo_root), targets)
 
     forgotten = set(targets)
 
