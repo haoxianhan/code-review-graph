@@ -2,7 +2,14 @@
 
 from pathlib import Path
 
-from code_review_graph.parser import CodeParser, normalize_erlang_atom, parse_erlang_mfa
+import pytest
+
+from code_review_graph.parser import (
+    CodeParser,
+    ErlangTraversalLimitError,
+    normalize_erlang_atom,
+    parse_erlang_mfa,
+)
 
 
 def _parse(name: str, source: str):
@@ -144,6 +151,19 @@ def test_erlang_deep_expression_walk_does_not_overflow():
         and edge.target.endswith("helper/0")
         for edge in edges
     )
+
+
+def test_erlang_ast_walk_fails_closed_when_the_budget_is_exceeded():
+    """A bounded walk must report truncation instead of returning a partial graph."""
+    source = (
+        b"-module(large).\n"
+        + b"run() -> ["
+        + b",".join([b"ok"] * 100_050)
+        + b"].\n"
+    )
+
+    with pytest.raises(ErlangTraversalLimitError, match="100000"):
+        CodeParser().parse_bytes(Path("large.erl"), source)
 
 
 def test_erlang_import_include_and_behaviour_edges():

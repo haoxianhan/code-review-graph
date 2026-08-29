@@ -76,6 +76,24 @@ _ERLANG_ATOM_ESCAPES = {
 _ERLANG_BARE_ATOM_RE = re.compile(r"^[a-z_][A-Za-z0-9_@]*$")
 
 
+class ErlangTraversalLimitError(RuntimeError):
+    """Raised when bounded Erlang AST traversal would drop named nodes.
+
+    The Generic parser deliberately bounds tree walks so a malformed or
+    adversarial source file cannot consume unbounded memory.  Returning a
+    partial graph at that boundary is unsafe, however: callers could mistake
+    missing relations for confirmed absence.  Surface the boundary as a
+    parse error so lifecycle code can preserve the previous graph and report
+    a non-successful build.
+    """
+
+    def __init__(self, max_nodes: int) -> None:
+        self.max_nodes = max_nodes
+        super().__init__(
+            f"Erlang AST traversal exceeded the {max_nodes} named-node limit"
+        )
+
+
 def normalize_erlang_atom(value: str) -> str:
     """Decode one Erlang atom spelling to its semantic identifier.
 
@@ -3132,7 +3150,7 @@ class CodeParser:
 
     @staticmethod
     def _erlang_walk(node, max_nodes: int = 100_000):
-        """Iteratively yield named descendants, avoiding recursion overflow."""
+        """Iteratively yield named descendants, failing closed at the limit."""
         pending = list(reversed(node.named_children))
         seen = 0
         while pending and seen < max_nodes:
@@ -3140,6 +3158,10 @@ class CodeParser:
             seen += 1
             yield current
             pending.extend(reversed(current.named_children))
+        if pending:
+            # The caller consumed the complete generator, so silently dropping
+            # the remaining descendants would produce an incomplete graph.
+            raise ErlangTraversalLimitError(max_nodes)
 
     @staticmethod
     def _erlang_string_text(node) -> Optional[str]:

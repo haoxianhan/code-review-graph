@@ -141,6 +141,33 @@ def test_uppercase_erlang_header_change_reparses_include_dependents(
         store.close()
 
 
+def test_large_erlang_ast_parse_failure_is_visible_and_keeps_identity_pending(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Full builds must report bounded-walk failures instead of indexing partial ASTs."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    source = repo / "src" / "large.erl"
+    source.write_bytes(
+        b"-module(large).\n"
+        + b"run() -> ["
+        + b",".join([b"ok"] * 100_050)
+        + b"].\n"
+    )
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        result = full_build(repo, store)
+
+        errors = [item for item in result["errors"] if item["file"] == "src/large.erl"]
+        assert len(errors) == 1
+        assert "100000" in errors[0]["error"]
+        assert store.get_nodes_by_file(str(source)) == []
+        assert store.get_metadata(_erlang_identity_key(repo)) is None
+    finally:
+        store.close()
+
+
 def test_automatic_update_reconciles_dirty_edit_restore_and_noop(
     tmp_path: Path, monkeypatch
 ) -> None:
