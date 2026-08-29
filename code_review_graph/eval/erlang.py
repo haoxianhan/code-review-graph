@@ -987,8 +987,14 @@ def _validate_endpoint(value: object, source: str) -> None:
         # prefix (``path/to/file.erl::module.fn/0``).  Validate that prefix
         # here as well as mapping-style ``{"file": ...}`` endpoints.
         if "::" in value:
-            path, _separator, _identity = value.partition("::")
+            path, _separator, identity = value.partition("::")
             _validate_relative_path(path, f"{source}.file")
+            # A qualified graph identity is only meaningful when its symbol
+            # suffix is present.  Accepting ``path::`` makes it behave like a
+            # file-only endpoint in some consumers and like an invalid node in
+            # others, which can produce inconsistent corpus scores.
+            if not identity:
+                raise _error(source, "qualified endpoint must include a symbol suffix")
         return
     endpoint = _mapping(value, source)
     if "file" in endpoint:
