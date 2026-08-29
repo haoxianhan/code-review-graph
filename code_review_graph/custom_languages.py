@@ -1,16 +1,10 @@
 """Config-driven custom language support ("bring your own language").
 
 Repos can teach the parser new tree-sitter languages without forking by
-dropping a ``languages.toml`` file into ``.code-review-graph/``::
-
-    [languages.erlang]
-    extensions = [".erl", ".hrl"]
-    grammar = "erlang"                        # tree_sitter_language_pack name
-    function_node_types = ["function_clause"]
-    class_node_types = ["record_decl"]
-    import_node_types = ["import_attribute"]
-    call_node_types = ["call"]
-    comment = "Erlang via the bundled tree-sitter-erlang grammar"
+dropping a ``languages.toml`` file into ``.code-review-graph/``.  Erlang is
+already a built-in Generic baseline (``.erl``, ``.hrl``, and ``.app.src``),
+so it must not be configured as a custom language; the bundled parser owns
+those extensions and always wins.
 
 The loader is deliberately defensive: a broken config must never crash a
 build.  Invalid entries are skipped with a ``logger.warning``, and built-in
