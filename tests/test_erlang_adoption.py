@@ -133,6 +133,22 @@ def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path,
     validate_evaluation_result(result)
 
 
+def test_clause_children_do_not_make_function_anchor_ambiguous(
+    tmp_path: Path, monkeypatch,
+):
+    """Clause navigation nodes must not be treated as callable endpoints."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    case = result["cases"][0]
+    assert case["status"] == "executed"
+    assert case["true_positive"] == 1
+    assert case["precision"] == 1.0
+    assert case["recall"] == 1.0
+
+
 def test_dirty_target_is_fail_closed_and_does_not_build(tmp_path: Path, monkeypatch):
     repo, manifest, corpus = _fixture(tmp_path)
     (repo / "src" / "caller.erl").write_text(

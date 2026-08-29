@@ -346,6 +346,12 @@ def _split_erlang_symbol(value: Any, explicit_arity: Any = None) -> tuple[str, i
 
 
 def _node_symbol_matches(node: GraphNode, symbol: Any, arity: Any = None) -> bool:
+    # Clauses are syntax/navigation children of a callable Function or Test;
+    # they are deliberately not independent semantic endpoints.  Keeping
+    # them out of symbol matching prevents a file-qualified function anchor
+    # from becoming ambiguous as soon as the Generic parser exposes clauses.
+    if node.kind == "Clause":
+        return False
     parsed = _split_erlang_symbol(symbol, arity)
     if parsed is None:
         return False
