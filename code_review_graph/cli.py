@@ -2024,6 +2024,7 @@ def main() -> None:
                         f"\nForgot {len(targets)} file(s); "
                         f"{remaining} file(s) remain in the graph."
                     )
+                    _print_erlang_integration_status(summary)
 
         elif args.command == "watch":
             from .postprocessing import run_post_processing

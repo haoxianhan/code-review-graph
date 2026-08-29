@@ -264,6 +264,36 @@ class TestBuildUpdateCommands:
 
         assert exc_info.value.code == 1
 
+    def test_forget_reports_erlang_status_and_diagnostics(self, capsys):
+        argv = ["code-review-graph", "forget", "src/worker.erl", "--repo", "repo-root"]
+        store = MagicMock()
+        stored_file = str(Path("repo-root/src/worker.erl").resolve())
+        store.get_all_files.return_value = [stored_file]
+        summary = {
+            "forgotten": [stored_file],
+            "reparsed": [],
+            "erlang_integration": {
+                "status": "degraded",
+                "diagnostics": [
+                    {"code": "elp_unavailable", "message": "missing"},
+                ],
+            },
+        }
+
+        with patch.object(sys, "argv", argv):
+            with patch("code_review_graph.graph.GraphStore", return_value=store):
+                with patch("code_review_graph.incremental.get_db_path") as mock_db:
+                    mock_db.return_value = MagicMock()
+                    with patch(
+                        "code_review_graph.forget.forget_files",
+                        return_value=summary,
+                    ):
+                        cli.main()
+
+        output = capsys.readouterr().out
+        assert "Erlang integration: degraded" in output
+        assert "elp_unavailable" in output
+
     def test_build_skip_postprocess_does_not_run_extra_cli_postprocess(self):
         argv = [
             "code-review-graph",
