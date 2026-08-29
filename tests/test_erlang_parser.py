@@ -90,6 +90,10 @@ def test_erlang_mfa_parser_rejects_malformed_or_out_of_range_targets():
     assert parse_erlang_mfa("worker:run/256", require_module=True) is None
     assert parse_erlang_mfa("worker:run/not-an-arity", require_module=True) is None
     assert parse_erlang_mfa("worker module:run/0", require_module=True) is None
+    assert parse_erlang_mfa("worker:run/" + ("0" * 4000), require_module=True) == (
+        "worker", "run", 0,
+    )
+    assert normalize_erlang_atom("'" + r"\x{" + ("0" * 4096) + "}'") == "\x00"
 
 
 def test_erlang_local_nested_and_remote_calls_preserve_arity():

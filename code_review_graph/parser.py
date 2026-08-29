@@ -113,11 +113,16 @@ def normalize_erlang_atom(value: str) -> str:
                 end = text.find("}", index + 3)
                 digits = text[index + 3:end] if end >= 0 else ""
                 if digits and re.fullmatch(r"[0-9A-Fa-f]+", digits):
-                    code = int(digits, 16)
-                    if code <= 0x10FFFF:
-                        chars.append(chr(code))
-                        index = end + 1
-                        continue
+                    # Unicode scalar values fit in six hexadecimal digits;
+                    # permit additional leading zeroes without converting an
+                    # attacker-controlled giant integer.
+                    significant = digits.lstrip("0")
+                    if len(significant) <= 6:
+                        code = int(significant or "0", 16)
+                        if code <= 0x10FFFF:
+                            chars.append(chr(code))
+                            index = end + 1
+                            continue
             elif index + 3 < len(text):
                 digits = text[index + 2:index + 4]
                 if re.fullmatch(r"[0-9A-Fa-f]{2}", digits):
@@ -200,7 +205,9 @@ def parse_erlang_mfa(
     arity_text = text[offset + 1:]
     if not arity_text.isdigit() or len(arity_text.lstrip("0")) > 3:
         return None
-    arity = int(arity_text or "0")
+    # Avoid Python's integer digit limit even when a caller supplies thousands
+    # of leading zeroes.  The significant portion was bounded above.
+    arity = int(arity_text.lstrip("0") or "0")
     if arity > 255:
         return None
     name = normalize_erlang_atom(raw_name)
