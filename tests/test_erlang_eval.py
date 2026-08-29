@@ -14,6 +14,7 @@ from code_review_graph.eval.erlang import (
     execute_corpus,
     load_corpus,
     load_manifest,
+    validate_artifact_pair,
 )
 
 
@@ -153,3 +154,18 @@ def test_execute_corpus_rejects_symlinked_anchor_before_read(tmp_path):
 
     with pytest.raises(ValueError, match="escapes the target checkout"):
         execute_corpus(manifest, corpus, target_root=target, dry_run=True)
+
+
+def test_manifest_and_corpus_artifacts_must_match(tmp_path):
+    manifest, corpus = _path_validation_fixtures(tmp_path)
+    manifest_path = tmp_path / "server_flexible.manifest.json"
+    corpus_path = tmp_path / "corpus.json"
+    corpus["manifest"] = "other.manifest.json"
+
+    with pytest.raises(ValueError, match="does not reference the supplied manifest"):
+        validate_artifact_pair(
+            manifest,
+            corpus,
+            manifest_path=manifest_path,
+            corpus_path=corpus_path,
+        )

@@ -1261,6 +1261,36 @@ def load_corpus(path: str | Path = DEFAULT_CORPUS) -> dict[str, Any]:
     return dict(document)
 
 
+def validate_artifact_pair(
+    manifest: Mapping[str, Any],
+    corpus: Mapping[str, Any],
+    *,
+    manifest_path: str | Path | None = None,
+    corpus_path: str | Path | None = None,
+) -> None:
+    """Ensure a corpus file is evaluated with the manifest it names.
+
+    A corpus's ``manifest`` field is an artifact identity, not descriptive
+    metadata.  When both source paths are known, resolve that reference next
+    to the corpus and reject a mismatched pair before inspecting the target
+    checkout. Mapping-only callers cannot establish a filesystem identity and
+    therefore retain the existing in-memory API behavior.
+    """
+    if manifest_path is None or corpus_path is None:
+        return
+    reference = corpus.get("manifest")
+    if not isinstance(reference, str) or not reference:
+        raise ValueError("corpus.manifest must be a non-empty relative path")
+    corpus_file = Path(corpus_path).expanduser().resolve(strict=False)
+    manifest_file = Path(manifest_path).expanduser().resolve(strict=False)
+    referenced_file = (corpus_file.parent / reference).resolve(strict=False)
+    if referenced_file != manifest_file:
+        raise ValueError(
+            "corpus.manifest does not reference the supplied manifest: "
+            f"{reference!r} -> {referenced_file}, expected {manifest_file}"
+        )
+
+
 def _utc_now() -> str:
     return _datetime.datetime.now(_datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -2030,6 +2060,8 @@ def discover_environment(
     *,
     target_root: str | Path | None = None,
     manifest_root: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    corpus_path: str | Path | None = None,
     timeout: float = 5.0,
     probe_root: str | Path | None = None,
     dry_run: bool = False,
@@ -2046,6 +2078,12 @@ def discover_environment(
     # target-relative path through the filesystem to catch symlink escapes.
     validate_manifest(manifest, "manifest")
     validate_corpus(corpus, "corpus")
+    validate_artifact_pair(
+        manifest,
+        corpus,
+        manifest_path=manifest_path,
+        corpus_path=corpus_path,
+    )
     manifest_target = _mapping(manifest["target"], "manifest.target")
     root = Path(target_root or str(manifest_target["path"])).expanduser().resolve(
         strict=False
@@ -2203,11 +2241,19 @@ def run_evaluation(
     # can use the default ``load_manifest`` behavior directly.
     manifest = load_manifest(manifest_path, load_adapters=False)
     corpus = load_corpus(corpus_path)
+    validate_artifact_pair(
+        manifest,
+        corpus,
+        manifest_path=manifest_path,
+        corpus_path=corpus_path,
+    )
     result = discover_environment(
         manifest,
         corpus,
         target_root=target_root,
         manifest_root=Path(manifest_path).resolve().parent,
+        manifest_path=manifest_path,
+        corpus_path=corpus_path,
         timeout=timeout,
         probe_root=probe_root,
         dry_run=dry_run,
@@ -2286,6 +2332,7 @@ __all__ = [
     "run_evaluation",
     "validate_adapter_manifest",
     "validate_corpus",
+    "validate_artifact_pair",
     "validate_manifest",
 ]
 
