@@ -904,6 +904,99 @@ def _corpus_summary(
     return summary, diagnostics
 
 
+def execute_corpus(
+    manifest: Mapping[str, Any],
+    corpus: Mapping[str, Any],
+    *,
+    target_root: str | Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run the read-only portion of each corpus case.
+
+    This deliberately does not invoke a project build, configuration script,
+    or semantic tool.  It verifies that every case is executable against the
+    selected checkout and reports the remaining graph/lifecycle work as
+    ``not_run`` rather than treating an unmeasured case as a pass.
+    """
+    target = _mapping(manifest["target"], "manifest.target")
+    root = Path(target_root or str(target["path"])).expanduser().resolve()
+    case_results: list[dict[str, Any]] = []
+    for case in corpus.get("cases", []):
+        if not isinstance(case, Mapping):
+            continue
+        case_id = str(case.get("id", "unknown"))
+        paths: set[str] = set()
+        query = case.get("query")
+        if isinstance(query, Mapping):
+            endpoint = query.get("target")
+            if isinstance(endpoint, Mapping) and isinstance(endpoint.get("file"), str):
+                paths.add(endpoint["file"])
+        expected = case.get("expected")
+        if isinstance(expected, Mapping):
+            for relation_kind in ("positive", "negative", "unresolved"):
+                relations = expected.get(relation_kind, [])
+                if not isinstance(relations, list):
+                    continue
+                for relation in relations:
+                    if not isinstance(relation, Mapping):
+                        continue
+                    for endpoint_kind in ("source", "target"):
+                        endpoint = relation.get(endpoint_kind)
+                        if isinstance(endpoint, Mapping) and isinstance(endpoint.get("file"), str):
+                            paths.add(endpoint["file"])
+        missing = sorted(path for path in paths if not (root / path).is_file())
+        if not root.is_dir():
+            status = "blocked"
+            reason = "target_missing"
+        elif missing:
+            status = "blocked"
+            reason = "anchor_missing"
+        elif dry_run:
+            status = "dry_run"
+            reason = "execution_disabled"
+        else:
+            status = "ready_for_graph_execution"
+            reason = "graph_execution_not_implemented"
+        case_results.append(
+            {
+                "id": case_id,
+                "category": case.get("category"),
+                "status": status,
+                "reason": reason,
+                "anchors": sorted(paths),
+                "missing_anchors": missing,
+            }
+        )
+    lifecycle = {
+        phase: {
+            "status": "not_run",
+            "reason": "lifecycle execution is not enabled by this read-only evaluator",
+        }
+        for phase in (
+            "full_build",
+            "incremental_update",
+            "watch",
+            "forget",
+            "standalone_postprocess",
+        )
+    }
+    blocked = sum(item["status"] == "blocked" for item in case_results)
+    return {
+        "status": "blocked" if blocked else "dry_run" if dry_run else "not_run",
+        "dry_run": dry_run,
+        "case_results": case_results,
+        "lifecycle": lifecycle,
+        "metrics": {
+            "status": "not_run",
+            "precision": None,
+            "recall_at_10": None,
+            "impact": None,
+            "latency": None,
+            "adoption_pass": False,
+        },
+    }
+
+
 def discover_environment(
     manifest: Mapping[str, Any],
     corpus: Mapping[str, Any],
@@ -911,6 +1004,7 @@ def discover_environment(
     target_root: str | Path | None = None,
     timeout: float = 5.0,
     probe_root: str | Path | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Discover repository, generated-data, cache, and toolchain state.
 
@@ -942,6 +1036,9 @@ def discover_environment(
     )
     corpus_summary, corpus_diagnostics = _corpus_summary(corpus, root)
     diagnostics.extend(corpus_diagnostics)
+    corpus_execution = execute_corpus(
+        manifest, corpus, target_root=root, dry_run=dry_run
+    )
 
     expected_submodules = {
         item.get("path"): item
@@ -1004,6 +1101,7 @@ def discover_environment(
         "toolchain": toolchain,
         "cache": _cache_state(root, manifest),
         "corpus": corpus_summary,
+        "corpus_execution": corpus_execution,
         "diagnostics": diagnostics,
         "adoption_verdict": adoption_verdict,
         "generic_indexing": "independent_of_semantic_tool_availability",
@@ -1018,6 +1116,7 @@ def run_evaluation(
     target_root: str | Path | None = None,
     timeout: float = 5.0,
     probe_root: str | Path | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Load artifacts and return one structured, non-mutating observation."""
 
@@ -1029,6 +1128,7 @@ def run_evaluation(
         target_root=target_root,
         timeout=timeout,
         probe_root=probe_root,
+        dry_run=dry_run,
     )
     result["manifest"] = str(Path(manifest_path).resolve())
     result["corpus_artifact"] = str(Path(corpus_path).resolve())
@@ -1059,6 +1159,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--pretty", action="store_true", help="Indent JSON output")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check corpus anchors without graph or lifecycle execution",
+    )
     args = parser.parse_args(argv)
     try:
         result = run_evaluation(
@@ -1067,6 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_root=args.target_root,
             timeout=args.timeout,
             probe_root=args.probe_root,
+            dry_run=args.dry_run,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -1084,6 +1190,7 @@ __all__ = [
     "DEFAULT_CORPUS",
     "DEFAULT_MANIFEST",
     "discover_environment",
+    "execute_corpus",
     "load_corpus",
     "load_manifest",
     "main",
