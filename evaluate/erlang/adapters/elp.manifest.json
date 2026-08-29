@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "kind": "erlang_adapter_manifest",
+  "adapter": "elp",
+  "target": {
+    "name": "server_flexible",
+    "scope": "repository_root"
+  },
+  "activation": {
+    "mode": "explicit_opt_in",
+    "required": false,
+    "fallback": "generic_graph"
+  },
+  "contract": {
+    "role": "targeted semantic enrichment",
+    "evidence_kinds": ["CALLS", "REFERENCES", "TESTED_BY", "IMPLEMENTS"],
+    "query_kinds": ["enrichment", "callers_of", "tests_for", "impact", "references"]
+  },
+  "invocation": {
+    "mode": "argv",
+    "argv": ["elp", "query", "--format", "json", "{query_kind}", "{query_targets}"],
+    "executable": "elp",
+    "command_allowlist": {
+      "executables": ["elp"],
+      "subcommands": ["query"],
+      "flags": ["--format", "json"],
+      "reject_shell_metacharacters": true
+    },
+    "shell": false,
+    "cwd": "repository_root",
+    "stdin": "devnull",
+    "environment_allowlist": ["PATH", "HOME", "LANG", "LC_ALL", "ELP_HOME", "ELP_OTP_VERSION"]
+  },
+  "timeout": {
+    "default_seconds": 15,
+    "max_seconds": 300,
+    "version_probe_seconds": 2,
+    "on_exceeded": "status_timeout_and_retain_previous_evidence",
+    "return_code": 124
+  },
+  "failure": {
+    "default_status": "degraded",
+    "fallback": "generic_graph",
+    "events": {
+      "missing_tool": {
+        "status": "unavailable",
+        "diagnostic_codes": ["elp_unavailable"],
+        "action": "continue_with_generic",
+        "fallback": "generic_graph"
+      },
+      "nonzero_exit": {
+        "status": "failed",
+        "diagnostic_codes": ["elp_failed"],
+        "action": "retain_previous_evidence",
+        "fallback": "generic_graph"
+      },
+      "timeout": {
+        "status": "timeout",
+        "diagnostic_codes": ["elp_timeout"],
+        "action": "retain_previous_evidence",
+        "fallback": "generic_graph"
+      },
+      "malformed_output": {
+        "status": "malformed",
+        "diagnostic_codes": ["elp_malformed_output", "elp_no_evidence"],
+        "action": "discard_adapter_evidence",
+        "fallback": "generic_graph"
+      }
+    }
+  },
+  "output": {
+    "format": "json",
+    "stream": "stdout",
+    "max_bytes": 2000000,
+    "malformed": {
+      "status": "malformed",
+      "diagnostic_codes": ["elp_malformed_output"],
+      "action": "discard_adapter_evidence",
+      "fallback": "generic_graph"
+    }
+  },
+  "provenance": {
+    "source": "elp",
+    "tool": "elp",
+    "required_fields": [
+      "source",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "query_kind",
+      "query_targets",
+      "status",
+      "analysis_key",
+      "command",
+      "duration_seconds",
+      "cache_state"
+    ],
+    "command_recorded": true,
+    "raw_output_recorded": true
+  },
+  "cache": {
+    "enabled": true,
+    "key_fields": [
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "query_kind",
+      "query_targets"
+    ],
+    "key_algorithm": "sha256(canonical_json(key_fields))",
+    "path_template": "{cache_dir}/{analysis_key}.json",
+    "stale_policy": "reject_revision_mismatch",
+    "atomic_write": true
+  },
+  "sandbox": {
+    "cwd": "repository_root",
+    "read_paths": ["target_source", "target_dependencies", "elp_workspace"],
+    "write_paths": ["cache_dir", "adapter_workspace"],
+    "network": "deny",
+    "project_code_execution": "tool_defined_only",
+    "config_scripts": "never_executed_by_crg",
+    "outside_workspace": "deny",
+    "allow_target_writes": false,
+    "known_side_effects": ["ELP may create workspace metadata unless ELP_HOME is redirected"]
+  },
+  "enforcement": {
+    "runtime_policy_enforced": false,
+    "status": "described_only",
+    "degraded_status": "degraded",
+    "diagnostic_code": "adapter_manifest_policy_not_enforced"
+  }
+}

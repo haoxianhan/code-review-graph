@@ -21,6 +21,9 @@ from typing import Any, Mapping, Sequence
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "erlang_evaluation_manifest"
 CORPUS_KIND = "erlang_evaluation_corpus"
+ADAPTER_MANIFEST_SCHEMA_VERSION = 1
+ADAPTER_MANIFEST_KIND = "erlang_adapter_manifest"
+ERLANG_ADAPTERS = ("generic", "elp", "xref", "dialyzer")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 GENERATED_REV_RE = re.compile(r"DATA_REV=(?P<value>[^\n\r]+)")
@@ -67,6 +70,74 @@ TOOL_STATUSES = {
 MODULE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = MODULE_ROOT / "evaluate" / "erlang" / "server_flexible.manifest.json"
 DEFAULT_CORPUS = MODULE_ROOT / "evaluate" / "erlang" / "corpus.json"
+DEFAULT_ADAPTER_MANIFEST_DIR = MODULE_ROOT / "evaluate" / "erlang" / "adapters"
+DEFAULT_ADAPTER_MANIFESTS = {
+    name: DEFAULT_ADAPTER_MANIFEST_DIR / f"{name}.manifest.json"
+    for name in ERLANG_ADAPTERS
+}
+
+ADAPTER_MANIFEST_REQUIRED_KEYS = {
+    "schema_version",
+    "kind",
+    "adapter",
+    "target",
+    "activation",
+    "contract",
+    "invocation",
+    "timeout",
+    "failure",
+    "output",
+    "provenance",
+    "cache",
+    "sandbox",
+    "enforcement",
+}
+ADAPTER_MANIFEST_FAILURE_EVENTS = (
+    "missing_tool",
+    "nonzero_exit",
+    "timeout",
+    "malformed_output",
+)
+ADAPTER_MANIFEST_PROVENANCE_FIELDS = {
+    "source",
+    "tool",
+    "tool_version",
+    "otp_version",
+    "repository",
+    "source_revision",
+    "generated_data_revision",
+    "configuration_digest",
+    "query_kind",
+    "query_targets",
+    "status",
+    "analysis_key",
+    "command",
+    "duration_seconds",
+    "cache_state",
+}
+ADAPTER_MANIFEST_CACHE_FIELDS = {
+    "repository",
+    "source_revision",
+    "generated_data_revision",
+    "configuration_digest",
+    "tool",
+    "tool_version",
+    "otp_version",
+    "query_kind",
+    "query_targets",
+}
+ADAPTER_MANIFEST_STATUSES = {
+    "ok",
+    "optional",
+    "unavailable",
+    "degraded",
+    "failed",
+    "malformed",
+    "timeout",
+    "stale",
+    "mismatch",
+    "not_applicable",
+}
 
 
 def _error(source: str, message: str) -> ValueError:
@@ -98,6 +169,377 @@ def _sha(value: object, source: str, *, full: bool = False) -> str:
     if not pattern.fullmatch(result):
         raise _error(source, "expected a hexadecimal Git revision")
     return result
+
+
+def _validate_string_list(value: object, source: str, *, allow_empty: bool = True) -> list[str]:
+    """Validate a JSON string array and return its normalized values."""
+    values = _list(value, source)
+    result: list[str] = []
+    for index, item in enumerate(values):
+        result.append(_string(item, f"{source}[{index}]"))
+    if not allow_empty and not result:
+        raise _error(source, "must not be empty")
+    return result
+
+
+def _validate_relative_path(value: object, source: str) -> str:
+    path = _string(value, source)
+    if Path(path).is_absolute() or "\\" in path:
+        raise _error(source, "must be a repository-relative POSIX path or placeholder")
+    parts = Path(path).parts
+    if ".." in parts:
+        raise _error(source, "must not escape the execution workspace")
+    return path
+
+
+def _validate_adapter_failure_event(value: object, source: str) -> None:
+    event = _mapping(value, source)
+    status = _string(event.get("status"), f"{source}.status")
+    if status not in ADAPTER_MANIFEST_STATUSES:
+        raise _error(f"{source}.status", f"unsupported adapter status {status!r}")
+    codes = _validate_string_list(event.get("diagnostic_codes", []), f"{source}.diagnostic_codes")
+    if status not in {"ok", "not_applicable"} and not codes:
+        raise _error(f"{source}.diagnostic_codes", "must identify an observable diagnostic")
+    _string(event.get("action"), f"{source}.action")
+    fallback = event.get("fallback", "generic_graph")
+    _string(fallback, f"{source}.fallback")
+
+
+def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest>") -> None:
+    """Validate one checked-in Erlang adapter execution manifest.
+
+    The manifest is intentionally declarative.  It records the boundary a
+    deployment must provide; the current semantic adapters do not load these
+    files at runtime, so external adapters explicitly report that policy
+    enforcement is caller-owned.
+    """
+
+    document = _mapping(manifest, source)
+    missing = ADAPTER_MANIFEST_REQUIRED_KEYS - set(document)
+    if missing:
+        raise _error(source, f"missing keys: {', '.join(sorted(missing))}")
+    if document.get("schema_version") != ADAPTER_MANIFEST_SCHEMA_VERSION:
+        raise _error(
+            source,
+            f"unsupported schema_version {document.get('schema_version')!r}",
+        )
+    if document.get("kind") != ADAPTER_MANIFEST_KIND:
+        raise _error(source, f"expected kind {ADAPTER_MANIFEST_KIND!r}")
+    adapter = _string(document.get("adapter"), f"{source}.adapter").casefold()
+    if adapter not in ERLANG_ADAPTERS:
+        raise _error(f"{source}.adapter", f"unsupported adapter {adapter!r}")
+
+    target = _mapping(document["target"], f"{source}.target")
+    _string(target.get("name"), f"{source}.target.name")
+    scope = _string(target.get("scope"), f"{source}.target.scope")
+    if scope not in {"repository_root", "workspace"}:
+        raise _error(f"{source}.target.scope", f"unsupported scope {scope!r}")
+
+    activation = _mapping(document["activation"], f"{source}.activation")
+    mode = _string(activation.get("mode"), f"{source}.activation.mode")
+    if mode not in {"always", "explicit_opt_in", "never"}:
+        raise _error(f"{source}.activation.mode", f"unsupported mode {mode!r}")
+    if not isinstance(activation.get("required"), bool):
+        raise _error(f"{source}.activation.required", "expected boolean")
+    _string(activation.get("fallback"), f"{source}.activation.fallback")
+
+    contract = _mapping(document["contract"], f"{source}.contract")
+    _string(contract.get("role"), f"{source}.contract.role")
+    _validate_string_list(contract.get("evidence_kinds", []), f"{source}.contract.evidence_kinds")
+    _validate_string_list(contract.get("query_kinds", []), f"{source}.contract.query_kinds")
+
+    invocation = _mapping(document["invocation"], f"{source}.invocation")
+    argv = _validate_string_list(
+        invocation.get("argv", []), f"{source}.invocation.argv", allow_empty=adapter == "generic"
+    )
+    if adapter != "generic" and not argv:
+        raise _error(f"{source}.invocation.argv", "external adapters require an argv template")
+    if not isinstance(invocation.get("shell"), bool):
+        raise _error(f"{source}.invocation.shell", "expected boolean")
+    if invocation.get("shell"):
+        raise _error(f"{source}.invocation.shell", "shell execution is forbidden")
+    invocation_cwd = _string(invocation.get("cwd"), f"{source}.invocation.cwd")
+    if invocation_cwd not in {"repository_root", "workspace", "probe_root", "not_applicable"}:
+        raise _error(f"{source}.invocation.cwd", f"unsupported cwd policy {invocation_cwd!r}")
+    _string(invocation.get("stdin"), f"{source}.invocation.stdin")
+    _validate_string_list(
+        invocation.get("environment_allowlist", []),
+        f"{source}.invocation.environment_allowlist",
+    )
+    allowlist = _mapping(
+        invocation.get("command_allowlist"), f"{source}.invocation.command_allowlist"
+    )
+    _validate_string_list(
+        allowlist.get("executables"),
+        f"{source}.invocation.command_allowlist.executables",
+    )
+    _validate_string_list(
+        allowlist.get("subcommands"),
+        f"{source}.invocation.command_allowlist.subcommands",
+    )
+    _validate_string_list(
+        allowlist.get("flags"),
+        f"{source}.invocation.command_allowlist.flags",
+    )
+    executables = allowlist.get("executables")
+    subcommands = allowlist.get("subcommands")
+    if adapter != "generic" and (
+        not isinstance(executables, list)
+        or not executables
+        or not isinstance(subcommands, list)
+        or not subcommands
+    ):
+        raise _error(
+            f"{source}.invocation.command_allowlist",
+            "external adapters require executable and subcommand allowlists",
+        )
+    if not isinstance(allowlist.get("reject_shell_metacharacters"), bool):
+        raise _error(
+            f"{source}.invocation.command_allowlist.reject_shell_metacharacters",
+            "expected boolean",
+        )
+    if not allowlist["reject_shell_metacharacters"]:
+        raise _error(
+            f"{source}.invocation.command_allowlist.reject_shell_metacharacters",
+            "must be true",
+        )
+    if adapter == "generic" and argv:
+        raise _error(f"{source}.invocation.argv", "Generic adapter must not execute a command")
+
+    timeout = _mapping(document["timeout"], f"{source}.timeout")
+    default_seconds = timeout.get("default_seconds")
+    max_seconds = timeout.get("max_seconds")
+    for field_name, value in (("default_seconds", default_seconds), ("max_seconds", max_seconds)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise _error(f"{source}.timeout.{field_name}", "expected a non-negative number")
+    probe_seconds = timeout.get("version_probe_seconds")
+    if (
+        not isinstance(probe_seconds, (int, float))
+        or isinstance(probe_seconds, bool)
+        or probe_seconds < 0
+    ):
+        raise _error(
+            f"{source}.timeout.version_probe_seconds",
+            "expected a non-negative number",
+        )
+    if adapter != "generic" and (default_seconds <= 0 or max_seconds <= 0):
+        raise _error(f"{source}.timeout", "external adapters require a positive timeout")
+    if max_seconds < default_seconds or max_seconds > 300:
+        raise _error(
+            f"{source}.timeout.max_seconds",
+            "must bound the default timeout and be <= 300",
+        )
+    _string(timeout.get("on_exceeded"), f"{source}.timeout.on_exceeded")
+    if not isinstance(timeout.get("return_code"), int) or isinstance(
+        timeout.get("return_code"), bool
+    ):
+        raise _error(f"{source}.timeout.return_code", "expected integer")
+
+    failure = _mapping(document["failure"], f"{source}.failure")
+    events = _mapping(failure.get("events"), f"{source}.failure.events")
+    for event_name in ADAPTER_MANIFEST_FAILURE_EVENTS:
+        if event_name not in events:
+            raise _error(f"{source}.failure.events", f"missing event {event_name!r}")
+        _validate_adapter_failure_event(events[event_name], f"{source}.failure.events.{event_name}")
+    for event_name, event in events.items():
+        if event_name not in ADAPTER_MANIFEST_FAILURE_EVENTS:
+            _validate_adapter_failure_event(event, f"{source}.failure.events.{event_name}")
+    _string(failure.get("default_status"), f"{source}.failure.default_status")
+    _string(failure.get("fallback"), f"{source}.failure.fallback")
+
+    output = _mapping(document["output"], f"{source}.output")
+    _string(output.get("format"), f"{source}.output.format")
+    _string(output.get("stream"), f"{source}.output.stream")
+    max_bytes = output.get("max_bytes")
+    if max_bytes is not None and (
+        not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0
+    ):
+        raise _error(f"{source}.output.max_bytes", "expected a positive integer or null")
+    malformed = _mapping(output.get("malformed"), f"{source}.output.malformed")
+    _validate_adapter_failure_event(malformed, f"{source}.output.malformed")
+
+    provenance = _mapping(document["provenance"], f"{source}.provenance")
+    required_fields = set(
+        _validate_string_list(
+            provenance.get("required_fields"),
+            f"{source}.provenance.required_fields",
+            allow_empty=False,
+        )
+    )
+    missing_provenance = ADAPTER_MANIFEST_PROVENANCE_FIELDS - required_fields
+    if missing_provenance:
+        raise _error(
+            f"{source}.provenance.required_fields",
+            f"missing fields: {', '.join(sorted(missing_provenance))}",
+        )
+    if adapter == "dialyzer" and "plt_identity" not in required_fields:
+        raise _error(
+            f"{source}.provenance.required_fields",
+            "Dialyzer provenance must include plt_identity",
+        )
+    _string(provenance.get("source"), f"{source}.provenance.source")
+    _string(provenance.get("tool"), f"{source}.provenance.tool")
+    for field_name in ("command_recorded", "raw_output_recorded"):
+        if not isinstance(provenance.get(field_name), bool):
+            raise _error(f"{source}.provenance.{field_name}", "expected boolean")
+
+    cache = _mapping(document["cache"], f"{source}.cache")
+    if not isinstance(cache.get("enabled"), bool):
+        raise _error(f"{source}.cache.enabled", "expected boolean")
+    key_fields = set(
+        _validate_string_list(
+            cache.get("key_fields"),
+            f"{source}.cache.key_fields",
+            allow_empty=False,
+        )
+    )
+    missing_cache_fields = ADAPTER_MANIFEST_CACHE_FIELDS - key_fields
+    if missing_cache_fields:
+        raise _error(
+            f"{source}.cache.key_fields",
+            f"missing fields: {', '.join(sorted(missing_cache_fields))}",
+        )
+    if adapter == "dialyzer" and "plt_identity" not in key_fields:
+        raise _error(f"{source}.cache.key_fields", "Dialyzer cache keys must include plt_identity")
+    key_algorithm = _string(cache.get("key_algorithm"), f"{source}.cache.key_algorithm")
+    if not key_algorithm.casefold().startswith("sha256"):
+        raise _error(f"{source}.cache.key_algorithm", "must use SHA-256")
+    _string(cache.get("path_template"), f"{source}.cache.path_template")
+    _string(cache.get("stale_policy"), f"{source}.cache.stale_policy")
+    if not isinstance(cache.get("atomic_write"), bool):
+        raise _error(f"{source}.cache.atomic_write", "expected boolean")
+
+    sandbox = _mapping(document["sandbox"], f"{source}.sandbox")
+    sandbox_cwd = _string(sandbox.get("cwd"), f"{source}.sandbox.cwd")
+    if adapter != "generic" and sandbox_cwd != invocation_cwd:
+        raise _error(f"{source}.sandbox.cwd", "must match invocation.cwd")
+    for field_name in ("read_paths", "write_paths"):
+        paths = _validate_string_list(sandbox.get(field_name), f"{source}.sandbox.{field_name}")
+        for index, path in enumerate(paths):
+            _validate_relative_path(path, f"{source}.sandbox.{field_name}[{index}]")
+    network = _string(sandbox.get("network"), f"{source}.sandbox.network")
+    if network not in {"none", "deny", "allow", "controlled"}:
+        raise _error(f"{source}.sandbox.network", f"unsupported network policy {network!r}")
+    if adapter != "generic" and network not in {"deny", "controlled"}:
+        raise _error(
+            f"{source}.sandbox.network",
+            "external adapters require a denied/controlled network",
+        )
+    _string(sandbox.get("project_code_execution"), f"{source}.sandbox.project_code_execution")
+    _string(sandbox.get("config_scripts"), f"{source}.sandbox.config_scripts")
+    if not isinstance(sandbox.get("outside_workspace"), str):
+        raise _error(f"{source}.sandbox.outside_workspace", "expected string policy")
+    if "allow_target_writes" in sandbox and not isinstance(sandbox["allow_target_writes"], bool):
+        raise _error(f"{source}.sandbox.allow_target_writes", "expected boolean")
+
+    enforcement = _mapping(document["enforcement"], f"{source}.enforcement")
+    runtime_enforced = enforcement.get("runtime_policy_enforced")
+    if not isinstance(runtime_enforced, bool):
+        raise _error(f"{source}.enforcement.runtime_policy_enforced", "expected boolean")
+    enforcement_status = _string(enforcement.get("status"), f"{source}.enforcement.status")
+    if enforcement_status not in {"intrinsic", "enforced", "described_only", "unavailable"}:
+        raise _error(f"{source}.enforcement.status", f"unsupported status {enforcement_status!r}")
+    if not runtime_enforced:
+        _string(enforcement.get("degraded_status"), f"{source}.enforcement.degraded_status")
+        _string(enforcement.get("diagnostic_code"), f"{source}.enforcement.diagnostic_code")
+
+
+def _adapter_manifest_paths(
+    directory: str | Path = DEFAULT_ADAPTER_MANIFEST_DIR,
+    paths: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
+) -> dict[str, Path]:
+    root = Path(directory).expanduser().resolve()
+    if paths is None:
+        return {name: root / f"{name}.manifest.json" for name in ERLANG_ADAPTERS}
+    if isinstance(paths, Mapping):
+        values = {str(name).casefold(): Path(path) for name, path in paths.items()}
+    else:
+        values = {}
+        for path in paths:
+            candidate = Path(path)
+            values[candidate.name.removesuffix(".manifest.json").casefold()] = candidate
+    if set(values) != set(ERLANG_ADAPTERS):
+        missing = set(ERLANG_ADAPTERS) - set(values)
+        extra = set(values) - set(ERLANG_ADAPTERS)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(sorted(missing))}")
+        if extra:
+            details.append(f"unknown: {', '.join(sorted(extra))}")
+        raise _error("adapter_manifests", "; ".join(details))
+    result: dict[str, Path] = {}
+    for name, path in values.items():
+        resolved = path if path.is_absolute() else root / path
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise _error(
+                f"adapter_manifests.{name}",
+                "path escapes the manifest directory",
+            ) from exc
+        result[name] = resolved
+    return result
+
+
+def load_adapter_manifests(
+    directory: str | Path = DEFAULT_ADAPTER_MANIFEST_DIR,
+    *,
+    paths: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load and validate all four checked-in Erlang adapter manifests."""
+    manifest_paths = _adapter_manifest_paths(directory, paths)
+    loaded: dict[str, dict[str, Any]] = {}
+    for name, path in manifest_paths.items():
+        if not path.is_file():
+            raise _error(str(path), "adapter manifest is missing")
+        document = _load_json(path)
+        validate_adapter_manifest(document, str(path))
+        if str(document.get("adapter", "")).casefold() != name:
+            raise _error(str(path), f"adapter name does not match expected {name!r}")
+        loaded[name] = dict(document)
+    return loaded
+
+
+def inspect_adapter_manifests(
+    directory: str | Path = DEFAULT_ADAPTER_MANIFEST_DIR,
+    *,
+    paths: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
+) -> dict[str, Any]:
+    """Return an observable policy status without raising on bad artifacts."""
+    try:
+        manifests = load_adapter_manifests(directory, paths=paths)
+    except (OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "unavailable",
+            "runtime_policy_enforced": False,
+            "manifests": [],
+            "diagnostics": [
+                _diagnostic(
+                    "adapter_manifest_unavailable",
+                    "warning",
+                    f"No valid Erlang adapter policy is available: {exc}",
+                )
+            ],
+        }
+    unenforced = [
+        name
+        for name, manifest in manifests.items()
+        if not manifest["enforcement"]["runtime_policy_enforced"]
+    ]
+    diagnostics = [
+        _diagnostic(
+            "adapter_manifest_policy_not_enforced",
+            "warning",
+            "Adapter manifest is descriptive; runtime sandbox enforcement remains caller-owned.",
+            adapters=unenforced,
+        )
+    ] if unenforced else []
+    return {
+        "status": "degraded" if unenforced else "ok",
+        "runtime_policy_enforced": not unenforced,
+        "manifests": sorted(manifests),
+        "diagnostics": diagnostics,
+    }
 
 
 def _validate_diagnostics(value: object, source: str) -> None:
@@ -214,6 +656,44 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
     _mapping(document["evaluation"], f"{source}.evaluation")
     _validate_diagnostics(document.get("diagnostics", []), f"{source}.diagnostics")
 
+    # Adapter policies are additive to the original evaluation-manifest
+    # schema.  When present, validate the index here; ``load_manifest`` then
+    # loads each referenced child manifest and applies the full contract.
+    adapter_index = document.get("adapters", document.get("adapter_manifests"))
+    if adapter_index is not None:
+        index = _mapping(adapter_index, f"{source}.adapters")
+        directory = _validate_relative_path(
+            index.get("directory"), f"{source}.adapters.directory"
+        )
+        if not directory:
+            raise _error(f"{source}.adapters.directory", "must not be empty")
+        files = _mapping(index.get("files"), f"{source}.adapters.files")
+        if set(str(key).casefold() for key in files) != set(ERLANG_ADAPTERS):
+            raise _error(
+                f"{source}.adapters.files",
+                f"must list exactly: {', '.join(ERLANG_ADAPTERS)}",
+            )
+        for name, value in files.items():
+            child_path = _validate_relative_path(value, f"{source}.adapters.files.{name}")
+            if not child_path.endswith(".manifest.json"):
+                raise _error(
+                    f"{source}.adapters.files.{name}",
+                    "must point to a .manifest.json file",
+                )
+        runtime_policy = _string(
+            index.get("runtime_policy"), f"{source}.adapters.runtime_policy"
+        )
+        if runtime_policy not in {"enforced", "described_only", "mixed"}:
+            raise _error(
+                f"{source}.adapters.runtime_policy",
+                f"unsupported runtime policy {runtime_policy!r}",
+            )
+        _string(index.get("invalid_policy_status"), f"{source}.adapters.invalid_policy_status")
+        _string(
+            index.get("invalid_policy_diagnostic"),
+            f"{source}.adapters.invalid_policy_diagnostic",
+        )
+
 
 def _validate_endpoint(value: object, source: str) -> None:
     if isinstance(value, str):
@@ -304,12 +784,28 @@ def _load_json(path: Path) -> Any:
         raise _error(str(path), f"invalid JSON at line {exc.lineno}, column {exc.colno}") from exc
 
 
-def load_manifest(path: str | Path = DEFAULT_MANIFEST) -> dict[str, Any]:
-    """Load and validate an Erlang evaluation manifest."""
+def load_manifest(
+    path: str | Path = DEFAULT_MANIFEST,
+    *,
+    load_adapters: bool = True,
+) -> dict[str, Any]:
+    """Load an evaluation manifest and, by default, its adapter policies."""
 
     manifest_path = Path(path)
     document = _load_json(manifest_path)
     validate_manifest(document, str(manifest_path))
+    adapter_index = document.get("adapters", document.get("adapter_manifests"))
+    if load_adapters and adapter_index is not None:
+        index = _mapping(adapter_index, f"{manifest_path}.adapters")
+        directory = manifest_path.parent / str(index["directory"])
+        child_paths = {
+            str(name).casefold(): directory / str(child)
+            for name, child in _mapping(index["files"], f"{manifest_path}.adapters.files").items()
+        }
+        document["_adapter_manifests"] = load_adapter_manifests(
+            directory,
+            paths=child_paths,
+        )
     return dict(document)
 
 
@@ -1002,6 +1498,7 @@ def discover_environment(
     corpus: Mapping[str, Any],
     *,
     target_root: str | Path | None = None,
+    manifest_root: str | Path | None = None,
     timeout: float = 5.0,
     probe_root: str | Path | None = None,
     dry_run: bool = False,
@@ -1021,6 +1518,20 @@ def discover_environment(
         root, _mapping(manifest["generated_data"], "manifest.generated_data")
     )
     diagnostics.extend(generated_diagnostics)
+    adapter_policy: dict[str, Any]
+    adapter_index = manifest.get("adapters", manifest.get("adapter_manifests"))
+    if adapter_index is None:
+        adapter_policy = inspect_adapter_manifests()
+    else:
+        index = _mapping(adapter_index, "manifest.adapters")
+        index_root = Path(manifest_root or MODULE_ROOT / "evaluate" / "erlang").resolve()
+        adapter_directory = index_root / str(index["directory"])
+        child_paths = {
+            str(name).casefold(): adapter_directory / str(child)
+            for name, child in _mapping(index["files"], "manifest.adapters.files").items()
+        }
+        adapter_policy = inspect_adapter_manifests(adapter_directory, paths=child_paths)
+    diagnostics.extend(adapter_policy.get("diagnostics", []))
     toolchain, tool_diagnostics = _discover_toolchain(
         root,
         _mapping(manifest["toolchain"], "manifest.toolchain"),
@@ -1099,6 +1610,7 @@ def discover_environment(
         "repository": repository,
         "generated_data": generated,
         "toolchain": toolchain,
+        "adapter_policy": adapter_policy,
         "cache": _cache_state(root, manifest),
         "corpus": corpus_summary,
         "corpus_execution": corpus_execution,
@@ -1120,12 +1632,18 @@ def run_evaluation(
 ) -> dict[str, Any]:
     """Load artifacts and return one structured, non-mutating observation."""
 
-    manifest = load_manifest(manifest_path)
+    # Keep evaluation observable even when a policy artifact is missing or
+    # malformed.  ``discover_environment`` turns that condition into an
+    # ``adapter_policy.status = unavailable`` diagnostic instead of aborting
+    # the read-only observation; callers that need strict startup validation
+    # can use the default ``load_manifest`` behavior directly.
+    manifest = load_manifest(manifest_path, load_adapters=False)
     corpus = load_corpus(corpus_path)
     result = discover_environment(
         manifest,
         corpus,
         target_root=target_root,
+        manifest_root=Path(manifest_path).resolve().parent,
         timeout=timeout,
         probe_root=probe_root,
         dry_run=dry_run,
@@ -1187,14 +1705,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "ADAPTER_MANIFEST_KIND",
+    "ADAPTER_MANIFEST_SCHEMA_VERSION",
+    "DEFAULT_ADAPTER_MANIFEST_DIR",
+    "DEFAULT_ADAPTER_MANIFESTS",
     "DEFAULT_CORPUS",
     "DEFAULT_MANIFEST",
+    "ERLANG_ADAPTERS",
     "discover_environment",
     "execute_corpus",
+    "inspect_adapter_manifests",
     "load_corpus",
     "load_manifest",
+    "load_adapter_manifests",
     "main",
     "run_evaluation",
+    "validate_adapter_manifest",
     "validate_corpus",
     "validate_manifest",
 ]

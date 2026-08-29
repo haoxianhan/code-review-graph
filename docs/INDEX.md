@@ -12,4 +12,5 @@
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) -- Common issues and fixes (including Windows/WSL)
 - [REPRODUCING.md](REPRODUCING.md) -- Reproducing every benchmark number (pinned SHAs, seeded runs, tokenizer calibration)
 - [ROADMAP.md](ROADMAP.md) -- Shipped and planned features
+- [ERLANG_ADAPTER_MANIFESTS.md](ERLANG_ADAPTER_MANIFESTS.md) -- Checked-in Erlang adapter execution and sandbox contracts
 - [LEGAL.md](LEGAL.md) -- License and privacy

@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "kind": "erlang_adapter_manifest",
+  "adapter": "dialyzer",
+  "target": {
+    "name": "server_flexible",
+    "scope": "repository_root"
+  },
+  "activation": {
+    "mode": "explicit_opt_in",
+    "required": false,
+    "fallback": "generic_graph"
+  },
+  "contract": {
+    "role": "typed diagnostics with source locations",
+    "evidence_kinds": ["DIALYZER_DIAGNOSTIC"],
+    "query_kinds": ["diagnostics"]
+  },
+  "invocation": {
+    "mode": "argv",
+    "argv": ["rebar3", "dialyzer"],
+    "executable": "rebar3",
+    "command_allowlist": {
+      "executables": ["rebar3"],
+      "subcommands": ["dialyzer"],
+      "flags": [],
+      "reject_shell_metacharacters": true
+    },
+    "shell": false,
+    "cwd": "repository_root",
+    "stdin": "devnull",
+    "environment_allowlist": ["PATH", "HOME", "LANG", "LC_ALL", "ERL_LIBS", "REBAR_COLOR", "REBAR_CACHE_DIR"]
+  },
+  "timeout": {
+    "default_seconds": 15,
+    "max_seconds": 300,
+    "version_probe_seconds": 2,
+    "on_exceeded": "status_timeout_and_omit_diagnostics",
+    "return_code": 124
+  },
+  "failure": {
+    "default_status": "degraded",
+    "fallback": "generic_graph",
+    "events": {
+      "missing_tool": {
+        "status": "unavailable",
+        "diagnostic_codes": ["dialyzer_unavailable"],
+        "action": "omit_diagnostics",
+        "fallback": "generic_graph"
+      },
+      "nonzero_exit": {
+        "status": "failed",
+        "diagnostic_codes": ["dialyzer_failed"],
+        "action": "retain_parseable_warnings_only",
+        "fallback": "generic_graph"
+      },
+      "timeout": {
+        "status": "timeout",
+        "diagnostic_codes": ["dialyzer_timeout"],
+        "action": "omit_diagnostics",
+        "fallback": "generic_graph"
+      },
+      "malformed_output": {
+        "status": "malformed",
+        "diagnostic_codes": ["dialyzer_malformed_output"],
+        "action": "discard_unparseable_diagnostics",
+        "fallback": "generic_graph"
+      }
+    }
+  },
+  "output": {
+    "format": "location_text",
+    "stream": "stdout_and_stderr",
+    "max_bytes": 2000000,
+    "malformed": {
+      "status": "malformed",
+      "diagnostic_codes": ["dialyzer_malformed_output"],
+      "action": "discard_unparseable_diagnostics",
+      "fallback": "generic_graph"
+    }
+  },
+  "provenance": {
+    "source": "dialyzer",
+    "tool": "rebar3",
+    "required_fields": [
+      "source",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "query_kind",
+      "query_targets",
+      "plt_identity",
+      "status",
+      "analysis_key",
+      "command",
+      "duration_seconds",
+      "cache_state"
+    ],
+    "command_recorded": true,
+    "raw_output_recorded": true
+  },
+  "cache": {
+    "enabled": true,
+    "key_fields": [
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "query_kind",
+      "query_targets",
+      "plt_identity"
+    ],
+    "key_algorithm": "sha256(canonical_json(key_fields))",
+    "path_template": "{cache_dir}/{analysis_key}.json",
+    "stale_policy": "reject_revision_or_plt_mismatch",
+    "atomic_write": true
+  },
+  "sandbox": {
+    "cwd": "repository_root",
+    "read_paths": ["target_source", "target_dependencies", "plt_path", "target_build"],
+    "write_paths": ["cache_dir", "adapter_workspace"],
+    "network": "deny",
+    "project_code_execution": "rebar3_task_may_load_plugins",
+    "config_scripts": "must_be_disabled_or_reviewed_before_enablement",
+    "outside_workspace": "deny",
+    "allow_target_writes": false,
+    "plt_write_policy": "read_only",
+    "known_side_effects": ["rebar3 may populate _build or create a PLT when configured"]
+  },
+  "enforcement": {
+    "runtime_policy_enforced": false,
+    "status": "described_only",
+    "degraded_status": "degraded",
+    "diagnostic_code": "adapter_manifest_policy_not_enforced"
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "kind": "erlang_adapter_manifest",
+  "adapter": "generic",
+  "target": {
+    "name": "server_flexible",
+    "scope": "repository_root"
+  },
+  "activation": {
+    "mode": "always",
+    "required": true,
+    "fallback": "none"
+  },
+  "contract": {
+    "role": "syntax-backed baseline",
+    "evidence_kinds": [
+      "FILE",
+      "MODULE",
+      "FUNCTION",
+      "TEST",
+      "RECORD",
+      "TYPE",
+      "CONTAINS",
+      "CALLS",
+      "IMPORTS_FROM"
+    ],
+    "query_kinds": [
+      "search",
+      "callers_of",
+      "callees_of",
+      "impact",
+      "tests_for"
+    ]
+  },
+  "invocation": {
+    "mode": "in_process",
+    "argv": [],
+    "executable": null,
+    "command_allowlist": {
+      "executables": [],
+      "subcommands": [],
+      "flags": [],
+      "reject_shell_metacharacters": true
+    },
+    "shell": false,
+    "cwd": "repository_root",
+    "stdin": "not_applicable",
+    "environment_allowlist": []
+  },
+  "timeout": {
+    "default_seconds": 0,
+    "max_seconds": 0,
+    "version_probe_seconds": 0,
+    "on_exceeded": "record_parse_failure_without_external_retry",
+    "return_code": 125
+  },
+  "failure": {
+    "default_status": "degraded",
+    "fallback": "none",
+    "events": {
+      "missing_tool": {
+        "status": "not_applicable",
+        "diagnostic_codes": ["generic_tool_not_applicable"],
+        "action": "continue",
+        "fallback": "none"
+      },
+      "nonzero_exit": {
+        "status": "failed",
+        "diagnostic_codes": ["generic_parse_failed"],
+        "action": "retain_previous_graph",
+        "fallback": "none"
+      },
+      "timeout": {
+        "status": "not_applicable",
+        "diagnostic_codes": ["generic_timeout_not_applicable"],
+        "action": "retain_previous_graph",
+        "fallback": "none"
+      },
+      "malformed_output": {
+        "status": "malformed",
+        "diagnostic_codes": ["generic_parse_failed"],
+        "action": "discard_partial_records",
+        "fallback": "none"
+      }
+    }
+  },
+  "output": {
+    "format": "graph_records",
+    "stream": "in_process",
+    "max_bytes": null,
+    "malformed": {
+      "status": "malformed",
+      "diagnostic_codes": ["generic_parse_failed"],
+      "action": "discard_partial_records",
+      "fallback": "none"
+    }
+  },
+  "provenance": {
+    "source": "generic",
+    "tool": "code-review-graph",
+    "required_fields": [
+      "source",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "query_kind",
+      "query_targets",
+      "status",
+      "analysis_key",
+      "command",
+      "duration_seconds",
+      "cache_state"
+    ],
+    "command_recorded": true,
+    "raw_output_recorded": false
+  },
+  "cache": {
+    "enabled": false,
+    "key_fields": [
+      "repository",
+      "source_revision",
+      "generated_data_revision",
+      "configuration_digest",
+      "tool",
+      "tool_version",
+      "otp_version",
+      "query_kind",
+      "query_targets"
+    ],
+    "key_algorithm": "sha256(canonical_json(key_fields))",
+    "path_template": "not_applicable",
+    "stale_policy": "reject_revision_mismatch",
+    "atomic_write": true
+  },
+  "sandbox": {
+    "cwd": "repository_root",
+    "read_paths": ["target_source", "target_dependencies"],
+    "write_paths": ["crg_graph_dir"],
+    "network": "none",
+    "project_code_execution": "forbidden",
+    "config_scripts": "never_executed",
+    "outside_workspace": "deny",
+    "allow_target_writes": false
+  },
+  "enforcement": {
+    "runtime_policy_enforced": true,
+    "status": "intrinsic",
+    "degraded_status": "degraded",
+    "diagnostic_code": "adapter_manifest_policy_not_enforced"
+  }
+}

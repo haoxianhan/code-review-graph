@@ -88,6 +88,18 @@
     "lifecycle_checks": ["full_build", "incremental_update", "watch", "forget", "standalone_postprocess"],
     "latency_budget_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000}
   },
+  "adapters": {
+    "directory": "adapters",
+    "files": {
+      "generic": "generic.manifest.json",
+      "elp": "elp.manifest.json",
+      "xref": "xref.manifest.json",
+      "dialyzer": "dialyzer.manifest.json"
+    },
+    "runtime_policy": "mixed",
+    "invalid_policy_status": "unavailable",
+    "invalid_policy_diagnostic": "adapter_manifest_unavailable"
+  },
   "analysis": {"cache_paths": [".code-review-graph", "_build/default", "_build/test", "server_ai/indexer/modules.json", "server_ai/indexer/records.json"]},
   "diagnostics": [
     {"code": "target_checkout_dirty_at_freeze", "severity": "warning", "message": "The requested revision was observed with local target changes; this is not a clean adoption baseline."},
