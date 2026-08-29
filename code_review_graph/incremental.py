@@ -397,6 +397,49 @@ def _append_untracked_erlang_layout_files(
     return changed_files
 
 
+def _append_mismatched_erlang_hashes(
+    repo_root: Path,
+    store: "GraphStore",
+    changed_files: list[str],
+) -> list[str]:
+    """Include Erlang files whose bytes no longer match the stored graph.
+
+    A working-tree edit can be indexed while the graph's Git anchor remains at
+    the same commit. If that edit is then restored to the anchor, ``git diff``
+    becomes empty even though the graph still describes the edited bytes. The
+    Generic Erlang contract is hash-based, so compare stored file hashes for
+    Erlang paths before accepting an automatic update as a no-op.
+    """
+    root = _canonical_repo_root(repo_root)
+    seen = {str(path).replace("\\", "/") for path in changed_files}
+    for stored_path in store.get_all_files():
+        normalized = normalize_file_path(stored_path)
+        if not _is_erlang_source_path(normalized) or not _path_belongs_to_root(
+            normalized, root
+        ):
+            continue
+        absolute = Path(normalized)
+        if not absolute.is_absolute():
+            absolute = root / absolute
+        try:
+            raw = absolute.read_bytes()
+        except (OSError, PermissionError):
+            continue
+        current_hash = hashlib.sha256(raw).hexdigest()
+        nodes = store.get_nodes_by_file(str(absolute))
+        stored_hashes = {node.file_hash for node in nodes if node.file_hash}
+        if stored_hashes and current_hash in stored_hashes:
+            continue
+        try:
+            relative = absolute.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if relative not in seen:
+            changed_files.append(relative)
+            seen.add(relative)
+    return changed_files
+
+
 def _run_erlang_lifecycle(
     repo_root: Path,
     store: GraphStore,
@@ -1976,6 +2019,7 @@ def incremental_update(
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
         changed_files = _append_untracked_erlang_layout_files(repo_root, changed_files)
+        changed_files = _append_mismatched_erlang_hashes(repo_root, store, changed_files)
     stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
 
     layout_changed = any(_is_erlang_layout_path(path) for path in changed_files)

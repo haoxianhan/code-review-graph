@@ -4,11 +4,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from code_review_graph.eval.erlang_adoption import graph_fingerprint
 from code_review_graph.forget import forget_files
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import collect_all_files, full_build, incremental_update
+from code_review_graph.incremental import (
+    ERLANG_IDENTITY_VERSION,
+    _erlang_identity_key,
+    collect_all_files,
+    full_build,
+    incremental_update,
+)
 from code_review_graph.postprocessing import run_post_processing
-from code_review_graph.tools.build import run_postprocess
+from code_review_graph.tools.build import build_or_update_graph, run_postprocess
+
+
+def _git(repo: Path, *args: str) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
 
 
 def _write_fixture(repo: Path) -> None:
@@ -123,3 +139,71 @@ def test_uppercase_erlang_header_change_reparses_include_dependents(
         assert result["files_updated"] == 2
     finally:
         store.close()
+
+
+def test_automatic_update_reconciles_dirty_edit_restore_and_noop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Restoring a previously indexed dirty Erlang file must not be a no-op."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "git-repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    source = repo / "src" / "worker.erl"
+    original = "-module(worker).\n-export([run/0]).\nrun() -> ok.\n"
+    source.write_text(original, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "initial Erlang source")
+
+    initial = build_or_update_graph(
+        full_rebuild=True, repo_root=str(repo), postprocess="none"
+    )
+    assert initial["errors"] == []
+    db_path = repo / ".code-review-graph" / "graph.db"
+    with GraphStore(db_path) as store:
+        clean_fingerprint = graph_fingerprint(store, repo)
+        identity_key = _erlang_identity_key(repo)
+        assert store.get_metadata(identity_key) == ERLANG_IDENTITY_VERSION
+
+    source.write_text(original + "helper() -> ok.\n", encoding="utf-8")
+    dirty = build_or_update_graph(
+        full_rebuild=False, repo_root=str(repo), base=None, postprocess="none"
+    )
+    assert dirty["files_updated"] == 1
+    with GraphStore(db_path) as store:
+        assert graph_fingerprint(store, repo) != clean_fingerprint
+        assert store.get_metadata(identity_key) == ERLANG_IDENTITY_VERSION
+
+    # Restore the exact committed bytes. Git now reports no diff, so the
+    # hash reconciliation must be what schedules this file for re-parsing.
+    source.write_text(original, encoding="utf-8")
+    restored = build_or_update_graph(
+        full_rebuild=False, repo_root=str(repo), base=None, postprocess="none"
+    )
+    assert restored["changed_files"] == ["src/worker.erl"]
+    assert restored["files_updated"] == 1
+    with GraphStore(db_path) as store:
+        assert graph_fingerprint(store, repo) == clean_fingerprint
+        assert store.get_metadata(identity_key) == ERLANG_IDENTITY_VERSION
+
+    no_op = build_or_update_graph(
+        full_rebuild=False, repo_root=str(repo), base=None, postprocess="none"
+    )
+    assert no_op["files_updated"] == 0
+    assert no_op["changed_files"] == []
+    with GraphStore(db_path) as store:
+        assert graph_fingerprint(store, repo) == clean_fingerprint
+        assert store.get_metadata(identity_key) == ERLANG_IDENTITY_VERSION
+
+    # Compare against an independent clean rebuild, not only the initial
+    # fingerprint, so the parity assertion covers the production path.
+    clean_store = GraphStore(tmp_path / "clean-rebuild.db")
+    try:
+        rebuilt = full_build(repo, clean_store)
+        assert rebuilt["errors"] == []
+        assert graph_fingerprint(clean_store, repo) == clean_fingerprint
+    finally:
+        clean_store.close()
