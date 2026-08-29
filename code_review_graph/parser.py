@@ -841,7 +841,7 @@ def normalize_file_path(path: "str | PurePath") -> str:
 
 @dataclass
 class NodeInfo:
-    kind: str  # File, Class, Function, Type, Test
+    kind: str  # File, Class, Function, Clause, Type, Test
     name: str
     file_path: str
     line_start: int
@@ -3497,7 +3497,49 @@ class CodeParser:
                 kind="CONTAINS", source=container, target=qualified,
                 file_path=file_path, line=line_start,
             ))
-            for _fun_decl, clause in clauses:
+            # Keep the callable identity merged at Function level while also
+            # exposing each source clause as a stable child.  Clause ordinals
+            # are source-order based and deliberately one-based so adding a
+            # later clause does not rename existing identities.
+            for clause_index, (_fun_decl, clause) in enumerate(clauses, start=1):
+                clause_identity = f"{identity}#clause-{clause_index}"
+                clause_qualified = self._qualify(
+                    clause_identity, file_path, parent,
+                )
+                nodes.append(NodeInfo(
+                    kind="Clause",
+                    name=name,
+                    identity_name=clause_identity,
+                    file_path=file_path,
+                    line_start=clause.start_point[0] + 1,
+                    line_end=clause.end_point[0] + 1,
+                    language="erlang",
+                    parent_name=parent,
+                    is_test=is_test,
+                    extra={
+                        "erlang_kind": "clause",
+                        "arity": arity,
+                        "function_identity": identity,
+                        "clause_index": clause_index,
+                        "clause_count": len(clauses),
+                        "exported": export_all or identity in exported_functions,
+                        "guarded": any(
+                            child.type == "guard"
+                            for child in clause.named_children
+                        ),
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=qualified,
+                    target=clause_qualified,
+                    file_path=file_path,
+                    line=clause.start_point[0] + 1,
+                    extra={
+                        "erlang_reference_kind": "clause",
+                        "clause_index": clause_index,
+                    },
+                ))
                 for call in self._erlang_walk(clause):
                     if call.type != "call":
                         if call.type in ("internal_fun", "external_fun"):

@@ -222,7 +222,7 @@ def _semantic_identity(record: Mapping[str, Any], *, diagnostic: bool = False) -
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,          -- File, Class, Function, Type, Test
+    kind TEXT NOT NULL,          -- File, Class, Function, Clause, Type, Test
     name TEXT NOT NULL,
     qualified_name TEXT NOT NULL UNIQUE,
     file_path TEXT NOT NULL,

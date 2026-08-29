@@ -54,6 +54,26 @@ helper(N) -> N.
     assert function.identity_name == "value/1"
     assert function.extra["clause_count"] == 2
     assert function.extra["arity"] == 1
+    clauses = [node for node in nodes if node.kind == "Clause"]
+    assert [node.identity_name for node in clauses] == [
+        "value/1#clause-1",
+        "value/1#clause-2",
+        "helper/1#clause-1",
+    ]
+    assert [node.extra["clause_index"] for node in clauses] == [1, 2, 1]
+    assert all(node.extra["function_identity"] in {"value/1", "helper/1"} for node in clauses)
+    clause_edges = [
+        edge for edge in edges
+        if edge.kind == "CONTAINS" and "#clause-" in edge.target
+    ]
+    assert {
+        (edge.source.rsplit("::", 1)[-1], edge.target.rsplit("::", 1)[-1])
+        for edge in clause_edges
+    } == {
+        ("sample.value/1", "sample.value/1#clause-1"),
+        ("sample.value/1", "sample.value/1#clause-2"),
+        ("sample.helper/1", "sample.helper/1#clause-1"),
+    }
     assert any(
         edge.kind == "CONTAINS"
         and edge.target == "src/sample.erl::sample.value/1"
