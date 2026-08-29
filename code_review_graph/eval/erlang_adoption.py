@@ -3258,10 +3258,23 @@ def _semantic_execution_state(
                     seen.add(tool.casefold())
     # Provenance records alone do not prove that an adapter actually ran: a
     # stale cache or a hand-written envelope could contain the same tool name.
-    # Require an explicit successful status for every declared adapter.
-    explicit_success = {name for name, status in statuses.items() if status in {"ok", "executed"}}
+    # Restrict successful evidence to adapters declared by the policy.  The
+    # Generic adapter is always-on baseline indexing, so it must never satisfy
+    # this semantic-adapter gate.  When no adapter names are available at all,
+    # retain the conservative legacy requirement set as the allow-list.
+    policy = environment.get("adapter_policy", {})
+    declared = _adapter_manifest_names(policy) if isinstance(policy, Mapping) else set()
+    if not declared and isinstance(policy, Mapping):
+        declared = set(_adapter_manifest_activations(policy))
+    semantic_declared = {name for name in declared if name != "generic"}
+    allowed_success = semantic_declared or (required if not declared else set())
+    explicit_success = {
+        name
+        for name, status in statuses.items()
+        if status in {"ok", "executed"} and name in allowed_success
+    }
     # Even when every optional adapter is explicitly marked ``required: false``,
-    # promotion still needs proof that at least one semantic adapter actually
+    # promotion still needs proof that at least one declared semantic adapter
     # ran.  A generic/disabled envelope alone is not semantic execution.
     valid = bool(envelopes) and bool(explicit_success) and not failures and required.issubset(
         explicit_success

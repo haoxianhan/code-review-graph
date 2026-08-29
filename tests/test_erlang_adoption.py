@@ -433,6 +433,34 @@ def test_result_validator_derives_optional_semantic_requirements_from_policy(tmp
         validate_evaluation_result(forged_lifecycle)
 
 
+def test_semantic_execution_rejects_generic_only_envelope():
+    """Generic baseline indexing must not satisfy semantic execution."""
+    environment = {
+        "adapter_policy": {
+            "manifests": ["generic"],
+            "manifest_activation": {
+                "generic": {"mode": "always", "required": True},
+            },
+        }
+    }
+    lifecycle = {
+        "full_build": {
+            "status": "executed",
+            "result": {
+                "erlang_integration": {
+                    "status": "ok",
+                    "adapters": {"generic": {"status": "ok"}},
+                }
+            },
+        }
+    }
+
+    execution = _semantic_execution_state(environment, lifecycle)
+
+    assert execution["valid"] is False
+    assert execution["status"] == "not_run"
+
+
 def test_unresolved_expectation_keeps_source_constraint(tmp_path: Path):
     from code_review_graph.graph import GraphStore
 
