@@ -7,13 +7,14 @@ Supports impact-radius queries and subgraph extraction.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +46,34 @@ logger = logging.getLogger(__name__)
 _JAVASCRIPT_LANGUAGE_FAMILY = ("javascript", "typescript", "tsx")
 _JAVASCRIPT_LANGUAGE_FAMILY_SET = frozenset(_JAVASCRIPT_LANGUAGE_FAMILY)
 
+# Semantic adapters are optional and their output can originate in external
+# tools. Keep persistence and response paths bounded even when an adapter
+# returns a malformed or unexpectedly large record.
+_MAX_SEMANTIC_RECORD_CHARS = 128_000
+_MAX_SEMANTIC_READ_RECORDS = 1_000
+_MAX_SEMANTIC_VALUE_DEPTH = 5
+_MAX_SEMANTIC_VALUE_ITEMS = 64
+_MAX_SEMANTIC_STRING_CHARS = 4_096
+_SEMANTIC_EDGE_METADATA_KEYS = frozenset({
+    "evidence_id",
+    "status",
+    "provenance",
+    "provenance_chain",
+    "diagnostics",
+    "metadata",
+})
+
+
+def _bounded_semantic_limit(value: Any) -> int:
+    """Return a finite, positive row limit for semantic reads."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _MAX_SEMANTIC_READ_RECORDS
+    return max(1, min(parsed, _MAX_SEMANTIC_READ_RECORDS))
+
 
 def _compatible_edge_languages(language: str) -> tuple[str, ...]:
     """Return languages that can safely share unresolved bare edge targets."""
@@ -65,6 +94,125 @@ def _bridge_qualified_name(qualified_name: str) -> str:
     """
     path_part, sep, symbol_part = qualified_name.partition("::")
     return normalize_file_path(path_part) + sep + symbol_part
+
+
+def _semantic_json(value: Any) -> str:
+    """Serialize semantic values deterministically for IDs and storage."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+
+
+def _semantic_digest(value: Any) -> str:
+    return hashlib.sha256(_semantic_json(value).encode("utf-8")).hexdigest()
+
+
+def _decode_semantic_mapping(value: Any) -> dict[str, Any]:
+    """Decode one bounded JSON object without letting corrupt rows escape."""
+    if isinstance(value, Mapping):
+        parsed: Any = value
+    elif isinstance(value, (str, bytes, bytearray)):
+        if len(value) > _MAX_SEMANTIC_RECORD_CHARS:
+            return {}
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            return {}
+    else:
+        return {}
+    try:
+        bounded = _bound_semantic_value(parsed)
+    except (RecursionError, TypeError, ValueError):
+        return {}
+    return bounded if isinstance(bounded, dict) else {}
+
+
+def _bound_semantic_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = _MAX_SEMANTIC_VALUE_DEPTH,
+) -> Any:
+    """Return JSON-compatible semantic metadata with finite size/depth."""
+    if depth >= max_depth:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:_MAX_SEMANTIC_STRING_CHARS]
+    if isinstance(value, Mapping):
+        items = sorted(value.items(), key=lambda item: str(item[0]))
+        return {
+            str(key)[:256]: _bound_semantic_value(item, depth=depth + 1, max_depth=max_depth)
+            for key, item in items[:_MAX_SEMANTIC_VALUE_ITEMS]
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            _bound_semantic_value(item, depth=depth + 1, max_depth=max_depth)
+            for item in list(value)[:_MAX_SEMANTIC_VALUE_ITEMS]
+        ]
+    return str(value)[:_MAX_SEMANTIC_STRING_CHARS]
+
+
+def _semantic_record_dict(record: Any) -> dict[str, Any] | None:
+    """Convert an EvidenceRecord/Diagnostic or mapping to bounded JSON data."""
+    if hasattr(record, "to_dict"):
+        try:
+            record = record.to_dict()
+        except Exception:
+            return None
+    if not isinstance(record, Mapping):
+        return None
+    bounded = _bound_semantic_value(dict(record))
+    if not isinstance(bounded, dict):
+        return None
+    serialized = _semantic_json(bounded)
+    if len(serialized) > _MAX_SEMANTIC_RECORD_CHARS:
+        # Retain identity and location fields while dropping unbounded optional
+        # metadata. The adapter's provenance remains available whenever it fits.
+        keep = {
+            key: bounded[key]
+            for key in (
+                "evidence_id", "diagnostic_id", "kind", "code", "source", "target",
+                "source_qualified", "target_qualified", "file_path", "line", "column",
+                "severity", "status", "provenance",
+            )
+            if key in bounded
+        }
+        bounded = _bound_semantic_value(keep, max_depth=3)
+        serialized = _semantic_json(bounded)
+    if len(serialized) > _MAX_SEMANTIC_RECORD_CHARS:
+        return None
+    return bounded
+
+
+def _semantic_provenance(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = record.get("provenance")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _semantic_analysis_key(provenance: Mapping[str, Any], record: Mapping[str, Any]) -> str:
+    value = provenance.get("analysis_key") or record.get("analysis_key")
+    if isinstance(value, str) and value:
+        return value[:256]
+    return _semantic_digest({
+        key: provenance.get(key)
+        for key in (
+            "repository", "tool", "tool_version", "otp_version", "source_revision",
+            "generated_data_revision", "configuration_digest", "query_kind", "query_targets",
+        )
+    })
+
+
+def _semantic_identity(record: Mapping[str, Any], *, diagnostic: bool = False) -> str:
+    key = "diagnostic_id" if diagnostic else "evidence_id"
+    value = record.get(key)
+    if isinstance(value, str) and value:
+        return value[:256]
+    identity_keys = (
+        ("code", "message", "severity", "file_path", "line", "column")
+        if diagnostic
+        else ("kind", "source", "target", "file_path", "line", "column")
+    )
+    return _semantic_digest({key: record.get(key) for key in identity_keys})
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +548,578 @@ class GraphStore:
     def get_metadata(self, key: str) -> Optional[str]:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    # --- Optional semantic evidence -------------------------------------
+
+    @staticmethod
+    def _semantic_key_details(
+        analysis_key: Any | None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Return the stable key and scope fields from an AnalysisKey-like value."""
+        if analysis_key is None:
+            return None, {}
+        if isinstance(analysis_key, str):
+            return analysis_key[:256] or None, {}
+        cache_key = getattr(analysis_key, "cache_key", None)
+        if not isinstance(cache_key, str) or not cache_key:
+            if isinstance(analysis_key, Mapping):
+                cache_key = analysis_key.get("analysis_key") or analysis_key.get("cache_key")
+            if not isinstance(cache_key, str) or not cache_key:
+                return None, {}
+        try:
+            details = (
+                analysis_key.to_dict()
+                if hasattr(analysis_key, "to_dict")
+                else dict(analysis_key)
+            )
+        except (TypeError, ValueError):
+            details = {}
+        return cache_key[:256], details if isinstance(details, dict) else {}
+
+    @staticmethod
+    def _semantic_scope(
+        provenance: Mapping[str, Any],
+        key_details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize provenance fields used by semantic scope indexes."""
+        details = key_details or {}
+        return {
+            field: (
+                provenance.get(field)
+                if provenance.get(field) is not None
+                else details.get(field)
+            )
+            for field in (
+                "repository", "tool", "query_kind", "source_revision",
+                "generated_data_revision", "configuration_digest", "otp_version",
+            )
+        }
+
+    @staticmethod
+    def _semantic_record_value(record: Any) -> dict[str, Any] | None:
+        return _semantic_record_dict(record)
+
+    @classmethod
+    def _semantic_records_from_json(
+        cls,
+        rows: Iterable[sqlite3.Row],
+        *,
+        diagnostic: bool = False,
+    ) -> list[Any]:
+        """Decode rows into semantic dataclasses, with a mapping fallback."""
+        try:
+            if diagnostic:
+                from .erlang_semantic import Diagnostic
+            else:
+                from .erlang_semantic import EvidenceRecord
+            record_type = Diagnostic if diagnostic else EvidenceRecord
+        except Exception:
+            record_type = None
+        decoded: list[Any] = []
+        for row in rows:
+            value = _decode_semantic_mapping(row["record_json"])
+            if not value:
+                continue
+            if record_type is None:
+                decoded.append(dict(value))
+                continue
+            try:
+                decoded.append(record_type.from_dict(value))
+            except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
+                # A malformed optional record must never make Generic graph
+                # queries fail. Preserve it for callers that can inspect raw
+                # JSON only when the typed boundary cannot parse it.
+                decoded.append(dict(value))
+        return decoded
+
+    def store_semantic_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        analysis_key: Any | None = None,
+        replace: bool = True,
+        purge_stale: bool = True,
+    ) -> dict[str, int]:
+        """Atomically persist one adapter/reconciliation snapshot.
+
+        ``snapshot`` may be an ``AdapterResult``/``ReconciliationResult`` or a
+        mapping with ``evidence`` and ``diagnostics`` lists.  The method keeps
+        semantic records in their own tables: callers can explicitly promote
+        proven relations into ordinary ``edges`` without changing Generic
+        fallback behavior.  A successful refresh replaces records for its
+        exact analysis key; stale records from the same repository/tool/query
+        scope are removed when ``purge_stale`` is enabled.
+        """
+        if hasattr(snapshot, "to_dict"):
+            try:
+                payload = snapshot.to_dict()
+            except Exception:
+                payload = {}
+        elif isinstance(snapshot, Mapping):
+            payload = dict(snapshot)
+        else:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        explicit_key, explicit_details = self._semantic_key_details(analysis_key)
+        requested_key = explicit_key is not None
+        raw_evidence = payload.get("evidence", ())
+        raw_diagnostics = payload.get("diagnostics", ())
+        evidence_values = (
+            list(raw_evidence)
+            if isinstance(raw_evidence, (list, tuple))
+            else []
+        )
+        diagnostic_values = (
+            list(raw_diagnostics)
+            if isinstance(raw_diagnostics, (list, tuple))
+            else []
+        )
+        top_provenance = payload.get("provenance")
+        if not isinstance(top_provenance, Mapping):
+            top_provenance = {}
+        # AdapterResult envelopes carry their key in provenance even when an
+        # unavailable adapter returns no records.  Recover it so the run
+        # status is still persisted and can replace an older snapshot.
+        if explicit_key is None:
+            envelope_key = top_provenance.get("analysis_key") or payload.get(
+                "analysis_key"
+            )
+            explicit_key, explicit_details = self._semantic_key_details(envelope_key)
+        top_status = payload.get("status")
+        grouped: dict[str, dict[str, Any]] = {}
+        mismatched = 0
+
+        def provenance_matches_explicit_key(provenance: Mapping[str, Any]) -> bool:
+            if explicit_key is None:
+                return True
+            provenance_key = provenance.get("analysis_key")
+            if provenance_key not in (None, "", explicit_key):
+                return False
+            if not explicit_details:
+                return True
+            for field in (
+                "repository", "source_revision", "generated_data_revision",
+                "configuration_digest", "tool", "tool_version", "otp_version",
+                "query_kind", "query_targets", "plt_identity",
+            ):
+                observed = provenance.get(field)
+                expected = explicit_details.get(field)
+                if observed is None or expected is None:
+                    continue
+                if field == "query_targets":
+                    observed = (
+                        tuple(observed)
+                        if isinstance(observed, (list, tuple))
+                        else observed
+                    )
+                    expected = (
+                        tuple(expected)
+                        if isinstance(expected, (list, tuple))
+                        else expected
+                    )
+                if field in {"tool", "query_kind"}:
+                    observed = str(observed).casefold()
+                    expected = str(expected).casefold()
+                if observed != expected:
+                    return False
+            return True
+
+        if requested_key and not provenance_matches_explicit_key(top_provenance):
+            mismatched += 1
+
+        def add_record(record: Any, *, diagnostic: bool) -> None:
+            value = self._semantic_record_value(record)
+            if value is None:
+                return
+            raw_provenance = value.get("provenance")
+            provenance = (
+                dict(raw_provenance) if isinstance(raw_provenance, Mapping)
+                else dict(top_provenance)
+            )
+            nonlocal mismatched
+            if not provenance_matches_explicit_key(provenance):
+                mismatched += 1
+                return
+            if not raw_provenance and explicit_key:
+                value["provenance"] = {
+                    **explicit_details,
+                    "analysis_key": explicit_key,
+                }
+                provenance = dict(value["provenance"])
+            key = explicit_key or (
+                provenance.get("analysis_key")
+                if isinstance(provenance.get("analysis_key"), str)
+                else None
+            )
+            if not key:
+                key = _semantic_analysis_key(provenance, value)
+            if not key:
+                return
+            scope = self._semantic_scope(provenance, explicit_details)
+            # AdapterResult carries status only at the envelope level. Keep it
+            # visible for diagnostics even when a record omits a status field.
+            if top_status is not None:
+                value.setdefault("status", str(top_status))
+            entry = grouped.setdefault(
+                key,
+                {
+                    "scope": scope,
+                    "provenance": provenance,
+                    "evidence": [],
+                    "diagnostics": [],
+                },
+            )
+            entry["scope"] = {
+                field: entry["scope"].get(field) or scope.get(field)
+                for field in entry["scope"]
+            }
+            if provenance and not entry["provenance"]:
+                entry["provenance"] = provenance
+            (entry["diagnostics"] if diagnostic else entry["evidence"]).append(value)
+
+        for record in evidence_values:
+            add_record(record, diagnostic=False)
+        for record in diagnostic_values:
+            add_record(record, diagnostic=True)
+
+        # An unavailable adapter can legitimately return no records. Persist a
+        # run envelope so status/diagnostics remain observable and stale data
+        # can still be replaced by the next refresh.
+        if not grouped and explicit_key and not mismatched:
+            grouped[explicit_key] = {
+                "scope": self._semantic_scope(top_provenance, explicit_details),
+                "provenance": dict(top_provenance),
+                "evidence": [],
+                "diagnostics": [],
+            }
+
+        self._begin_immediate()
+        counts = {
+            "runs": 0,
+            "evidence": 0,
+            "diagnostics": 0,
+            "stale_removed": 0,
+            "mismatched": mismatched,
+        }
+        try:
+            for key, entry in grouped.items():
+                scope = entry["scope"]
+                if purge_stale:
+                    where = ["analysis_key != ?"]
+                    params: list[Any] = [key]
+                    for field in ("repository", "tool", "query_kind"):
+                        value = scope.get(field)
+                        if value:
+                            where.append(f"{field} = ?")
+                            params.append(str(value))
+                    clause = " AND ".join(where)
+                    evidence_removed = self._conn.execute(
+                        f"DELETE FROM semantic_evidence WHERE {clause}", params,  # nosec B608
+                    ).rowcount
+                    diagnostics_removed = self._conn.execute(
+                        f"DELETE FROM semantic_diagnostics WHERE {clause}", params,  # nosec B608
+                    ).rowcount
+                    self._conn.execute(
+                        f"DELETE FROM semantic_runs WHERE {clause}", params,  # nosec B608
+                    )
+                    counts["stale_removed"] += (
+                        max(0, evidence_removed) + max(0, diagnostics_removed)
+                    )
+                if replace:
+                    self._conn.execute(
+                        "DELETE FROM semantic_evidence WHERE analysis_key = ?", (key,)
+                    )
+                    self._conn.execute(
+                        "DELETE FROM semantic_diagnostics WHERE analysis_key = ?", (key,)
+                    )
+                now = time.time()
+                provenance = dict(entry["provenance"])
+                run_status = str(
+                    payload.get("status")
+                    or provenance.get("status")
+                    or ("ok" if entry["evidence"] else "unavailable")
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO semantic_runs "
+                    "(analysis_key, repository, tool, query_kind, source_revision, "
+                    "generated_data_revision, configuration_digest, otp_version, status, "
+                    "provenance_json, evidence_count, diagnostic_count, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        key,
+                        scope.get("repository") or "",
+                        scope.get("tool") or "",
+                        scope.get("query_kind") or "",
+                        scope.get("source_revision"),
+                        scope.get("generated_data_revision"),
+                        scope.get("configuration_digest"),
+                        scope.get("otp_version"),
+                        run_status,
+                        _semantic_json(_bound_semantic_value(provenance)),
+                        len(entry["evidence"]),
+                        len(entry["diagnostics"]),
+                        now,
+                    ),
+                )
+                counts["runs"] += 1
+                for value in entry["evidence"]:
+                    record_id = _semantic_identity(value)
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO semantic_evidence "
+                        "(analysis_key, evidence_id, repository, tool, query_kind, "
+                        "source_revision, generated_data_revision, configuration_digest, "
+                        "otp_version, kind, source_qualified, target_qualified, file_path, "
+                        "line, column_number, status, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            key, record_id, scope.get("repository") or "", scope.get("tool") or "",
+                            scope.get("query_kind") or "", scope.get("source_revision"),
+                            scope.get("generated_data_revision"), scope.get("configuration_digest"),
+                            scope.get("otp_version"), str(value.get("kind", "")),
+                            str(value.get("source", value.get("source_qualified", ""))),
+                            str(value.get("target", value.get("target_qualified", ""))),
+                            value.get("file_path"), value.get("line"), value.get("column"),
+                            str(value.get("status") or provenance.get("status") or "ok"),
+                            _semantic_json(value), now,
+                        ),
+                    )
+                    counts["evidence"] += 1
+                for value in entry["diagnostics"]:
+                    record_id = _semantic_identity(value, diagnostic=True)
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO semantic_diagnostics "
+                        "(analysis_key, diagnostic_id, repository, tool, query_kind, "
+                        "source_revision, generated_data_revision, configuration_digest, "
+                        "otp_version, code, message, severity, file_path, line, column_number, "
+                        "status, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            key, record_id, scope.get("repository") or "", scope.get("tool") or "",
+                            scope.get("query_kind") or "", scope.get("source_revision"),
+                            scope.get("generated_data_revision"), scope.get("configuration_digest"),
+                            scope.get("otp_version"), str(value.get("code", "unknown")),
+                            str(value.get("message", "")), str(value.get("severity", "warning")),
+                            value.get("file_path"), value.get("line"), value.get("column"),
+                            str(value.get("status") or provenance.get("status") or "ok"),
+                            _semantic_json(value), now,
+                        ),
+                    )
+                    counts["diagnostics"] += 1
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        return counts
+
+    def upsert_semantic_evidence(
+        self,
+        evidence: Iterable[Any] = (),
+        *,
+        diagnostics: Iterable[Any] = (),
+        analysis_key: Any | None = None,
+        replace: bool = False,
+        purge_stale: bool = True,
+    ) -> dict[str, int]:
+        """Persist semantic records without requiring an adapter envelope."""
+        return self.store_semantic_snapshot(
+            {"evidence": list(evidence), "diagnostics": list(diagnostics)},
+            analysis_key=analysis_key,
+            replace=replace,
+            purge_stale=purge_stale,
+        )
+
+    def get_semantic_evidence(
+        self,
+        *,
+        analysis_key: Any | None = None,
+        repository: str | None = None,
+        tool: str | None = None,
+        query_kind: str | None = None,
+        kind: str | None = None,
+        source: str | None = None,
+        target: str | None = None,
+        limit: int = _MAX_SEMANTIC_READ_RECORDS,
+    ) -> list[Any]:
+        """Read bounded semantic evidence records, newest scopes first."""
+        return self._get_semantic_records(
+            "semantic_evidence",
+            diagnostic=False,
+            analysis_key=analysis_key,
+            repository=repository,
+            tool=tool,
+            query_kind=query_kind,
+            kind=kind,
+            source=source,
+            target=target,
+            limit=limit,
+        )
+
+    def get_semantic_diagnostics(
+        self,
+        *,
+        analysis_key: Any | None = None,
+        repository: str | None = None,
+        tool: str | None = None,
+        query_kind: str | None = None,
+        code: str | None = None,
+        limit: int = _MAX_SEMANTIC_READ_RECORDS,
+    ) -> list[Any]:
+        """Read bounded adapter diagnostics with their original provenance."""
+        return self._get_semantic_records(
+            "semantic_diagnostics",
+            diagnostic=True,
+            analysis_key=analysis_key,
+            repository=repository,
+            tool=tool,
+            query_kind=query_kind,
+            code=code,
+            limit=limit,
+        )
+
+    def _get_semantic_records(
+        self,
+        table: str,
+        *,
+        diagnostic: bool,
+        analysis_key: Any | None,
+        repository: str | None,
+        tool: str | None,
+        query_kind: str | None,
+        kind: str | None = None,
+        code: str | None = None,
+        source: str | None = None,
+        target: str | None = None,
+        limit: int = _MAX_SEMANTIC_READ_RECORDS,
+    ) -> list[Any]:
+        if table not in {"semantic_evidence", "semantic_diagnostics"}:
+            raise ValueError("unknown semantic record table")
+        bounded_limit = _bounded_semantic_limit(limit)
+        clauses: list[str] = []
+        params: list[Any] = []
+        key, details = self._semantic_key_details(analysis_key)
+        if key:
+            clauses.append("analysis_key = ?")
+            params.append(key)
+        for field, value in (
+            ("repository", repository or details.get("repository")),
+            ("tool", tool or details.get("tool")),
+            ("query_kind", query_kind or details.get("query_kind")),
+        ):
+            if value:
+                clauses.append(f"{field} = ?")
+                params.append(str(value))
+        if kind and not diagnostic:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if code and diagnostic:
+            clauses.append("code = ?")
+            params.append(code)
+        if source and not diagnostic:
+            clauses.append("source_qualified = ?")
+            params.append(source)
+        if target and not diagnostic:
+            clauses.append("target_qualified = ?")
+            params.append(target)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT record_json FROM {table} {where} "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT ?",  # nosec B608
+            (*params, bounded_limit),
+        ).fetchall()
+        return self._semantic_records_from_json(rows, diagnostic=diagnostic)
+
+    def get_semantic_snapshot(
+        self,
+        *,
+        analysis_key: Any | None = None,
+        repository: str | None = None,
+        tool: str | None = None,
+        query_kind: str | None = None,
+        limit: int = _MAX_SEMANTIC_READ_RECORDS,
+    ) -> dict[str, Any]:
+        """Return semantic evidence, diagnostics, and run status together."""
+        bounded_limit = _bounded_semantic_limit(limit)
+        key, details = self._semantic_key_details(analysis_key)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if key:
+            clauses.append("analysis_key = ?")
+            params.append(key)
+        for field, value in (
+            ("repository", repository or details.get("repository")),
+            ("tool", tool or details.get("tool")),
+            ("query_kind", query_kind or details.get("query_kind")),
+        ):
+            if value:
+                clauses.append(f"{field} = ?")
+                params.append(str(value))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            "SELECT analysis_key, status, provenance_json, evidence_count, "
+            f"diagnostic_count, updated_at FROM semantic_runs {where} "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT ?",  # nosec B608
+            (*params, bounded_limit),
+        ).fetchall()
+        return {
+            "runs": [
+                {
+                    "analysis_key": row["analysis_key"],
+                    "status": row["status"],
+                    "provenance": _decode_semantic_mapping(row["provenance_json"]),
+                    "evidence_count": row["evidence_count"],
+                    "diagnostic_count": row["diagnostic_count"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ],
+            "evidence": self.get_semantic_evidence(
+                analysis_key=key, repository=repository, tool=tool,
+                query_kind=query_kind, limit=bounded_limit,
+            ),
+            "diagnostics": self.get_semantic_diagnostics(
+                analysis_key=key, repository=repository, tool=tool,
+                query_kind=query_kind, limit=bounded_limit,
+            ),
+        }
+
+    def purge_stale_semantic_evidence(
+        self,
+        analysis_key: Any,
+        *,
+        repository: str | None = None,
+        tool: str | None = None,
+        query_kind: str | None = None,
+    ) -> int:
+        """Remove records from older revisions in the same semantic scope."""
+        key, details = self._semantic_key_details(analysis_key)
+        if not key:
+            return 0
+        scope = {
+            "repository": repository or details.get("repository"),
+            "tool": tool or details.get("tool"),
+            "query_kind": query_kind or details.get("query_kind"),
+        }
+        clauses = ["analysis_key != ?"]
+        params: list[Any] = [key]
+        for field, value in scope.items():
+            if value:
+                clauses.append(f"{field} = ?")
+                params.append(str(value))
+        where = " AND ".join(clauses)
+        self._begin_immediate()
+        try:
+            removed = 0
+            for table in ("semantic_evidence", "semantic_diagnostics", "semantic_runs"):
+                removed += max(0, self._conn.execute(
+                    f"DELETE FROM {table} WHERE {where}", params,  # nosec B608
+                ).rowcount)
+            self._conn.commit()
+            return removed
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     def has_nodes(self) -> bool:
         row = self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone()

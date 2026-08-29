@@ -42,6 +42,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 _KNOWN_TABLES = frozenset({
     "nodes", "edges", "metadata", "communities", "flows", "flow_memberships", "nodes_fts",
     "community_summaries", "flow_snapshots", "risk_index",
+    "semantic_runs", "semantic_evidence", "semantic_diagnostics",
 })
 
 
@@ -238,6 +239,97 @@ def _migrate_v9(conn: sqlite3.Connection) -> None:
     logger.info("Migration v9: added edge confidence columns")
 
 
+def _migrate_v10(conn: sqlite3.Connection) -> None:
+    """v10: Persist bounded, revision-keyed semantic evidence.
+
+    Semantic records live outside the generic nodes/edges tables so optional
+    analyzers can be refreshed or removed without rewriting syntax-derived
+    graph data.  The normalized scope columns make stale-revision cleanup
+    deterministic; ``record_json`` retains the adapter's complete structured
+    record for callers that need its provenance chain or diagnostics.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_runs (
+            analysis_key TEXT PRIMARY KEY,
+            repository TEXT NOT NULL DEFAULT '',
+            tool TEXT NOT NULL DEFAULT '',
+            query_kind TEXT NOT NULL DEFAULT '',
+            source_revision TEXT,
+            generated_data_revision TEXT,
+            configuration_digest TEXT,
+            otp_version TEXT,
+            status TEXT NOT NULL DEFAULT 'ok',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            diagnostic_count INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_evidence (
+            analysis_key TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            repository TEXT NOT NULL DEFAULT '',
+            tool TEXT NOT NULL DEFAULT '',
+            query_kind TEXT NOT NULL DEFAULT '',
+            source_revision TEXT,
+            generated_data_revision TEXT,
+            configuration_digest TEXT,
+            otp_version TEXT,
+            kind TEXT NOT NULL,
+            source_qualified TEXT NOT NULL,
+            target_qualified TEXT NOT NULL,
+            file_path TEXT,
+            line INTEGER,
+            column_number INTEGER,
+            status TEXT NOT NULL DEFAULT 'ok',
+            record_json TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (analysis_key, evidence_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_diagnostics (
+            analysis_key TEXT NOT NULL,
+            diagnostic_id TEXT NOT NULL,
+            repository TEXT NOT NULL DEFAULT '',
+            tool TEXT NOT NULL DEFAULT '',
+            query_kind TEXT NOT NULL DEFAULT '',
+            source_revision TEXT,
+            generated_data_revision TEXT,
+            configuration_digest TEXT,
+            otp_version TEXT,
+            code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'warning',
+            file_path TEXT,
+            line INTEGER,
+            column_number INTEGER,
+            status TEXT NOT NULL DEFAULT 'ok',
+            record_json TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (analysis_key, diagnostic_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_evidence_scope "
+        "ON semantic_evidence(repository, tool, query_kind, source_revision)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_evidence_relation "
+        "ON semantic_evidence(kind, source_qualified, target_qualified)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_diagnostics_scope "
+        "ON semantic_diagnostics(repository, tool, query_kind, source_revision)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_runs_scope "
+        "ON semantic_runs(repository, tool, query_kind, source_revision)"
+    )
+    logger.info("Migration v10: created semantic evidence tables")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -251,6 +343,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_v7,
     8: _migrate_v8,
     9: _migrate_v9,
+    10: _migrate_v10,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())
@@ -273,10 +366,14 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             continue
         logger.info("Running migration v%d", version)
         try:
+            # GraphStore uses autocommit mode, so a migration must open its
+            # own explicit transaction for DDL and schema_version updates to
+            # roll back together on any Python or SQLite exception.
+            conn.execute("BEGIN")
             MIGRATIONS[version](conn)
             _set_schema_version(conn, version)
             conn.commit()
-        except sqlite3.Error:
+        except Exception:
             conn.rollback()
             logger.error("Migration v%d failed, rolling back", version, exc_info=True)
             raise
