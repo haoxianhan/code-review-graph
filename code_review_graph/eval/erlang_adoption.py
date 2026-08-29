@@ -269,7 +269,17 @@ def _validate_artifact_paths(
                     )
         impact = case.get("impact")
         if isinstance(impact, Mapping):
-            for field in ("changed_files", "changed", "critical_dependents"):
+            # ``expected`` is the legacy spelling accepted by
+            # ``_impact_metric`` when ``critical_dependents`` is omitted.
+            # Validate both spellings before any impact calculation so a
+            # corpus cannot smuggle a parent/absolute path through the
+            # fallback field.
+            for field in (
+                "changed_files",
+                "changed",
+                "critical_dependents",
+                "expected",
+            ):
                 values = impact.get(field, [])
                 if isinstance(values, list):
                     for value_index, value in enumerate(values):
@@ -283,7 +293,12 @@ def _validate_artifact_paths(
         for entry_index, entry in enumerate(impact_entries):
             if not isinstance(entry, Mapping):
                 continue
-            for field in ("changed_files", "changed", "critical_dependents"):
+            for field in (
+                "changed_files",
+                "changed",
+                "critical_dependents",
+                "expected",
+            ):
                 values = entry.get(field, [])
                 if isinstance(values, list):
                     for value_index, value in enumerate(values):
@@ -2887,6 +2902,28 @@ def _impact_metric(corpus: Mapping[str, Any], store: GraphStore, root: Path) -> 
         ):
             invalid_entries += 1
             continue
+        try:
+            # Keep this helper safe when called directly, outside the public
+            # preflight path validation in ``run_adoption_evaluation``.
+            changed_relative = [
+                _safe_relative_path(
+                    path,
+                    root,
+                    f"impact[{index}].changed_files[{path_index}]",
+                )
+                for path_index, path in enumerate(changed)
+            ]
+            critical_relative = [
+                _safe_relative_path(
+                    path,
+                    root,
+                    f"impact[{index}].critical_dependents[{path_index}]",
+                )
+                for path_index, path in enumerate(critical)
+            ]
+        except ValueError:
+            invalid_entries += 1
+            continue
         false_positive_allowed = false_positive_allowed or bool(
             entry.get("allow_false_positives") is True
             or entry.get("false_positive_allowed") is True
@@ -2900,14 +2937,14 @@ def _impact_metric(corpus: Mapping[str, Any], store: GraphStore, root: Path) -> 
             invalid_entries += 1
             continue
         try:
-            changed_abs = [normalize_file_path(root / str(path)) for path in changed]
+            changed_abs = [normalize_file_path(root / path) for path in changed_relative]
             result = store.get_impact_radius(changed_abs, max_depth=max_depth, max_nodes=10_000)
         except Exception as exc:  # noqa: BLE001 - malformed graph evidence is fail-closed
             invalid_entries += 1
             entry_results.append(
                 {
                     "index": index,
-                    "expected": sorted(str(path).replace("\\", "/") for path in critical),
+                    "expected": sorted(critical_relative),
                     "predicted": [],
                     "covered": [],
                     "coverage": None,
@@ -2919,7 +2956,7 @@ def _impact_metric(corpus: Mapping[str, Any], store: GraphStore, root: Path) -> 
             )
             continue
         entry_predicted = {_relative_path(path, root) for path in result.get("impacted_files", [])}
-        entry_expected = {str(path).replace("\\", "/") for path in critical}
+        entry_expected = set(critical_relative)
         entry_covered = entry_expected.intersection(entry_predicted)
         entry_false_positive = entry_predicted - entry_expected
         entry_allowed = bool(

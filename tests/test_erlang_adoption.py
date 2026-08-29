@@ -338,6 +338,20 @@ def test_result_validator_recomputes_impact_entries(tmp_path: Path):
         validate_evaluation_result(inconsistent_summary)
 
 
+def test_impact_expected_paths_cannot_escape_target(tmp_path: Path):
+    """The legacy impact ``expected`` spelling remains repository-scoped."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    corpus["impact"] = [
+        {
+            "changed_files": ["src/worker.erl"],
+            "expected": ["../outside.erl"],
+        }
+    ]
+
+    with pytest.raises(ValueError, match=r"corpus\.impact\[0\]\.expected"):
+        run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+
 def test_empty_diagnostics_requirement_is_satisfied() -> None:
     assert _top_level_diagnostics_gate(set(), {"required": []}) is True
     assert _top_level_diagnostics_gate(set(), {"required": ["missing"]}) is False
