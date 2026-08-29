@@ -30,8 +30,15 @@ def _propagate_erlang_result_status(result: dict[str, Any]) -> dict[str, Any]:
 
     Generic indexing remains usable when an adapter is unavailable, but a
     caller must not mistake that degraded result for a clean build.  Disabled
-    and skipped integration are intentional non-failure states.
+    and skipped integration are intentional non-failure states.  Parse errors
+    are handled here as well because ``full_build``/``incremental_update``
+    report them in the top-level ``errors`` list without an integration result.
+    An Erlang parse failure must therefore never be presented as a clean public
+    build, even when optional semantic enrichment is disabled.
     """
+    if _result_has_erlang_errors(result):
+        result["status"] = "degraded"
+
     integration = result.get("erlang_integration")
     if not isinstance(integration, Mapping):
         return result

@@ -120,6 +120,32 @@ helper(X) -> X.
     assert any(edge.extra["erlang_resolution"] == "same_file" for edge in calls)
 
 
+def test_erlang_deep_expression_walk_does_not_overflow():
+    """Deep but legal Erlang expressions remain parseable without recursion."""
+    depth = 1_500
+    source = (
+        b"-module(deep).\n"
+        + b"run() -> "
+        + b"(" * depth
+        + b"helper()"
+        + b")" * depth
+        + b".\n"
+        + b"helper() -> ok.\n"
+    )
+
+    nodes, edges = CodeParser().parse_bytes(Path("deep.erl"), source)
+
+    assert {node.name for node in nodes if node.kind == "Function"} == {
+        "run", "helper",
+    }
+    assert any(
+        edge.kind == "CALLS"
+        and edge.source.endswith("run/0")
+        and edge.target.endswith("helper/0")
+        for edge in edges
+    )
+
+
 def test_erlang_import_include_and_behaviour_edges():
     _nodes, edges = _parse(
         "src/sample.erl",

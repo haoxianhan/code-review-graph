@@ -1687,6 +1687,33 @@ class TestBuildPostprocess:
         assert result["status"] == "degraded"
         assert result["diagnostics"][0]["code"] == "elp_unavailable"
 
+    def test_build_degrades_when_erlang_parse_error_is_reported(self, monkeypatch):
+        """A failed Erlang parse cannot be reported as a clean build."""
+        import code_review_graph.tools.build as build_module
+
+        store = MagicMock()
+        monkeypatch.setattr(build_module, "_get_store", lambda _root: (store, self.root))
+        monkeypatch.setattr(
+            build_module,
+            "_invoke_full_build",
+            lambda _root, _store, _config: {
+                "files_parsed": 1,
+                "total_nodes": 0,
+                "total_edges": 0,
+                "errors": [{"file": "src/deep.erl", "error": "AST too deep"}],
+            },
+        )
+        monkeypatch.setattr(build_module, "_run_postprocess", lambda *_args, **_kwargs: [])
+
+        result = build_module.build_or_update_graph(
+            full_rebuild=True, repo_root=str(self.root), postprocess="none"
+        )
+
+        assert result["status"] == "degraded"
+        assert result["errors"] == [
+            {"file": "src/deep.erl", "error": "AST too deep"}
+        ]
+
     def test_incremental_noop_and_update_propagate_degraded_erlang_status(
         self, monkeypatch
     ):
