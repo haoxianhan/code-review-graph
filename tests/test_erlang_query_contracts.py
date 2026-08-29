@@ -13,7 +13,7 @@ from code_review_graph.erlang_semantic import (
 )
 from code_review_graph.graph import GraphEdge, GraphStore, edge_to_dict
 from code_review_graph.parser import EdgeInfo, NodeInfo
-from code_review_graph.tools.query import query_graph
+from code_review_graph.tools.query import _erlang_mfa_parts, query_graph
 
 
 def _repo(tmp_path: Path) -> Path:
@@ -100,6 +100,34 @@ def test_mfa_alias_resolves_without_generic_broad_fallback(tmp_path: Path):
     # The Generic baseline keeps an unresolved remote target. It must not be
     # mistaken for a resolved caller merely because the MFA alias matched.
     assert result["results"] == []
+
+
+def test_quoted_mfa_alias_resolves_canonical_delimiters(tmp_path: Path):
+    root = _repo(tmp_path)
+    (root / "src").mkdir()
+    worker_file = (root / "src" / "worker.erl").as_posix()
+    with GraphStore(root / ".code-review-graph" / "graph.db") as store:
+        store.upsert_node(NodeInfo(
+            kind="Class", name="mod:ule", file_path=worker_file,
+            line_start=1, line_end=3, language="erlang",
+            extra={"erlang_kind": "module"},
+        ))
+        store.upsert_node(NodeInfo(
+            kind="Function", name="fun/ction", identity_name="fun/ction/2",
+            file_path=worker_file, parent_name="mod:ule",
+            line_start=2, line_end=2, language="erlang",
+            extra={"erlang_kind": "function", "arity": 2},
+        ))
+        store.commit()
+
+    assert _erlang_mfa_parts(r"'mod\:ule':'fun\/ction'/2") == (
+        "mod:ule", "fun/ction", 2,
+    )
+    result = query_graph(
+        "callers_of", r"'mod\:ule':'fun\/ction'/2", repo_root=str(root),
+    )
+    assert result["status"] == "ok"
+    assert result["target"] == f"{worker_file}::mod:ule.fun/ction/2"
 
 
 def test_invalid_mfa_is_bounded_and_does_not_search_by_fragment(tmp_path: Path):

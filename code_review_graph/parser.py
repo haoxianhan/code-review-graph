@@ -58,6 +58,154 @@ _SQL_TABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+_ERLANG_ATOM_ESCAPES = {
+    "b": "\b",
+    "d": "\x7f",
+    "e": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "s": " ",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
+_ERLANG_BARE_ATOM_RE = re.compile(r"^[a-z_][A-Za-z0-9_@]*$")
+
+
+def normalize_erlang_atom(value: str) -> str:
+    """Decode one Erlang atom spelling to its semantic identifier.
+
+    Quoted atoms support the same compact escape forms as Erlang strings:
+    character escapes, octal, hexadecimal, and control notation.  Unknown
+    escapes retain the escaped character, matching Erlang's lexical meaning
+    for escaped punctuation such as ``\\:`` and ``\\/``.
+    """
+    text = str(value).strip()
+    if len(text) < 2 or text[0] != text[-1] or text[0] != "'":
+        return text
+    text = text[1:-1]
+    chars: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != "\\" or index + 1 >= len(text):
+            chars.append(char)
+            index += 1
+            continue
+        escaped = text[index + 1]
+        replacement = _ERLANG_ATOM_ESCAPES.get(escaped)
+        if replacement is not None:
+            chars.append(replacement)
+            index += 2
+            continue
+        if escaped == "^" and index + 2 < len(text):
+            control = text[index + 2]
+            code = 0x7F if control == "?" else ord(control.upper()) & 0x1F
+            chars.append(chr(code))
+            index += 3
+            continue
+        if escaped == "x":
+            if index + 2 < len(text) and text[index + 2] == "{":
+                end = text.find("}", index + 3)
+                digits = text[index + 3:end] if end >= 0 else ""
+                if digits and re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                    code = int(digits, 16)
+                    if code <= 0x10FFFF:
+                        chars.append(chr(code))
+                        index = end + 1
+                        continue
+            elif index + 3 < len(text):
+                digits = text[index + 2:index + 4]
+                if re.fullmatch(r"[0-9A-Fa-f]{2}", digits):
+                    chars.append(chr(int(digits, 16)))
+                    index += 4
+                    continue
+        if escaped in "01234567":
+            end = index + 2
+            while end < len(text) and end < index + 4 and text[end] in "01234567":
+                end += 1
+            chars.append(chr(int(text[index + 1:end], 8)))
+            index = end
+            continue
+        # Erlang permits escaping punctuation.  Keep the character while
+        # dropping only the syntactic escape marker.
+        chars.append(escaped)
+        index += 2
+    return "".join(chars)
+
+
+def _scan_erlang_atom_token(value: str, offset: int) -> tuple[str, int] | None:
+    """Scan one bare or quoted atom token, returning raw text and end offset."""
+    if offset >= len(value):
+        return None
+    if value[offset] == "'":
+        index = offset + 1
+        while index < len(value):
+            if value[index] == "\\" and index + 1 < len(value):
+                index += 2
+                continue
+            if value[index] == "'":
+                return value[offset:index + 1], index + 1
+            index += 1
+        return None
+    index = offset
+    while index < len(value) and value[index] not in ":/":
+        index += 1
+    if index == offset:
+        return None
+    token = value[offset:index]
+    if not _ERLANG_BARE_ATOM_RE.fullmatch(token):
+        return None
+    return token, index
+
+
+def parse_erlang_mfa(
+    value: str,
+    *,
+    require_module: bool = False,
+) -> tuple[str | None, str, int] | None:
+    """Parse a static Erlang ``module:function/arity`` or local MFA.
+
+    Quoted module/function atoms may contain ``:`` and ``/``.  Parsing is
+    token-based rather than regex-based so those delimiters are not mistaken
+    for syntax separators.  ``None`` is returned for malformed or out-of-range
+    input; callers can then keep dynamic expressions unresolved.
+    """
+    text = str(value).strip()
+    if text.startswith("fun "):
+        text = text[4:].strip()
+    if not text or len(text) > 4096:
+        return None
+    first = _scan_erlang_atom_token(text, 0)
+    if first is None:
+        return None
+    raw_first, offset = first
+    module: str | None = None
+    if offset < len(text) and text[offset] == ":":
+        module = normalize_erlang_atom(raw_first)
+        second = _scan_erlang_atom_token(text, offset + 1)
+        if second is None:
+            return None
+        raw_name, offset = second
+    else:
+        if require_module:
+            return None
+        raw_name = raw_first
+    if offset >= len(text) or text[offset] != "/":
+        return None
+    arity_text = text[offset + 1:]
+    if not arity_text.isdigit() or len(arity_text.lstrip("0")) > 3:
+        return None
+    arity = int(arity_text or "0")
+    if arity > 255:
+        return None
+    name = normalize_erlang_atom(raw_name)
+    return module, name, arity
+
 # dbt model dependencies: {{ ref('model') }}, {{ ref('package', 'model') }}
 # and {{ source('source_name', 'table') }}. String-literal arguments only —
 # dynamic ref() calls cannot be resolved statically.
@@ -2819,25 +2967,9 @@ class CodeParser:
         """
         if node is None or node.type != "atom":
             return None
-        text = node.text.decode("utf-8", errors="replace").strip()
-        if len(text) >= 2 and text[0] == text[-1] == "'":
-            text = text[1:-1]
-            chars: list[str] = []
-            index = 0
-            while index < len(text):
-                char = text[index]
-                if char == "\\" and index + 1 < len(text):
-                    escaped = text[index + 1]
-                    escapes = {
-                        "n": "\n", "r": "\r", "t": "\t", "b": "\b",
-                        "f": "\f", "v": "\v", "\\": "\\", "'": "'",
-                    }
-                    chars.append(escapes.get(escaped, escaped))
-                    index += 2
-                    continue
-                chars.append(char)
-                index += 1
-            text = "".join(chars)
+        text = normalize_erlang_atom(
+            node.text.decode("utf-8", errors="replace").strip()
+        )
         return text or None
 
     @classmethod

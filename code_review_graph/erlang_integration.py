@@ -49,7 +49,12 @@ from .erlang_semantic import (
     run_erlang_enrichment,
 )
 from .graph import GraphNode, GraphStore
-from .parser import EdgeInfo, normalize_file_path
+from .parser import (
+    EdgeInfo,
+    normalize_erlang_atom,
+    normalize_file_path,
+    parse_erlang_mfa,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -681,11 +686,7 @@ class _ErlangNodeIndex:
 
     @staticmethod
     def _unquote(value: str) -> str:
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] == "'":
-            value = value[1:-1]
-            value = value.replace("\\'", "'").replace("\\\\", "\\")
-        return value
+        return normalize_erlang_atom(value)
 
     @staticmethod
     def _unique(values: Iterable[GraphNode]) -> GraphNode | None:
@@ -740,18 +741,9 @@ class _ErlangNodeIndex:
             if found is not None:
                 return found
             value = suffix
-        match = _MFA_RE.match(value)
-        if match:
-            module = self._unquote(match.group("module")) if match.group("module") else None
-            name = self._unquote(match.group("name"))
-            try:
-                # Erlang arities are small machine integers.  Refuse absurd
-                # values before Python's integer parser or SQLite sees them.
-                if len(match.group("arity")) > 6:
-                    return None
-                arity = int(match.group("arity"))
-            except (TypeError, ValueError, OverflowError):
-                return None
+        parsed = parse_erlang_mfa(value)
+        if parsed is not None:
+            module, name, arity = parsed
             return self._unique(self.symbols.get((module, name, arity), ())) or self._unique(
                 self.symbols.get((None, name, arity), ())
                 if module is None

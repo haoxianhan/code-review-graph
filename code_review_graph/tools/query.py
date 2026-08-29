@@ -13,7 +13,7 @@ from ..embeddings import EmbeddingStore
 from ..graph import GraphNode, GraphStore, _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
-from ..parser import normalize_file_path
+from ..parser import normalize_file_path, parse_erlang_mfa
 from ..search import hybrid_search
 from ..uncertainty import (
     empty_impact_confidence,
@@ -55,12 +55,6 @@ _QUERY_PATTERNS = {
 _JAVA_FQN_PART = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 _MAX_FQN_CANDIDATES = 100
 _MAX_QUERY_RESULTS = 10_000
-_ERLANG_MAX_ARITY = 255
-_ERLANG_ATOM_PATTERN = r"(?:'(?:\\.|[^'])*'|[a-z_][A-Za-z0-9_@]*)"
-_ERLANG_MFA_RE = re.compile(
-    rf"^(?P<module>{_ERLANG_ATOM_PATTERN}):"
-    rf"(?P<function>{_ERLANG_ATOM_PATTERN})/(?P<arity>\d+)$",
-)
 
 
 def _display_query_target(target: Any) -> str:
@@ -78,26 +72,18 @@ def _erlang_mfa_parts(target: str) -> tuple[str, str, int] | None:
     hostile value cannot trip Python's integer conversion limit.
     """
     value = str(target).strip()
-    match = _ERLANG_MFA_RE.fullmatch(value)
-    if match is None:
+    parsed = parse_erlang_mfa(value, require_module=True)
+    if parsed is None:
         # A colon and slash strongly indicate an attempted MFA.  Treat a
         # malformed attempt as invalid rather than accidentally matching an
         # unrelated node named after part of the string.
         return ("", "", -1) if ":" in value and "/" in value else None
-    arity_text = match.group("arity")
-    significant_arity = arity_text.lstrip("0")
-    # Leading zeroes are harmless (``000/0`` is still arity zero), while a
-    # long non-zero suffix must be rejected before integer conversion.
-    if len(significant_arity) > 3:
-        return "", "", -1
-    arity = int(significant_arity or "0")
-    if arity > _ERLANG_MAX_ARITY:
-        return "", "", -1
-    return (
-        match.group("module").strip("'"),
-        match.group("function").strip("'"),
-        arity,
-    )
+    module, function, arity = parsed
+    # ``require_module=True`` guarantees this invariant; keep the guard local
+    # so a future parser change cannot pass ``None`` into the SQL layer.
+    if module is None:
+        return ("", "", -1)
+    return module, function, arity
 
 
 def _looks_like_java_method_fqn(target: str) -> bool:

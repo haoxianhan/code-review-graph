@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from code_review_graph.parser import CodeParser
+from code_review_graph.parser import CodeParser, normalize_erlang_atom, parse_erlang_mfa
 
 
 def _parse(name: str, source: str):
@@ -72,6 +72,24 @@ def test_erlang_quoted_atoms_are_normalized_in_symbol_names():
     function = next(node for node in nodes if node.kind == "Function")
     assert function.name == "run-now"
     assert function.identity_name == "run-now/0"
+
+
+def test_erlang_mfa_parser_handles_quoted_delimiters_and_escapes():
+    assert normalize_erlang_atom(r"'mod\:ule'") == "mod:ule"
+    assert normalize_erlang_atom(r"'fun\/ction'") == "fun/ction"
+    assert normalize_erlang_atom(r"'line\x{3a}oct\072'") == "line:oct:"
+    assert normalize_erlang_atom(r"'control\^?'") == "control\x7f"
+    assert parse_erlang_mfa(
+        r"'mod\:ule':'fun\/ction'/2", require_module=True,
+    ) == ("mod:ule", "fun/ction", 2)
+    assert parse_erlang_mfa("local/1", require_module=True) is None
+    assert parse_erlang_mfa("Upper:run/0", require_module=True) is None
+
+
+def test_erlang_mfa_parser_rejects_malformed_or_out_of_range_targets():
+    assert parse_erlang_mfa("worker:run/256", require_module=True) is None
+    assert parse_erlang_mfa("worker:run/not-an-arity", require_module=True) is None
+    assert parse_erlang_mfa("worker module:run/0", require_module=True) is None
 
 
 def test_erlang_local_nested_and_remote_calls_preserve_arity():
