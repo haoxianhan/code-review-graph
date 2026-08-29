@@ -11,6 +11,7 @@ import argparse
 import datetime as _datetime
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -126,6 +127,49 @@ ADAPTER_MANIFEST_CACHE_FIELDS = {
     "query_kind",
     "query_targets",
 }
+ADAPTER_MANIFEST_COMMAND_ALLOWLIST_KEYS = {
+    "executables",
+    "subcommands",
+    "flags",
+    "reject_shell_metacharacters",
+}
+ADAPTER_MANIFEST_PLACEHOLDERS = {
+    "{query_kind}",
+    "{query_targets}",
+}
+ADAPTER_MANIFEST_ADAPTER_PLACEHOLDERS = {
+    "generic": set(),
+    "elp": {"{query_kind}", "{query_targets}"},
+    "xref": set(),
+    "dialyzer": set(),
+}
+# These values are passed as argv tokens, but rejecting shell syntax keeps a
+# manifest from becoming an accidental command-string escape hatch for a
+# caller that later chooses to invoke it through a shell.
+ADAPTER_MANIFEST_SHELL_METACHARACTERS = frozenset(
+    {
+        ";",
+        "|",
+        "&",
+        "$",
+        "`",
+        "<",
+        ">",
+        "\\",
+        "'",
+        '"',
+        "(",
+        ")",
+        "*",
+        "?",
+        "[",
+        "]",
+        "!",
+        "~",
+        "\n",
+        "\r",
+    }
+)
 ADAPTER_MANIFEST_STATUSES = {
     "ok",
     "optional",
@@ -184,12 +228,74 @@ def _validate_string_list(value: object, source: str, *, allow_empty: bool = Tru
 
 def _validate_relative_path(value: object, source: str) -> str:
     path = _string(value, source)
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise _error(source, "must not contain control characters")
     if Path(path).is_absolute() or "\\" in path:
         raise _error(source, "must be a repository-relative POSIX path or placeholder")
     parts = Path(path).parts
     if ".." in parts:
         raise _error(source, "must not escape the execution workspace")
     return path
+
+
+def _validate_command_token(
+    value: object,
+    source: str,
+    *,
+    allow_placeholder: bool = False,
+    allowed_placeholders: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Validate one literal argv/allowlist token.
+
+    Command templates are later consumed by more than one execution
+    backend.  Keep them single-token and reject shell syntax even though the
+    current subprocess runner uses ``shell=False``.
+    """
+
+    token = _string(value, source)
+    if any(
+        char in ADAPTER_MANIFEST_SHELL_METACHARACTERS
+        or ord(char) < 32
+        or ord(char) == 127
+        for char in token
+    ):
+        raise _error(source, "contains shell metacharacters or control bytes")
+    if any(char.isspace() for char in token):
+        raise _error(source, "must be a single argv token without whitespace")
+    placeholders = (
+        ADAPTER_MANIFEST_PLACEHOLDERS if allowed_placeholders is None else allowed_placeholders
+    )
+    if "{" in token or "}" in token:
+        if not allow_placeholder or token not in placeholders:
+            raise _error(source, f"unsupported template placeholder {token!r}")
+    return token
+
+
+def _validate_command_token_list(value: object, source: str) -> list[str]:
+    values = _list(value, source)
+    result = [
+        _validate_command_token(item, f"{source}[{index}]")
+        for index, item in enumerate(values)
+    ]
+    if len(set(result)) != len(result):
+        raise _error(source, "must not contain duplicate command tokens")
+    return result
+
+
+def _resolve_contained_manifest_path(root: Path, value: object, source: str) -> Path:
+    """Resolve a manifest-relative path and enforce the post-resolution root."""
+
+    relative = _validate_relative_path(value, source)
+    try:
+        resolved_root = root.expanduser().resolve(strict=False)
+        resolved = (resolved_root / relative).resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise _error(source, f"cannot resolve path safely: {exc}") from exc
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise _error(source, "path escapes the manifest directory after resolution") from exc
+    return resolved
 
 
 def _validate_adapter_failure_event(value: object, source: str) -> None:
@@ -249,11 +355,31 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
     _validate_string_list(contract.get("query_kinds", []), f"{source}.contract.query_kinds")
 
     invocation = _mapping(document["invocation"], f"{source}.invocation")
-    argv = _validate_string_list(
-        invocation.get("argv", []), f"{source}.invocation.argv", allow_empty=adapter == "generic"
-    )
-    if adapter != "generic" and not argv:
-        raise _error(f"{source}.invocation.argv", "external adapters require an argv template")
+    invocation_mode = _string(invocation.get("mode"), f"{source}.invocation.mode")
+    expected_mode = "in_process" if adapter == "generic" else "argv"
+    if invocation_mode != expected_mode:
+        raise _error(
+            f"{source}.invocation.mode",
+            f"{adapter} adapter requires invocation mode {expected_mode!r}",
+        )
+    raw_argv = _list(invocation.get("argv", []), f"{source}.invocation.argv")
+    allowed_placeholders = frozenset(ADAPTER_MANIFEST_ADAPTER_PLACEHOLDERS[adapter])
+    argv = [
+        _validate_command_token(
+            token,
+            f"{source}.invocation.argv[{index}]",
+            allow_placeholder=True,
+            allowed_placeholders=allowed_placeholders,
+        )
+        for index, token in enumerate(raw_argv)
+    ]
+    if adapter != "generic" and len(argv) < 2:
+        raise _error(
+            f"{source}.invocation.argv",
+            "external adapters require executable and subcommand tokens",
+        )
+    if adapter == "generic" and argv:
+        raise _error(f"{source}.invocation.argv", "Generic adapter must not execute a command")
     if not isinstance(invocation.get("shell"), bool):
         raise _error(f"{source}.invocation.shell", "expected boolean")
     if invocation.get("shell"):
@@ -262,37 +388,40 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
     if invocation_cwd not in {"repository_root", "workspace", "probe_root", "not_applicable"}:
         raise _error(f"{source}.invocation.cwd", f"unsupported cwd policy {invocation_cwd!r}")
     _string(invocation.get("stdin"), f"{source}.invocation.stdin")
+    if "executable" not in invocation:
+        raise _error(f"{source}.invocation", "missing keys: executable")
     _validate_string_list(
         invocation.get("environment_allowlist", []),
         f"{source}.invocation.environment_allowlist",
     )
-    allowlist = _mapping(
-        invocation.get("command_allowlist"), f"{source}.invocation.command_allowlist"
+    allowlist_source = f"{source}.invocation.command_allowlist"
+    allowlist = _mapping(invocation.get("command_allowlist"), allowlist_source)
+    missing_allowlist = ADAPTER_MANIFEST_COMMAND_ALLOWLIST_KEYS - set(allowlist)
+    if missing_allowlist:
+        raise _error(
+            allowlist_source,
+            f"missing keys: {', '.join(sorted(missing_allowlist))}",
+        )
+    unknown_allowlist = set(allowlist) - ADAPTER_MANIFEST_COMMAND_ALLOWLIST_KEYS
+    if unknown_allowlist:
+        raise _error(
+            allowlist_source,
+            f"unknown keys: {', '.join(sorted(str(key) for key in unknown_allowlist))}",
+        )
+    executables = _validate_command_token_list(
+        allowlist.get("executables"), f"{allowlist_source}.executables"
     )
-    _validate_string_list(
-        allowlist.get("executables"),
-        f"{source}.invocation.command_allowlist.executables",
+    subcommands = _validate_command_token_list(
+        allowlist.get("subcommands"), f"{allowlist_source}.subcommands"
     )
-    _validate_string_list(
-        allowlist.get("subcommands"),
-        f"{source}.invocation.command_allowlist.subcommands",
-    )
-    _validate_string_list(
-        allowlist.get("flags"),
-        f"{source}.invocation.command_allowlist.flags",
-    )
-    executables = allowlist.get("executables")
-    subcommands = allowlist.get("subcommands")
-    if adapter != "generic" and (
-        not isinstance(executables, list)
-        or not executables
-        or not isinstance(subcommands, list)
-        or not subcommands
-    ):
+    flags = _validate_command_token_list(allowlist.get("flags"), f"{allowlist_source}.flags")
+    if adapter != "generic" and (not executables or not subcommands):
         raise _error(
             f"{source}.invocation.command_allowlist",
             "external adapters require executable and subcommand allowlists",
         )
+    if adapter == "generic" and (executables or subcommands or flags):
+        raise _error(allowlist_source, "Generic adapter must not declare command tokens")
     if not isinstance(allowlist.get("reject_shell_metacharacters"), bool):
         raise _error(
             f"{source}.invocation.command_allowlist.reject_shell_metacharacters",
@@ -303,8 +432,52 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
             f"{source}.invocation.command_allowlist.reject_shell_metacharacters",
             "must be true",
         )
-    if adapter == "generic" and argv:
-        raise _error(f"{source}.invocation.argv", "Generic adapter must not execute a command")
+    executable_value = invocation.get("executable")
+    if adapter == "generic":
+        if executable_value is not None:
+            raise _error(
+                f"{source}.invocation.executable",
+                "Generic adapter must not declare an executable",
+            )
+    else:
+        executable = _validate_command_token(
+            executable_value, f"{source}.invocation.executable"
+        )
+        if executable not in executables:
+            raise _error(
+                f"{source}.invocation.executable",
+                "must be present in command_allowlist.executables",
+            )
+        if argv[0] != executable:
+            raise _error(
+                f"{source}.invocation.argv[0]",
+                "must match invocation.executable",
+            )
+        if argv[0] not in executables:
+            raise _error(
+                f"{source}.invocation.argv[0]",
+                "executable is not in command_allowlist.executables",
+            )
+        if argv[1] not in subcommands:
+            raise _error(
+                f"{source}.invocation.argv[1]",
+                "subcommand is not in command_allowlist.subcommands",
+            )
+        for index, token in enumerate(argv[2:], start=2):
+            if token in allowed_placeholders:
+                continue
+            if token not in flags:
+                raise _error(
+                    f"{source}.invocation.argv[{index}]",
+                    "token is not an approved flag or template placeholder",
+                )
+        if adapter == "elp":
+            for placeholder in allowed_placeholders:
+                if argv.count(placeholder) != 1:
+                    raise _error(
+                        f"{source}.invocation.argv",
+                        f"ELP command must contain exactly one {placeholder} placeholder",
+                    )
 
     timeout = _mapping(document["timeout"], f"{source}.timeout")
     default_seconds = timeout.get("default_seconds")
@@ -312,6 +485,8 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
     for field_name, value in (("default_seconds", default_seconds), ("max_seconds", max_seconds)):
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise _error(f"{source}.timeout.{field_name}", "expected a non-negative number")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _error(f"{source}.timeout.{field_name}", "expected a finite number")
     probe_seconds = timeout.get("version_probe_seconds")
     if (
         not isinstance(probe_seconds, (int, float))
@@ -322,12 +497,22 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
             f"{source}.timeout.version_probe_seconds",
             "expected a non-negative number",
         )
+    if isinstance(probe_seconds, float) and not math.isfinite(probe_seconds):
+        raise _error(
+            f"{source}.timeout.version_probe_seconds",
+            "expected a finite number",
+        )
     if adapter != "generic" and (default_seconds <= 0 or max_seconds <= 0):
         raise _error(f"{source}.timeout", "external adapters require a positive timeout")
     if max_seconds < default_seconds or max_seconds > 300:
         raise _error(
             f"{source}.timeout.max_seconds",
             "must bound the default timeout and be <= 300",
+        )
+    if probe_seconds > max_seconds:
+        raise _error(
+            f"{source}.timeout.version_probe_seconds",
+            "must not exceed max_seconds",
         )
     _string(timeout.get("on_exceeded"), f"{source}.timeout.on_exceeded")
     if not isinstance(timeout.get("return_code"), int) or isinstance(
@@ -448,16 +633,28 @@ def _adapter_manifest_paths(
     directory: str | Path = DEFAULT_ADAPTER_MANIFEST_DIR,
     paths: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
 ) -> dict[str, Path]:
-    root = Path(directory).expanduser().resolve()
+    try:
+        root = Path(directory).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise _error(
+            "adapter_manifests",
+            f"cannot resolve manifest directory safely: {exc}",
+        ) from exc
     if paths is None:
-        return {name: root / f"{name}.manifest.json" for name in ERLANG_ADAPTERS}
-    if isinstance(paths, Mapping):
+        values = {
+            name: Path(f"{name}.manifest.json")
+            for name in ERLANG_ADAPTERS
+        }
+    elif isinstance(paths, Mapping):
         values = {str(name).casefold(): Path(path) for name, path in paths.items()}
     else:
         values = {}
         for path in paths:
             candidate = Path(path)
-            values[candidate.name.removesuffix(".manifest.json").casefold()] = candidate
+            name = candidate.name.removesuffix(".manifest.json").casefold()
+            if name in values:
+                raise _error("adapter_manifests", f"duplicate manifest path for {name!r}")
+            values[name] = candidate
     if set(values) != set(ERLANG_ADAPTERS):
         missing = set(ERLANG_ADAPTERS) - set(values)
         extra = set(values) - set(ERLANG_ADAPTERS)
@@ -469,7 +666,27 @@ def _adapter_manifest_paths(
         raise _error("adapter_manifests", "; ".join(details))
     result: dict[str, Path] = {}
     for name, path in values.items():
-        resolved = path if path.is_absolute() else root / path
+        candidate = path.expanduser()
+        if candidate.is_absolute():
+            # ``paths`` is also a programmatic API; retain support for an
+            # absolute path while still requiring it to resolve inside the
+            # supplied manifest directory.
+            try:
+                resolved = candidate.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise _error(
+                    f"adapter_manifests.{name}",
+                    f"cannot resolve path safely: {exc}",
+                ) from exc
+        else:
+            relative = _validate_relative_path(str(candidate), f"adapter_manifests.{name}")
+            try:
+                resolved = (root / relative).resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise _error(
+                    f"adapter_manifests.{name}",
+                    f"cannot resolve path safely: {exc}",
+                ) from exc
         try:
             resolved.relative_to(root)
         except ValueError as exc:
@@ -508,19 +725,8 @@ def inspect_adapter_manifests(
     """Return an observable policy status without raising on bad artifacts."""
     try:
         manifests = load_adapter_manifests(directory, paths=paths)
-    except (OSError, TypeError, ValueError) as exc:
-        return {
-            "status": "unavailable",
-            "runtime_policy_enforced": False,
-            "manifests": [],
-            "diagnostics": [
-                _diagnostic(
-                    "adapter_manifest_unavailable",
-                    "warning",
-                    f"No valid Erlang adapter policy is available: {exc}",
-                )
-            ],
-        }
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _unavailable_adapter_policy(exc)
     unenforced = [
         name
         for name, manifest in manifests.items()
@@ -539,6 +745,21 @@ def inspect_adapter_manifests(
         "runtime_policy_enforced": not unenforced,
         "manifests": sorted(manifests),
         "diagnostics": diagnostics,
+    }
+
+
+def _unavailable_adapter_policy(exc: BaseException) -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "runtime_policy_enforced": False,
+        "manifests": [],
+        "diagnostics": [
+            _diagnostic(
+                "adapter_manifest_unavailable",
+                "warning",
+                f"No valid Erlang adapter policy is available: {exc}",
+            )
+        ],
     }
 
 
@@ -674,10 +895,13 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
                 f"must list exactly: {', '.join(ERLANG_ADAPTERS)}",
             )
         for name, value in files.items():
-            child_path = _validate_relative_path(value, f"{source}.adapters.files.{name}")
+            name_text = _string(name, f"{source}.adapters.files key")
+            child_path = _validate_relative_path(
+                value, f"{source}.adapters.files.{name_text}"
+            )
             if not child_path.endswith(".manifest.json"):
                 raise _error(
-                    f"{source}.adapters.files.{name}",
+                    f"{source}.adapters.files.{name_text}",
                     "must point to a .manifest.json file",
                 )
         runtime_policy = _string(
@@ -791,17 +1015,29 @@ def load_manifest(
 ) -> dict[str, Any]:
     """Load an evaluation manifest and, by default, its adapter policies."""
 
-    manifest_path = Path(path)
+    manifest_path = Path(path).expanduser().resolve(strict=False)
     document = _load_json(manifest_path)
     validate_manifest(document, str(manifest_path))
     adapter_index = document.get("adapters", document.get("adapter_manifests"))
     if load_adapters and adapter_index is not None:
         index = _mapping(adapter_index, f"{manifest_path}.adapters")
-        directory = manifest_path.parent / str(index["directory"])
-        child_paths = {
-            str(name).casefold(): directory / str(child)
-            for name, child in _mapping(index["files"], f"{manifest_path}.adapters.files").items()
-        }
+        directory = _resolve_contained_manifest_path(
+            manifest_path.parent,
+            index["directory"],
+            f"{manifest_path}.adapters.directory",
+        )
+        child_paths: dict[str, str] = {}
+        for name, child in _mapping(
+            index["files"], f"{manifest_path}.adapters.files"
+        ).items():
+            # Resolve each child before loading it so a symlink cannot move a
+            # checked-in policy outside the directory named by the parent.
+            _resolve_contained_manifest_path(
+                directory,
+                child,
+                f"{manifest_path}.adapters.files.{name}",
+            )
+            child_paths[str(name).casefold()] = str(child)
         document["_adapter_manifests"] = load_adapter_manifests(
             directory,
             paths=child_paths,
@@ -1523,14 +1759,25 @@ def discover_environment(
     if adapter_index is None:
         adapter_policy = inspect_adapter_manifests()
     else:
-        index = _mapping(adapter_index, "manifest.adapters")
-        index_root = Path(manifest_root or MODULE_ROOT / "evaluate" / "erlang").resolve()
-        adapter_directory = index_root / str(index["directory"])
-        child_paths = {
-            str(name).casefold(): adapter_directory / str(child)
-            for name, child in _mapping(index["files"], "manifest.adapters.files").items()
-        }
-        adapter_policy = inspect_adapter_manifests(adapter_directory, paths=child_paths)
+        try:
+            index = _mapping(adapter_index, "manifest.adapters")
+            index_root = Path(
+                manifest_root or MODULE_ROOT / "evaluate" / "erlang"
+            ).expanduser().resolve(strict=False)
+            adapter_directory = _resolve_contained_manifest_path(
+                index_root,
+                index["directory"],
+                "manifest.adapters.directory",
+            )
+            child_paths = {
+                str(name).casefold(): str(child)
+                for name, child in _mapping(
+                    index["files"], "manifest.adapters.files"
+                ).items()
+            }
+            adapter_policy = inspect_adapter_manifests(adapter_directory, paths=child_paths)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            adapter_policy = _unavailable_adapter_policy(exc)
     diagnostics.extend(adapter_policy.get("diagnostics", []))
     toolchain, tool_diagnostics = _discover_toolchain(
         root,
