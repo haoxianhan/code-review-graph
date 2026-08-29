@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "kind": "erlang_evaluation_manifest",
+  "target": {
+    "name": "server_flexible",
+    "path": "/home/haoxian/workspaces/shiyue/server_flexible",
+    "remote": "ssh://git@ysc2-gitlab.shiyue.com:10022/g_server/server.git"
+  },
+  "revision": {
+    "requested": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
+    "observed": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
+    "working_tree_clean": false,
+    "baseline_status": "non_clean",
+    "dirty_paths": [
+      "apps/server_mongodb",
+      "server_ai/indexer/docs.json",
+      "server_ai/indexer/manifest.txt",
+      "docker-operations-hardening-plan.md",
+      "docs/architecture/docker-images.md",
+      "server_ai/docs/specs/20260828-server-ai-behavior-evals.md",
+      "unify-rebar3-plan.md"
+    ]
+  },
+  "dependencies": {
+    "lockfiles": [
+      {
+        "path": "rebar.lock",
+        "sha256": "11147eb50b093a61fe80253dae762d703387f23054d00907217c4ab3dc2d6b8c"
+      }
+    ],
+    "submodules": [
+      {
+        "path": "apps/server_mongodb",
+        "gitlink_revision": "74a3a7cf2cf10ca105e464ad8644bf3986d25795",
+        "checkout_revision": "56681fdb3a9c8ddc36b7c13232fc1d8e407f513d",
+        "working_tree_clean": false
+      },
+      {
+        "path": "apps/server_grpc",
+        "gitlink_revision": "272806b8af6f8c186fe377f48f71286bf896b625",
+        "checkout_revision": "272806b8af6f8c186fe377f48f71286bf896b625",
+        "working_tree_clean": true
+      },
+      {
+        "path": "apps/server_log",
+        "gitlink_revision": "0612ee392ff923560e37fc45e8770c948627f789",
+        "checkout_revision": "0612ee392ff923560e37fc45e8770c948627f789",
+        "working_tree_clean": true
+      },
+      {
+        "path": "server_deps_beam",
+        "gitlink_revision": "06186380ecb2383878ce9efcfbdff37d9cec5abf",
+        "checkout_revision": "06186380ecb2383878ce9efcfbdff37d9cec5abf",
+        "working_tree_clean": true
+      }
+    ]
+  },
+  "generated_data": {
+    "revision": "35021",
+    "config_version": "dfc505397095d365a0a19899aa5b4467",
+    "paths": [
+      "tools/gen_data/include",
+      "tools/gen_data/src",
+      "apps/server_cfg_data/include/config",
+      "apps/server_cfg_data/src/data"
+    ]
+  },
+  "toolchain": {
+    "tools": {
+      "erl": {"command": ["erl", "-noshell"], "path": "/etc/profiles/per-user/haoxian/bin/erl", "status": "available"},
+      "rebar3": {"command": ["rebar3", "version"], "path": "/etc/profiles/per-user/haoxian/bin/rebar3", "status": "available"},
+      "dialyzer": {"command": ["dialyzer", "--version"], "path": "/etc/profiles/per-user/haoxian/bin/dialyzer", "status": "available"},
+      "elp": {"command": ["elp", "--version"], "path": null, "status": "unavailable"},
+      "erlang_ls": {"command": ["erlang_ls", "--version"], "path": null, "status": "unavailable"},
+      "elp-ls": {"command": ["elp-ls", "--version"], "path": null, "status": "unavailable"}
+    },
+    "runtime": {"otp_release": "25", "erts_version": null, "configured_otp_path": "/home/haoxian/kerl/25.3.2/"},
+    "configuration": {
+      "files": ["rebar.config", "rebar.config.script", "erlang_ls.config", ".elp_lint.toml"],
+      "execute_during_discovery": false,
+      "observed": {"rebar_config_script_present": false, "erlang_ls_config_present": true, "elp_lint_config_present": true}
+    }
+  },
+  "evaluation": {
+    "status": "scaffolded",
+    "adoption": "auxiliary_review_context_only",
+    "fixed_revision_required": true,
+    "lifecycle_checks": ["full_build", "incremental_update", "watch", "forget", "standalone_postprocess"],
+    "latency_budget_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000}
+  },
+  "analysis": {"cache_paths": [".code-review-graph", "_build/default", "_build/test", "server_ai/indexer/modules.json", "server_ai/indexer/records.json"]},
+  "diagnostics": [
+    {"code": "target_checkout_dirty_at_freeze", "severity": "warning", "message": "The requested revision was observed with local target changes; this is not a clean adoption baseline."},
+    {"code": "semantic_tools_not_available_at_freeze", "severity": "warning", "message": "ELP and erlang_ls were unavailable; Generic syntax evidence remains the compatibility floor."},
+    {"code": "lifecycle_metrics_not_run", "severity": "warning", "message": "Lifecycle and precision/recall gates are not established by this artifact scaffold."}
+  ]
+}
