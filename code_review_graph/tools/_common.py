@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import subprocess
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..graph import GraphStore
+from ..graph import GraphStore, _bound_semantic_value
 from ..incremental import find_project_root, get_db_path
 from ..parser import normalize_file_path
 
@@ -17,6 +19,209 @@ _PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
 _PROVENANCE_GIT_TIMEOUT_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
+
+# Semantic adapters are optional and may return arbitrarily large metadata.
+# Keep review/query responses bounded independently from persistence limits.
+_SEMANTIC_RESPONSE_RECORD_LIMIT = 32
+_SEMANTIC_RESPONSE_VALUE_DEPTH = 4
+_SEMANTIC_RESPONSE_RECORD_CHARS = 32_000
+_SEMANTIC_MATCH_TEXT_CHARS = 4_096
+
+
+def _semantic_response_record(value: Any) -> dict[str, Any] | None:
+    """Convert one persisted semantic record to a bounded JSON mapping."""
+    try:
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        if not isinstance(value, dict):
+            value = dict(value) if isinstance(value, Mapping) else None
+        if not isinstance(value, dict):
+            return None
+        bounded = _bound_semantic_value(value, max_depth=_SEMANTIC_RESPONSE_VALUE_DEPTH)
+        if not isinstance(bounded, dict):
+            return None
+        encoded = json.dumps(
+            bounded, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            default=str,
+        )
+        if len(encoded) <= _SEMANTIC_RESPONSE_RECORD_CHARS:
+            return bounded
+        # Preserve identity/location/provenance if a malformed adapter managed
+        # to exceed the normal bounded value budget.
+        keep = {
+            key: bounded[key]
+            for key in (
+                "evidence_id", "diagnostic_id", "kind", "code", "source",
+                "target", "file_path", "line", "column", "severity", "status",
+                "provenance",
+            )
+            if key in bounded
+        }
+        bounded = _bound_semantic_value(keep, max_depth=3)
+        return bounded if isinstance(bounded, dict) else None
+    except (TypeError, ValueError, OSError, RecursionError, OverflowError):
+        return None
+
+
+def _semantic_match_values(value: Any) -> set[str]:
+    """Return conservative comparable spellings for an endpoint/path value."""
+    if value is None:
+        return set()
+    text = str(value).strip()
+    if not text:
+        return set()
+    # Endpoint values can originate in a user query.  Keep matching bounded
+    # even when a caller submits an unexpectedly large target string.
+    text = text[:_SEMANTIC_MATCH_TEXT_CHARS]
+    normalized = text.replace("\\", "/")
+    values = {text, normalized}
+    tail = normalized.rsplit("::", 1)[-1]
+    values.add(tail)
+
+    # ELP/xref commonly use module:function/arity while Generic nodes use a
+    # path-qualified module.function/arity suffix.  Keep both spellings in
+    # the comparison set without treating arbitrary colons in file paths as
+    # Erlang separators.
+    if "/" in tail:
+        function_part, separator, arity = tail.rpartition("/")
+        if separator and arity.isdigit() and "." in function_part:
+            module, function = function_part.rsplit(".", 1)
+            if module and function:
+                values.add(f"{module}:{function}/{arity}")
+        if separator and arity.isdigit() and ":" in function_part:
+            module, function = function_part.rsplit(":", 1)
+            if module and function:
+                values.add(f"{module}.{function}/{arity}")
+    return {item.casefold() for item in values if item}
+
+
+def _semantic_record_matches(
+    record: Mapping[str, Any],
+    *,
+    endpoints: set[str],
+    files: set[str],
+    diagnostic: bool = False,
+) -> bool:
+    """Filter semantic records to the query/review scope without guessing."""
+    if not endpoints and not files:
+        return True
+    record_values: set[str] = set()
+    for key in ("source", "source_qualified", "target", "target_qualified"):
+        record_values.update(_semantic_match_values(record.get(key)))
+    raw_file = record.get("file_path")
+    file_values = _semantic_match_values(raw_file)
+    if endpoints and record_values.intersection(endpoints):
+        return True
+    if files:
+        for candidate in file_values:
+            if any(candidate == wanted or candidate.endswith("/" + wanted) for wanted in files):
+                return True
+    # Diagnostics without a source location can still describe the requested
+    # run, but only when their provenance names one of the requested targets.
+    # Never let an unrelated, target-less warning leak into a scoped response.
+    if diagnostic:
+        provenance = record.get("provenance")
+        if isinstance(provenance, Mapping):
+            for target in provenance.get("query_targets", ()) or ():
+                if _semantic_match_values(target).intersection(endpoints):
+                    return True
+        if not endpoints and not files and not raw_file and not record_values:
+            return True
+    return False
+
+
+def _read_semantic_context(
+    store: GraphStore,
+    root: Path,
+    *,
+    endpoints: Iterable[str] = (),
+    files: Iterable[str] = (),
+    limit: int = _SEMANTIC_RESPONSE_RECORD_LIMIT,
+    include_evidence: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read bounded, repository-scoped semantic evidence/diagnostics.
+
+    Reads are deliberately best effort: an old database, a malformed optional
+    row, or a missing semantic table must never break Generic graph queries.
+    """
+    endpoint_values: set[str] = set()
+    for endpoint in endpoints:
+        endpoint_values.update(_semantic_match_values(endpoint))
+    file_values: set[str] = set()
+    for file_path in files:
+        text = str(file_path).strip().replace("\\", "/").casefold()
+        if text:
+            file_values.add(text)
+            try:
+                file_values.add(normalize_file_path(root / file_path).casefold())
+            except (TypeError, ValueError, OSError):
+                pass
+    try:
+        repository = normalize_file_path(root)
+        bounded_limit = max(1, min(int(limit), _SEMANTIC_RESPONSE_RECORD_LIMIT))
+    except (TypeError, ValueError, OverflowError):
+        repository = normalize_file_path(root)
+        bounded_limit = _SEMANTIC_RESPONSE_RECORD_LIMIT
+
+    output: dict[str, list[dict[str, Any]]] = {
+        "semantic_evidence": [],
+        "semantic_diagnostics": [],
+    }
+    try:
+        if include_evidence:
+            raw_evidence = store.get_semantic_evidence(
+                repository=repository, limit=bounded_limit * 4,
+            )
+            for item in raw_evidence:
+                record = _semantic_response_record(item)
+                if record is None or not _semantic_record_matches(
+                    record, endpoints=endpoint_values, files=file_values,
+                ):
+                    continue
+                output["semantic_evidence"].append(record)
+                if len(output["semantic_evidence"]) >= bounded_limit:
+                    break
+    except Exception:
+        logger.debug("Could not read optional semantic evidence", exc_info=True)
+    try:
+        raw_diagnostics = store.get_semantic_diagnostics(
+            repository=repository, limit=bounded_limit * 4,
+        )
+        for item in raw_diagnostics:
+            record = _semantic_response_record(item)
+            if record is None or not _semantic_record_matches(
+                record, endpoints=endpoint_values, files=file_values, diagnostic=True,
+            ):
+                continue
+            output["semantic_diagnostics"].append(record)
+            if len(output["semantic_diagnostics"]) >= bounded_limit:
+                break
+    except Exception:
+        logger.debug("Could not read optional semantic diagnostics", exc_info=True)
+    return output
+
+
+def _attach_semantic_context(
+    response: dict[str, Any],
+    store: GraphStore,
+    root: Path,
+    *,
+    endpoints: Iterable[str] = (),
+    files: Iterable[str] = (),
+    limit: int = _SEMANTIC_RESPONSE_RECORD_LIMIT,
+    include_evidence: bool = True,
+    target: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach non-empty semantic context fields to an existing response."""
+    payload = _read_semantic_context(
+        store, root, endpoints=endpoints, files=files, limit=limit,
+        include_evidence=include_evidence,
+    )
+    destination = target if target is not None else response
+    for key, values in payload.items():
+        if values:
+            destination[key] = values
+    return response
 
 
 def _error_response(

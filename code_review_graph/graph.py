@@ -620,6 +620,17 @@ class GraphStore:
             value = _decode_semantic_mapping(row["record_json"])
             if not value:
                 continue
+            # Older adapters used the graph edge field names. Normalize those
+            # aliases before constructing typed records so the response layer
+            # can match and expose them exactly like canonical evidence.
+            if not value.get("source") and value.get("source_qualified"):
+                value["source"] = value["source_qualified"]
+            if not value.get("target") and value.get("target_qualified"):
+                value["target"] = value["target_qualified"]
+            if not value.get("file_path") and value.get("file"):
+                value["file_path"] = value["file"]
+            if value.get("line") is None and value.get("line_number") is not None:
+                value["line"] = value["line_number"]
             if record_type is None:
                 decoded.append(dict(value))
                 continue
@@ -1975,6 +1986,69 @@ class GraphStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def find_erlang_mfa(
+        self,
+        module: str,
+        function: str,
+        arity: int,
+        *,
+        limit: int | None = None,
+    ) -> list[GraphNode]:
+        """Return bounded repository-local matches for an Erlang MFA alias.
+
+        Erlang's BEAM function arity is bounded by 255.  The public query
+        layer validates that invariant before calling this method; retaining
+        it here as well prevents an internal caller from binding an enormous
+        integer to SQLite's ``LIMIT`` parameter.
+        """
+        try:
+            arity_value = int(arity)
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if arity_value < 0 or arity_value > 255:
+            return []
+        module_value = str(module)
+        function_value = str(function)
+        suffix = f".{function_value}/{arity_value}"
+        sql = (
+            "SELECT * FROM nodes WHERE language = 'erlang' "
+            "AND kind IN ('Function', 'Test') AND parent_name = ? "
+            "AND COALESCE(json_extract(extra, '$.erlang_kind'), '') != 'callback' "
+            "AND substr(qualified_name, -length(?)) = ? ORDER BY qualified_name"
+        )
+        params: list[Any] = [module_value, suffix, suffix]
+        if limit is not None:
+            try:
+                limit_value = max(0, min(int(limit), 10_000))
+            except (TypeError, ValueError, OverflowError):
+                limit_value = 10_000
+            sql += " LIMIT ?"
+            params.append(limit_value)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            self._row_to_node(row)
+            for row in rows
+            if row["qualified_name"].endswith(suffix)
+        ]
+
+    def count_erlang_mfa(self, module: str, function: str, arity: int) -> int:
+        """Count repository-local Erlang MFA matches without loading rows."""
+        try:
+            arity_value = int(arity)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if arity_value < 0 or arity_value > 255:
+            return 0
+        suffix = f".{function}/{arity_value}"
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM nodes WHERE language = 'erlang' "
+            "AND kind IN ('Function', 'Test') AND parent_name = ? "
+            "AND COALESCE(json_extract(extra, '$.erlang_kind'), '') != 'callback' "
+            "AND substr(qualified_name, -length(?)) = ?",
+            (str(module), suffix, suffix),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
     def count_search_nodes(self, query: str) -> int:
         """Count nodes using the same FTS-first semantics as ``search_nodes``."""
         words = query.split()
@@ -2992,4 +3066,55 @@ def edge_to_dict(e: GraphEdge) -> dict:
                 e.extra.get(f"{resolution}_targets_truncated")
                 or count > len(result[key])
             )
+
+    # Optional Erlang semantic projection metadata is deliberately exposed
+    # through a small, bounded allow-list.  Generic edges keep their historic
+    # response shape; only edges explicitly marked by the integration layer
+    # receive these fields.  This also keeps arbitrary adapter payloads out of
+    # MCP responses while preserving enough provenance for review decisions.
+    extra = e.extra if isinstance(e.extra, Mapping) else {}
+    if extra.get("_crg_erlang_semantic"):
+        evidence_id = extra.get("semantic_evidence_id") or extra.get("evidence_id")
+        if isinstance(evidence_id, str) and evidence_id:
+            result["evidence_id"] = evidence_id[:256]
+            # Keep the implementation's historical spelling available to
+            # callers that inspect persisted projection metadata directly.
+            result["semantic_evidence_id"] = evidence_id[:256]
+        evidence_ids = extra.get("semantic_evidence_ids") or extra.get("evidence_ids")
+        if isinstance(evidence_ids, (list, tuple)):
+            result["evidence_ids"] = [
+                item[:256]
+                for item in evidence_ids[:32]
+                if isinstance(item, str) and item
+            ]
+        tool = extra.get("semantic_tool")
+        if isinstance(tool, str) and tool:
+            result["semantic_tool"] = tool[:128]
+        query_kind = extra.get("semantic_query_kind")
+        if isinstance(query_kind, str) and query_kind:
+            result["semantic_query_kind"] = query_kind[:128]
+        raw_provenance = extra.get("semantic_provenance") or extra.get("provenance")
+        if isinstance(raw_provenance, Mapping):
+            bounded_provenance = _bound_semantic_value(raw_provenance, max_depth=4)
+            if isinstance(bounded_provenance, Mapping):
+                result["semantic_provenance"] = dict(bounded_provenance)
+        raw_chain = extra.get("provenance_chain")
+        if isinstance(raw_chain, (list, tuple)):
+            chain = _bound_semantic_value(raw_chain, max_depth=4)
+            if isinstance(chain, list):
+                result["provenance_chain"] = chain[:32]
+        status = extra.get("status")
+        if not isinstance(status, str) or not status:
+            provenance = raw_provenance if isinstance(raw_provenance, Mapping) else {}
+            status = provenance.get("status")
+        if isinstance(status, str) and status:
+            result["status"] = status[:64]
+        # A reconciler may attach bounded conflict/diagnostic summaries to the
+        # projection.  Preserve them when present without exposing internals.
+        for key in ("semantic_conflicts", "semantic_diagnostics"):
+            value = extra.get(key)
+            if isinstance(value, (list, tuple)):
+                bounded = _bound_semantic_value(value, max_depth=4)
+                if isinstance(bounded, list):
+                    result[key] = bounded[:32]
     return result

@@ -20,7 +20,12 @@ from ..uncertainty import (
     empty_query_confidence,
     empty_search_confidence,
 )
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _attach_semantic_context,
+    _get_store,
+    _resolve_graph_file_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,50 @@ _QUERY_PATTERNS = {
 
 _JAVA_FQN_PART = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 _MAX_FQN_CANDIDATES = 100
+_MAX_QUERY_RESULTS = 10_000
+_ERLANG_MAX_ARITY = 255
+_ERLANG_ATOM_PATTERN = r"(?:'(?:\\.|[^'])*'|[a-z_][A-Za-z0-9_@]*)"
+_ERLANG_MFA_RE = re.compile(
+    rf"^(?P<module>{_ERLANG_ATOM_PATTERN}):"
+    rf"(?P<function>{_ERLANG_ATOM_PATTERN})/(?P<arity>\d+)$",
+)
+
+
+def _display_query_target(target: Any) -> str:
+    """Return a bounded target spelling suitable for a response summary."""
+    return _sanitize_name(str(target), max_len=256)
+
+
+def _erlang_mfa_parts(target: str) -> tuple[str, str, int] | None:
+    """Parse a bounded public ``module:function/arity`` alias.
+
+    ``None`` means the input is not MFA-shaped and may continue through the
+    generic name search.  A negative arity sentinel means it is MFA-shaped but
+    invalid/out of BEAM range; callers must return ``not_found`` without a
+    broad fallback search.  The digit-length check happens before ``int`` so a
+    hostile value cannot trip Python's integer conversion limit.
+    """
+    value = str(target).strip()
+    match = _ERLANG_MFA_RE.fullmatch(value)
+    if match is None:
+        # A colon and slash strongly indicate an attempted MFA.  Treat a
+        # malformed attempt as invalid rather than accidentally matching an
+        # unrelated node named after part of the string.
+        return ("", "", -1) if ":" in value and "/" in value else None
+    arity_text = match.group("arity")
+    significant_arity = arity_text.lstrip("0")
+    # Leading zeroes are harmless (``000/0`` is still arity zero), while a
+    # long non-zero suffix must be rejected before integer conversion.
+    if len(significant_arity) > 3:
+        return "", "", -1
+    arity = int(significant_arity or "0")
+    if arity > _ERLANG_MAX_ARITY:
+        return "", "", -1
+    return (
+        match.group("module").strip("'"),
+        match.group("function").strip("'"),
+        arity,
+    )
 
 
 def _looks_like_java_method_fqn(target: str) -> bool:
@@ -132,8 +181,13 @@ def get_impact_radius(
         Changed nodes, impacted nodes, impacted files, connecting edges,
         plus ``truncated`` flag and ``total_impacted`` count.
     """
-    if isinstance(max_results, bool) or max_results < 1:
+    if (
+        isinstance(max_results, bool)
+        or not isinstance(max_results, int)
+        or max_results < 1
+    ):
         raise ValueError("max_results must be an integer greater than or equal to 1")
+    max_results = min(max_results, _MAX_QUERY_RESULTS)
 
     store, root = _get_store(repo_root)
     try:
@@ -143,7 +197,7 @@ def get_impact_radius(
                 changed_files = get_staged_and_unstaged(root)
 
         if not changed_files:
-            return {
+            response = {
                 "status": "ok",
                 "summary": "No changed files detected.",
                 "changed_nodes": [],
@@ -152,6 +206,8 @@ def get_impact_radius(
                 "truncated": False,
                 "total_impacted": 0,
             }
+            _attach_semantic_context(response, store, root, limit=8)
+            return response
 
         # Resolve user-facing paths to the file paths stored in the graph.
         original_tokens = estimate_file_tokens(root, changed_files)
@@ -218,6 +274,17 @@ def get_impact_radius(
             }
             if confidence:
                 minimal_response["confidence"] = confidence
+            _attach_semantic_context(
+                minimal_response,
+                store,
+                root,
+                endpoints=(
+                    [n.qualified_name for n in result["changed_nodes"]]
+                    + [n.qualified_name for n in result["impacted_nodes"]]
+                ),
+                files=changed_files + result["impacted_files"],
+                limit=16,
+            )
             attach_context_savings(minimal_response, original_tokens=original_tokens)
             return minimal_response
 
@@ -235,6 +302,19 @@ def get_impact_radius(
         }
         if confidence:
             response["confidence"] = confidence
+        _attach_semantic_context(
+            response,
+            store,
+            root,
+            endpoints=(
+                [n.qualified_name for n in result["changed_nodes"]]
+                + [n.qualified_name for n in result["impacted_nodes"]]
+                + [e.source_qualified for e in result["edges"]]
+                + [e.target_qualified for e in result["edges"]]
+            ),
+            files=changed_files + result["impacted_files"],
+            limit=32,
+        )
         attach_context_savings(response, original_tokens=original_tokens)
         return response
     finally:
@@ -269,7 +349,11 @@ def query_graph(
     Returns:
         Matching nodes and their aligned edges, with total and omitted counts.
     """
-    if isinstance(max_results, bool) or max_results < 1:
+    if (
+        isinstance(max_results, bool)
+        or not isinstance(max_results, int)
+        or max_results < 1
+    ):
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
     store, root = _get_store(repo_root)
@@ -283,6 +367,7 @@ def query_graph(
                 ),
             }
 
+        max_results = min(max_results, _MAX_QUERY_RESULTS)
         response_limit = min(max_results, 5) if detail_level == "minimal" else max_results
         results: list[dict[str, Any]] = []
         edges_out: list[dict[str, Any]] = []
@@ -328,49 +413,82 @@ def query_graph(
                 abs_target = normalize_file_path(root / target)
                 node = store.get_node(abs_target)
             if not node:
-                java_candidates = _java_fqn_candidates(store, target)
-                candidates = (
-                    java_candidates
-                    if java_candidates is not None
-                    else store.search_nodes(target, limit=20)
-                )
-                if pattern == "inheritors_of" and "::" not in target:
-                    exact_type_candidates = [
-                        candidate
-                        for candidate in candidates
-                        if candidate.name == target
-                        and candidate.kind
-                        in {"Class", "Interface", "Type", "Struct", "Enum", "Trait"}
-                    ]
-                    if exact_type_candidates:
-                        candidates = exact_type_candidates
-                if len(candidates) == 1:
-                    node = candidates[0]
-                    target = node.qualified_name
-                elif len(candidates) > 1:
-                    candidate_count = (
-                        len(candidates)
-                        if java_candidates is not None
-                        else store.count_search_nodes(target)
+                erlang_mfa = _erlang_mfa_parts(target)
+                erlang_candidates: list[GraphNode] | None = None
+                if erlang_mfa is not None:
+                    erlang_candidates = (
+                        []
+                        if erlang_mfa[2] < 0
+                        else store.find_erlang_mfa(
+                            *erlang_mfa,
+                            limit=min(max(response_limit + 1, 2), _MAX_QUERY_RESULTS),
+                        )
                     )
-                    ranked = _rank_disambiguation_candidates(candidates, target)
-                    return {
-                        "status": "ambiguous",
-                        "summary": (
-                            f"'{target}' matches {candidate_count} node(s). "
-                            "Re-run with a qualified_name from disambiguation."
-                        ),
-                        # Preserve the established key while adding the clearer
-                        # agent-facing name introduced by #458.
-                        "candidates": ranked,
-                        "disambiguation": ranked,
-                        "candidate_count": candidate_count,
-                        "candidates_truncated": candidate_count > len(candidates),
-                        "hint": (
-                            "Use a qualified_name from disambiguation as the "
-                            "target parameter."
-                        ),
-                    }
+                    if len(erlang_candidates) == 1:
+                        node = erlang_candidates[0]
+                        target = node.qualified_name
+                    elif len(erlang_candidates) > 1:
+                        candidate_count = store.count_erlang_mfa(*erlang_mfa)
+                        ranked = _rank_disambiguation_candidates(erlang_candidates, target)
+                        visible = ranked[:response_limit]
+                        return {
+                            "status": "ambiguous",
+                            "summary": (
+                                f"'{target}' matches {candidate_count} Erlang node(s)."
+                            ),
+                            "candidates": visible,
+                            "disambiguation": visible,
+                            "candidate_count": candidate_count,
+                            "candidates_truncated": candidate_count > len(visible),
+                            "hint": (
+                                "Use a qualified_name from disambiguation as the "
+                                "target parameter."
+                            ),
+                        }
+                if not node and erlang_candidates is None:
+                    java_candidates = _java_fqn_candidates(store, target)
+                    candidates = (
+                        java_candidates
+                        if java_candidates is not None
+                        else store.search_nodes(target, limit=20)
+                    )
+                    if pattern == "inheritors_of" and "::" not in target:
+                        exact_type_candidates = [
+                            candidate
+                            for candidate in candidates
+                            if candidate.name == target
+                            and candidate.kind
+                            in {"Class", "Interface", "Type", "Struct", "Enum", "Trait"}
+                        ]
+                        if exact_type_candidates:
+                            candidates = exact_type_candidates
+                    if len(candidates) == 1:
+                        node = candidates[0]
+                        target = node.qualified_name
+                    elif len(candidates) > 1:
+                        candidate_count = (
+                            len(candidates)
+                            if java_candidates is not None
+                            else store.count_search_nodes(target)
+                        )
+                        ranked = _rank_disambiguation_candidates(candidates, target)
+                        return {
+                            "status": "ambiguous",
+                            "summary": (
+                                f"'{target}' matches {candidate_count} node(s). "
+                                "Re-run with a qualified_name from disambiguation."
+                            ),
+                            # Preserve the established key while adding the clearer
+                            # agent-facing name introduced by #458.
+                            "candidates": ranked,
+                            "disambiguation": ranked,
+                            "candidate_count": candidate_count,
+                            "candidates_truncated": candidate_count > len(candidates),
+                            "hint": (
+                                "Use a qualified_name from disambiguation as the "
+                                "target parameter."
+                            ),
+                        }
 
         if not node and pattern not in ("consumers_of", "file_summary"):
             # This branch, not the empty-result path below, is where an
@@ -378,11 +496,23 @@ def query_graph(
             # not-indexed marker has to be attached here too.
             unresolved: dict[str, Any] = {
                 "status": "not_found",
-                "summary": f"No node found matching '{target}'.",
+                "summary": (
+                    f"No node found matching '{_display_query_target(target)}'."
+                ),
             }
             unresolved_note = empty_query_confidence(store, root, pattern, target, None)
             if unresolved_note:
                 unresolved["confidence"] = unresolved_note
+            # Semantic adapters may know about an external or not-yet-indexed
+            # endpoint.  Preserve that evidence even when Generic resolution
+            # has no node to anchor the traversal.
+            _attach_semantic_context(
+                unresolved,
+                store,
+                root,
+                endpoints=[target],
+                limit=8,
+            )
             return unresolved
 
         qn = node.qualified_name if node else target
@@ -714,6 +844,17 @@ def query_graph(
             }
             if confidence:
                 minimal_response["confidence"] = confidence
+            _attach_semantic_context(
+                minimal_response,
+                store,
+                root,
+                endpoints=(
+                    [target, qn]
+                    + [item.get("qualified_name", "") for item in results]
+                ),
+                files=(target,) if pattern == "file_summary" else (),
+                limit=8,
+            )
             return minimal_response
 
         response: dict[str, Any] = {
@@ -729,6 +870,34 @@ def query_graph(
         }
         if confidence:
             response["confidence"] = confidence
+        # Include persisted auxiliary evidence alongside the ordinary graph
+        # traversal.  The endpoint set includes both sides of returned edges,
+        # allowing callers_of/callees_of to surface the matching evidence while
+        # retaining unrelated repository diagnostics out of the response.
+        semantic_endpoints = [target, qn]
+        semantic_files: list[str] = []
+        for edge in (
+            store.iter_edges_by_target(qn) if pattern in {"callers_of", "references_to"}
+            else store.iter_edges_by_source(qn)
+        ):
+            semantic_endpoints.extend((edge.source_qualified, edge.target_qualified))
+            if edge.file_path:
+                semantic_files.append(edge.file_path)
+        semantic_endpoints.extend(
+            item.get("qualified_name", "")
+            for item in results
+            if isinstance(item, dict)
+        )
+        if pattern == "file_summary":
+            semantic_files.append(target)
+        _attach_semantic_context(
+            response,
+            store,
+            root,
+            endpoints=semantic_endpoints,
+            files=semantic_files,
+            limit=32,
+        )
         return response
     finally:
         store.close()
