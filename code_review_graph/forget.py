@@ -58,6 +58,23 @@ def _referrer_files(
             window + window,
         ).fetchall()
         referrers.update(row["file_path"] for row in rows)
+
+    # Erlang preprocessor includes are intentionally stored as their source
+    # spelling (for example ``sample.hrl``), so they do not point at the
+    # included file's node qualified name. Re-parse matching referrers when a
+    # forgotten target is an Erlang header, just as incremental updates do.
+    for forgotten_file in forgotten:
+        header_name = Path(forgotten_file).name
+        if not header_name.lower().endswith(".hrl"):
+            continue
+        rows = conn.execute(
+            "SELECT DISTINCT file_path FROM edges "
+            "WHERE kind = 'IMPORTS_FROM' AND "
+            "(lower(target_qualified) = lower(?) OR "
+            "lower(target_qualified) LIKE lower(?))",
+            (header_name, f"%/{header_name}"),
+        ).fetchall()
+        referrers.update(row["file_path"] for row in rows)
     return sorted(referrers - forgotten)
 
 

@@ -1157,17 +1157,18 @@ def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
     # basename is unique in the current graph; this keeps ambiguous include
     # trees unresolved instead of invalidating unrelated consumers.
     target_name = Path(file_path).name
-    if target_name.endswith(".hrl"):
+    if target_name.lower().endswith(".hrl"):
         matching_files = {
             candidate
             for candidate in store.get_all_files()
-            if Path(candidate).name == target_name
+            if Path(candidate).name.casefold() == target_name.casefold()
         }
         if matching_files == {file_path}:
             rows = store._conn.execute(
                 "SELECT file_path FROM edges "
                 "WHERE kind = 'IMPORTS_FROM' AND "
-                "(target_qualified = ? OR target_qualified LIKE ?)",
+                "(lower(target_qualified) = lower(?) OR "
+                "lower(target_qualified) LIKE lower(?))",
                 (target_name, f"%/{target_name}"),
             ).fetchall()
             dependents.update(row["file_path"] for row in rows)

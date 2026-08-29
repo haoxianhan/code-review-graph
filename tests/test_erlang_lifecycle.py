@@ -88,7 +88,38 @@ def test_erlang_extensions_work_through_build_update_postprocess_and_forget(
         forgotten = str(repo / "include" / "sample.hrl")
         summary = forget_files(store, repo, [forgotten])
         assert summary["forgotten"] == [forgotten]
+        assert str(source) in summary["reparsed"]
         assert forgotten not in store.get_all_files()
         assert str(source) in store.get_all_files()
+    finally:
+        store.close()
+
+
+def test_uppercase_erlang_header_change_reparses_include_dependents(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "include").mkdir()
+    (repo / "src").mkdir()
+    header = repo / "include" / "SAMPLE.HRL"
+    source = repo / "src" / "sample.erl"
+    header.write_text("-record(sample, {}).\n", encoding="utf-8")
+    source.write_text(
+        "-module(sample).\n-include(\"sample.hrl\").\nrun() -> #sample{}.\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(repo / "graph.db")
+    try:
+        full_build(repo, store)
+        header.write_text(
+            "-record(sample, {value :: integer()}).\n", encoding="utf-8"
+        )
+        result = incremental_update(
+            repo, store, changed_files=["include/SAMPLE.HRL"]
+        )
+        assert "src/sample.erl" in result["dependent_files"]
+        assert result["files_updated"] == 2
     finally:
         store.close()
