@@ -8,6 +8,8 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from code_review_graph import cli
 
 
@@ -233,6 +235,34 @@ class TestBuildUpdateCommands:
         output = capsys.readouterr().out
         assert "Erlang integration: degraded" in output
         assert "elp_unavailable" in output
+
+    @pytest.mark.parametrize("command", ["build", "update", "postprocess"])
+    def test_erlang_parse_errors_make_public_cli_non_success(self, command):
+        """An incomplete Erlang graph must fail shell automation visibly."""
+        argv = ["code-review-graph", command, "--repo", "repo-root"]
+        if command in {"build", "update"}:
+            argv.insert(2, "--skip-postprocess")
+        result = {
+            "status": "degraded",
+            "errors": [{"file": "src/deep.erl", "error": "AST too deep"}],
+            "erlang_integration": {"status": "disabled"},
+        }
+
+        with patch.object(sys, "argv", argv):
+            with patch("code_review_graph.graph.GraphStore") as mock_store:
+                mock_store.return_value = MagicMock()
+                with patch("code_review_graph.incremental.get_db_path") as mock_db:
+                    mock_db.return_value = MagicMock()
+                    function = (
+                        "code_review_graph.tools.build.run_postprocess"
+                        if command == "postprocess"
+                        else "code_review_graph.tools.build.build_or_update_graph"
+                    )
+                    with patch(function, return_value=result):
+                        with pytest.raises(SystemExit) as exc_info:
+                            cli.main()
+
+        assert exc_info.value.code == 1
 
     def test_build_skip_postprocess_does_not_run_extra_cli_postprocess(self):
         argv = [

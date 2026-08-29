@@ -43,6 +43,7 @@ import fnmatch
 import json
 import logging
 import os
+from collections.abc import Mapping
 from functools import partial
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
@@ -81,6 +82,26 @@ def _print_erlang_integration_status(result: dict) -> None:
         code = diagnostic.get("code", "unknown")
         message = diagnostic.get("message", "")
         print(f"Erlang diagnostic [{code}]: {message}")
+
+
+def _erlang_parse_error_requires_failure(result: Mapping[str, object]) -> bool:
+    """Return whether a lifecycle result contains a fatal Erlang parse error.
+
+    Optional semantic adapters intentionally degrade while preserving the
+    Generic graph. A parser error is different: it means the graph may be
+    incomplete, so shell callers must receive a non-zero status even though
+    the result remains available for diagnostics.
+    """
+    errors = result.get("errors")
+    if not isinstance(errors, (list, tuple)):
+        return False
+    for error in errors:
+        if not isinstance(error, Mapping):
+            continue
+        path = str(error.get("file", "")).replace("\\", "/").casefold()
+        if path.endswith((".erl", ".hrl", ".app.src")) or "erlang" in path:
+            return True
+    return False
 
 
 def _get_version() -> str:
@@ -1655,6 +1676,8 @@ def main() -> None:
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
             _print_erlang_integration_status(result)
+            if _erlang_parse_error_requires_failure(result):
+                raise SystemExit(1)
         finally:
             store.close()
         return
@@ -1802,6 +1825,8 @@ def main() -> None:
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
                 _print_erlang_integration_status(result)
+            if _erlang_parse_error_requires_failure(result):
+                raise SystemExit(1)
 
         elif args.command == "update":
             pp = (
@@ -1848,6 +1873,9 @@ def main() -> None:
                         f" (postprocess={pp})"
                     )
                 _print_erlang_integration_status(result)
+
+            if _erlang_parse_error_requires_failure(result):
+                raise SystemExit(1)
 
             # --brief: append a one-line change-impact summary with the same
             # estimated context-savings approximation that detect-changes uses.

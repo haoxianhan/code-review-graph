@@ -2317,7 +2317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         print(_human_report(result))
-    return 0
+    # Keep the observation command useful for exploratory/non-clean runs while
+    # making hard preflight failures visible to shell automation.  The
+    # executable adoption runner uses the same blocked/non-blocked boundary.
+    return 1 if result.get("adoption_verdict") == "blocked" else 0
 
 
 __all__ = [

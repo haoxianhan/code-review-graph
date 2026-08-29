@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -57,6 +58,27 @@ def test_corpus_execution_is_observable_without_running_project_code(tmp_path):
     assert result["metrics"]["adoption_pass"] is False
     assert all(item["status"] == "blocked" for item in result["case_results"])
     assert all(item["status"] == "not_run" for item in result["lifecycle"].values())
+
+
+def test_observation_cli_returns_nonzero_for_blocked_preflight(monkeypatch, capsys):
+    """Hard evaluator blocks must be visible to shell callers."""
+    from code_review_graph.eval import erlang
+
+    monkeypatch.setattr(
+        erlang,
+        "run_evaluation",
+        lambda *args, **kwargs: {
+            "target": {"name": "fixture", "path": "/tmp/fixture"},
+            "adoption_verdict": "blocked",
+            "corpus": {"case_count": 0},
+            "diagnostics": [],
+        },
+    )
+
+    exit_code = erlang.main(["--json"])
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out)["adoption_verdict"] == "blocked"
 
 
 @pytest.mark.parametrize(
