@@ -3,8 +3,8 @@
 code-review-graph ships parsers for 35+ languages, but the
 [tree-sitter-language-pack](https://github.com/Goldziher/tree-sitter-language-pack)
 it depends on bundles many more grammars than the built-in list. If your repo
-uses a language the graph does not cover yet — Erlang, Haskell, OCaml,
-Fortran, Ada, Clojure, ... — you can teach the parser about it with a small
+uses a language the graph does not cover yet — Haskell, OCaml, Fortran, Ada,
+Clojure, ... — you can teach the parser about it with a small
 config file. No fork, no code changes.
 
 ## Quick start
@@ -12,14 +12,14 @@ config file. No fork, no code changes.
 Create `<repo_root>/.code-review-graph/languages.toml`:
 
 ```toml
-[languages.erlang]
-extensions = [".erl"]
-grammar = "erlang"
-function_node_types = ["function_clause"]
-class_node_types = ["record_decl"]
-import_node_types = ["import_attribute"]
+[languages.example_lang]
+extensions = [".example"]
+grammar = "some_grammar"
+function_node_types = ["function_definition"]
+class_node_types = ["class_definition"]
+import_node_types = ["import_statement"]
 call_node_types = ["call"]
-comment = "Erlang via the bundled tree-sitter-erlang grammar"
+comment = "Example language via a bundled grammar"
 ```
 
 Then rebuild:
@@ -31,8 +31,8 @@ uv run code-review-graph build
 Files matching the configured extensions are now parsed with the named
 grammar, and the resulting Function/Class nodes and CALLS/IMPORTS_FROM edges
 flow through every downstream feature (impact radius, search, communities,
-wiki, MCP tools) exactly like built-in languages. Nodes carry the custom
-language name (here `erlang`) in their `language` field.
+wiki, MCP tools) exactly like built-in languages. Nodes carry the configured
+custom language name in their `language` field.
 
 ## Schema reference
 
@@ -155,7 +155,19 @@ EOF
 Pick the node types that wrap whole definitions (`function_clause`, not the
 inner `atom`) and whole call expressions (`call`, not the callee identifier).
 
-## Worked example: Erlang end to end
+## Erlang baseline boundary
+
+Erlang is bundled as a Generic baseline, so it does not belong in
+`languages.toml`. The baseline recognizes `.erl`, `.hrl`, and `.app.src` and
+supports generic nodes, includes, local call candidates, and lifecycle
+updates. Optional ELP, `rebar3 xref`, and Dialyzer evidence is revision-keyed
+and auxiliary: unavailable tools, malformed output, timeouts, and stale caches
+are reported as diagnostics while Generic indexing remains usable. Erlang is
+not promoted to sole blocking-review evidence until the real-project corpus
+passes the precision, recall, impact, latency, and lifecycle gates in
+`erlang-support-plan.md`.
+
+## Worked example: custom language end to end
 
 `src/math_utils.erl`:
 
@@ -175,7 +187,7 @@ scale(Points, F) ->
     lists:map(fun(P) -> add(P, F) end, Points).
 ```
 
-With the `[languages.erlang]` config from the quick start, a build produces:
+With the bundled Erlang baseline, a build produces:
 
 - `Function` nodes `add`, `helper`, `scale` (from `function_clause`),
   each with `language = "erlang"`.

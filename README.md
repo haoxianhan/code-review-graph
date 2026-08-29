@@ -165,17 +165,27 @@ Blade template references, and Laravel Route/Eloquent semantic edges when the
 source includes explicit framework imports, model inheritance, and receiver
 evidence.
 
+### Erlang support and auxiliary semantic context
+
+Erlang (`.erl`, `.hrl`, and `.app.src`) is a bundled Generic Tree-sitter
+baseline and works through the normal build, incremental, watch, and review
+workflows without a `languages.toml` entry. Optional ELP, `rebar3 xref`, and
+Dialyzer enrichment is revision-keyed and remains auxiliary review context;
+missing tools or stale evidence never disable Generic indexing. See the
+[Erlang support plan](erlang-support-plan.md) and the checked-in evaluation
+artifacts under `evaluate/erlang/` for the adoption boundary.
+
 ### Add your own language (no fork needed)
 
 If your repo uses a language the parser does not cover yet, drop a `languages.toml` into `.code-review-graph/` mapping file extensions to any grammar bundled in `tree_sitter_language_pack`, plus the tree-sitter node types for functions, classes, imports, and calls:
 
 ```toml
-[languages.erlang]
-extensions = [".erl"]
-grammar = "erlang"
-function_node_types = ["function_clause"]
-class_node_types = ["record_decl"]
-import_node_types = ["import_attribute"]
+[languages.example_lang]
+extensions = [".example"]
+grammar = "some_grammar"
+function_node_types = ["function_definition"]
+class_node_types = ["class_definition"]
+import_node_types = ["import_statement"]
 call_node_types = ["call"]
 ```
 
