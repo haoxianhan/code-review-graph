@@ -230,7 +230,15 @@ def _validate_relative_path(value: object, source: str) -> str:
     path = _string(value, source)
     if any(ord(char) < 32 or ord(char) == 127 for char in path):
         raise _error(source, "must not contain control characters")
-    if Path(path).is_absolute() or "\\" in path:
+    # Treat Windows drive/UNC spellings as absolute even when the evaluator
+    # runs on POSIX.  Manifest paths are always repository-relative POSIX
+    # spellings; accepting a platform-specific absolute form would make the
+    # later ``root / path`` join ignore the containment root.
+    if (
+        Path(path).is_absolute()
+        or "\\" in path
+        or re.match(r"^[A-Za-z]:($|/)", path)
+    ):
         raise _error(source, "must be a repository-relative POSIX path or placeholder")
     parts = Path(path).parts
     if ".." in parts:
@@ -285,6 +293,34 @@ def _validate_command_token_list(value: object, source: str) -> list[str]:
 def _resolve_contained_manifest_path(root: Path, value: object, source: str) -> Path:
     """Resolve a manifest-relative path and enforce the post-resolution root."""
 
+    return _resolve_contained_path(
+        root,
+        value,
+        source,
+        root_description="the manifest directory",
+    )
+
+
+def _resolve_contained_target_path(root: Path, value: object, source: str) -> Path:
+    """Resolve a target-relative path and reject lexical or symlink escapes."""
+
+    return _resolve_contained_path(
+        root,
+        value,
+        source,
+        root_description="the target checkout",
+    )
+
+
+def _resolve_contained_path(
+    root: Path,
+    value: object,
+    source: str,
+    *,
+    root_description: str,
+) -> Path:
+    """Resolve a relative path and enforce containment after symlink resolution."""
+
     relative = _validate_relative_path(value, source)
     try:
         resolved_root = root.expanduser().resolve(strict=False)
@@ -294,7 +330,10 @@ def _resolve_contained_manifest_path(root: Path, value: object, source: str) -> 
     try:
         resolved.relative_to(resolved_root)
     except ValueError as exc:
-        raise _error(source, "path escapes the manifest directory after resolution") from exc
+        raise _error(
+            source,
+            f"path escapes {root_description} after resolution",
+        ) from exc
     return resolved
 
 
@@ -805,7 +844,7 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
         raise _error(f"{source}.revision.baseline_status", "unsupported baseline status")
     dirty_paths = _list(revision.get("dirty_paths", []), f"{source}.revision.dirty_paths")
     for index, path in enumerate(dirty_paths):
-        _string(path, f"{source}.revision.dirty_paths[{index}]")
+        _validate_relative_path(path, f"{source}.revision.dirty_paths[{index}]")
     if revision["working_tree_clean"] and dirty_paths:
         raise _error(source, "clean working tree cannot contain dirty_paths")
     if baseline_status == "clean" and not revision["working_tree_clean"]:
@@ -816,7 +855,9 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
         _list(dependencies.get("lockfiles", []), f"{source}.dependencies.lockfiles")
     ):
         lock = _mapping(lockfile, f"{source}.dependencies.lockfiles[{index}]")
-        _string(lock.get("path"), f"{source}.dependencies.lockfiles[{index}].path")
+        _validate_relative_path(
+            lock.get("path"), f"{source}.dependencies.lockfiles[{index}].path"
+        )
         digest = _string(lock.get("sha256"), f"{source}.dependencies.lockfiles[{index}].sha256")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
             raise _error(f"{source}.dependencies.lockfiles[{index}].sha256", "expected SHA-256")
@@ -824,7 +865,10 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
         _list(dependencies.get("submodules", []), f"{source}.dependencies.submodules")
     ):
         submodule = _mapping(item, f"{source}.dependencies.submodules[{index}]")
-        _string(submodule.get("path"), f"{source}.dependencies.submodules[{index}].path")
+        _validate_relative_path(
+            submodule.get("path"),
+            f"{source}.dependencies.submodules[{index}].path",
+        )
         _sha(
             submodule.get("gitlink_revision"),
             f"{source}.dependencies.submodules[{index}].gitlink_revision",
@@ -847,7 +891,7 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
     for index, item in enumerate(
         _list(generated.get("paths", []), f"{source}.generated_data.paths")
     ):
-        _string(item, f"{source}.generated_data.paths[{index}]")
+        _validate_relative_path(item, f"{source}.generated_data.paths[{index}]")
 
     toolchain = _mapping(document["toolchain"], f"{source}.toolchain")
     tools = _mapping(toolchain.get("tools"), f"{source}.toolchain.tools")
@@ -867,7 +911,9 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
     for index, item in enumerate(
         _list(configuration.get("files", []), f"{source}.toolchain.configuration.files")
     ):
-        _string(item, f"{source}.toolchain.configuration.files[{index}]")
+        _validate_relative_path(
+            item, f"{source}.toolchain.configuration.files[{index}]"
+        )
     if configuration.get("execute_during_discovery") is not False:
         raise _error(
             f"{source}.toolchain.configuration.execute_during_discovery",
@@ -876,6 +922,20 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
 
     _mapping(document["evaluation"], f"{source}.evaluation")
     _validate_diagnostics(document.get("diagnostics", []), f"{source}.diagnostics")
+
+    analysis = document.get("analysis")
+    if analysis is not None:
+        analysis_mapping = _mapping(analysis, f"{source}.analysis")
+        for index, item in enumerate(
+            _list(
+                analysis_mapping.get("cache_paths", []),
+                f"{source}.analysis.cache_paths",
+            )
+        ):
+            _validate_relative_path(
+                item,
+                f"{source}.analysis.cache_paths[{index}]",
+            )
 
     # Adapter policies are additive to the original evaluation-manifest
     # schema.  When present, validate the index here; ``load_manifest`` then
@@ -923,12 +983,16 @@ def _validate_endpoint(value: object, source: str) -> None:
     if isinstance(value, str):
         if not value:
             raise _error(source, "endpoint string must not be empty")
+        # Qualified graph identities may carry a repository-relative file
+        # prefix (``path/to/file.erl::module.fn/0``).  Validate that prefix
+        # here as well as mapping-style ``{"file": ...}`` endpoints.
+        if "::" in value:
+            path, _separator, _identity = value.partition("::")
+            _validate_relative_path(path, f"{source}.file")
         return
     endpoint = _mapping(value, source)
     if "file" in endpoint:
-        path = _string(endpoint["file"], f"{source}.file")
-        if Path(path).is_absolute() or "\\" in path:
-            raise _error(f"{source}.file", "must be repository-relative POSIX path")
+        _validate_relative_path(endpoint["file"], f"{source}.file")
     if "symbol" in endpoint:
         _string(endpoint["symbol"], f"{source}.symbol")
     if "arity" in endpoint and (
@@ -959,7 +1023,7 @@ def validate_corpus(corpus: object, source: str = "<corpus>") -> None:
         raise _error(source, f"unsupported schema_version {document.get('schema_version')!r}")
     if document.get("kind") != CORPUS_KIND:
         raise _error(source, f"expected kind {CORPUS_KIND!r}")
-    _string(document.get("manifest"), f"{source}.manifest")
+    _validate_relative_path(document.get("manifest"), f"{source}.manifest")
     cases = _list(document["cases"], f"{source}.cases")
     if not cases:
         raise _error(f"{source}.cases", "must not be empty")
@@ -996,6 +1060,149 @@ def validate_corpus(corpus: object, source: str = "<corpus>") -> None:
             ):
                 _string(code, f"{case_source}.required_diagnostics[{diagnostic_index}]")
     _mapping(document["metrics"], f"{source}.metrics")
+
+
+def _validate_target_artifact_paths(
+    manifest: Mapping[str, Any],
+    corpus: Mapping[str, Any],
+    target_root: Path,
+) -> None:
+    """Validate every manifest/corpus path before touching the checkout.
+
+    The JSON validators reject lexical traversal, but they cannot account for
+    a symlink already present in the target checkout.  Resolve each path
+    against the canonical root here so direct callers of
+    :func:`discover_environment` and :func:`execute_corpus` get the same
+    containment guarantee as the file-loading APIs.
+    """
+
+    root = target_root.expanduser().resolve(strict=False)
+
+    dependencies = _mapping(manifest.get("dependencies", {}), "manifest.dependencies")
+    for index, item in enumerate(
+        _list(dependencies.get("lockfiles", []), "manifest.dependencies.lockfiles")
+    ):
+        if isinstance(item, Mapping):
+            _resolve_contained_target_path(
+                root,
+                item.get("path"),
+                f"manifest.dependencies.lockfiles[{index}].path",
+            )
+    for index, item in enumerate(
+        _list(dependencies.get("submodules", []), "manifest.dependencies.submodules")
+    ):
+        if isinstance(item, Mapping):
+            _resolve_contained_target_path(
+                root,
+                item.get("path"),
+                f"manifest.dependencies.submodules[{index}].path",
+            )
+
+    generated = _mapping(manifest.get("generated_data", {}), "manifest.generated_data")
+    for index, value in enumerate(
+        _list(generated.get("paths", []), "manifest.generated_data.paths")
+    ):
+        _resolve_contained_target_path(
+            root,
+            value,
+            f"manifest.generated_data.paths[{index}]",
+        )
+
+    revision = _mapping(manifest.get("revision", {}), "manifest.revision")
+    for index, value in enumerate(
+        _list(revision.get("dirty_paths", []), "manifest.revision.dirty_paths")
+    ):
+        _resolve_contained_target_path(
+            root,
+            value,
+            f"manifest.revision.dirty_paths[{index}]",
+        )
+
+    toolchain = _mapping(manifest.get("toolchain", {}), "manifest.toolchain")
+    configuration = _mapping(
+        toolchain.get("configuration", {}), "manifest.toolchain.configuration"
+    )
+    for index, value in enumerate(
+        _list(
+            configuration.get("files", []),
+            "manifest.toolchain.configuration.files",
+        )
+    ):
+        _resolve_contained_target_path(
+            root,
+            value,
+            f"manifest.toolchain.configuration.files[{index}]",
+        )
+
+    analysis = manifest.get("analysis", {})
+    analysis_mapping = _mapping(analysis, "manifest.analysis")
+    for index, value in enumerate(
+        _list(analysis_mapping.get("cache_paths", []), "manifest.analysis.cache_paths")
+    ):
+        _resolve_contained_target_path(
+            root,
+            value,
+            f"manifest.analysis.cache_paths[{index}]",
+        )
+
+    def validate_endpoint_path(endpoint: object, source: str) -> None:
+        if isinstance(endpoint, Mapping) and "file" in endpoint:
+            _resolve_contained_target_path(root, endpoint["file"], f"{source}.file")
+        elif isinstance(endpoint, str) and "::" in endpoint:
+            path, _separator, _identity = endpoint.partition("::")
+            _resolve_contained_target_path(root, path, f"{source}.file")
+
+    cases = _list(corpus.get("cases", []), "corpus.cases")
+    for index, case in enumerate(cases):
+        if not isinstance(case, Mapping):
+            continue
+        case_source = f"corpus.cases[{index}]"
+        query = case.get("query")
+        if isinstance(query, Mapping):
+            validate_endpoint_path(query.get("target"), f"{case_source}.query.target")
+        expected = case.get("expected")
+        if isinstance(expected, Mapping):
+            for relation_kind in ("positive", "negative", "unresolved"):
+                relations = expected.get(relation_kind, [])
+                if not isinstance(relations, list):
+                    continue
+                for relation_index, relation in enumerate(relations):
+                    if not isinstance(relation, Mapping):
+                        continue
+                    relation_source = (
+                        f"{case_source}.expected.{relation_kind}[{relation_index}]"
+                    )
+                    validate_endpoint_path(
+                        relation.get("source"), f"{relation_source}.source"
+                    )
+                    validate_endpoint_path(
+                        relation.get("target"), f"{relation_source}.target"
+                    )
+
+    # Adoption corpora may carry optional impact ground truth.  Only the
+    # fields whose values are explicitly file lists are path-bearing; fields
+    # such as ``expected`` can contain relation objects and are left to the
+    # corpus-specific evaluator.
+    impact_entries: list[object] = []
+    top_level_impact = corpus.get("impact")
+    if isinstance(top_level_impact, list):
+        impact_entries.extend(top_level_impact)
+    for case in cases:
+        if isinstance(case, Mapping) and isinstance(case.get("impact"), Mapping):
+            impact_entries.append(case["impact"])
+    for entry_index, entry in enumerate(impact_entries):
+        if not isinstance(entry, Mapping):
+            continue
+        for field in ("changed_files", "changed", "critical_dependents"):
+            values = entry.get(field, [])
+            if not isinstance(values, list):
+                continue
+            for value_index, value in enumerate(values):
+                _resolve_contained_target_path(
+                    root,
+                    value,
+                    f"corpus.impact[{entry_index}].{field}[{value_index}]",
+                )
 
 
 def _load_json(path: Path) -> Any:
@@ -1187,9 +1394,27 @@ def _match_text(pattern: re.Pattern[str], text: str | None) -> str | None:
 def _discover_generated_data(
     target_root: Path, expected: Mapping[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    paths = [target_root / str(item) for item in expected.get("paths", [])]
-    revision_file = target_root / "tools" / "gen_data" / "data_rev_info"
-    structure_file = target_root / "tools" / "gen_data" / "server_cfg_structure_version"
+    target_root = target_root.expanduser().resolve(strict=False)
+    paths = [
+        _resolve_contained_target_path(
+            target_root,
+            item,
+            f"manifest.generated_data.paths[{index}]",
+        )
+        for index, item in enumerate(
+            _list(expected.get("paths", []), "manifest.generated_data.paths")
+        )
+    ]
+    revision_file = _resolve_contained_target_path(
+        target_root,
+        "tools/gen_data/data_rev_info",
+        "generated_data.revision_file",
+    )
+    structure_file = _resolve_contained_target_path(
+        target_root,
+        "tools/gen_data/server_cfg_structure_version",
+        "generated_data.structure_file",
+    )
     revision_text = _read_text(revision_file)
     structure_text = _read_text(structure_file)
     generated: dict[str, Any] = {
@@ -1208,9 +1433,20 @@ def _discover_generated_data(
     }
     for path in paths:
         if path.is_dir():
-            generated["counts"][str(path.relative_to(target_root))] = sum(
-                1 for child in path.rglob("*") if child.is_file()
-            )
+            count = 0
+            for child in path.rglob("*"):
+                # ``rglob`` can expose symlinked files even when the base
+                # directory itself is contained.  Resolve every child before
+                # inspecting it so a generated-data symlink cannot make
+                # discovery touch an arbitrary outside file.
+                contained_child = _resolve_contained_target_path(
+                    target_root,
+                    child.relative_to(target_root).as_posix(),
+                    "generated_data.child",
+                )
+                if contained_child.is_file():
+                    count += 1
+            generated["counts"][str(path.relative_to(target_root))] = count
         else:
             generated["counts"][str(path.relative_to(target_root))] = None
 
@@ -1254,6 +1490,7 @@ def _parse_status_lines(output: str) -> list[str]:
 
 
 def _discover_submodules(target_root: Path) -> list[dict[str, Any]]:
+    target_root = target_root.expanduser().resolve(strict=False)
     result = _run_command(["git", "submodule", "status", "--recursive"], cwd=target_root)
     if result.get("returncode") != 0:
         return []
@@ -1263,7 +1500,11 @@ def _discover_submodules(target_root: Path) -> list[dict[str, Any]]:
         if not match:
             continue
         path = match.group("path")
-        submodule_root = target_root / path
+        submodule_root = _resolve_contained_target_path(
+            target_root,
+            path,
+            "git submodule path",
+        )
         expected = _run_command(["git", "ls-tree", "HEAD", "--", path], cwd=target_root)
         gitlink = None
         gitlink_match = re.search(r"160000 commit ([0-9a-fA-F]{40})\s+", expected.get("stdout", ""))
@@ -1400,7 +1641,11 @@ def _discover_toolchain(
         )
 
     configured_otp_path = None
-    config_path = target_root / "erlang_ls.config"
+    config_path = _resolve_contained_target_path(
+        target_root,
+        "erlang_ls.config",
+        "toolchain.erlang_ls.config",
+    )
     config_text = _read_text(config_path)
     configured_otp_path = _match_text(OTP_PATH_RE, config_text)
     runtime_output = tools["erl"].get("version_output") or ""
@@ -1421,16 +1666,38 @@ def _discover_toolchain(
         },
         "configuration": {
             "files": [
-                str(target_root / "rebar.config"),
-                str(target_root / "rebar.config.script"),
-                str(target_root / "erlang_ls.config"),
-                str(target_root / ".elp_lint.toml"),
+                str(
+                    _resolve_contained_target_path(
+                        target_root, "rebar.config", "toolchain.rebar.config"
+                    )
+                ),
+                str(
+                    _resolve_contained_target_path(
+                        target_root,
+                        "rebar.config.script",
+                        "toolchain.rebar.config.script",
+                    )
+                ),
+                str(config_path),
+                str(
+                    _resolve_contained_target_path(
+                        target_root, ".elp_lint.toml", "toolchain.elp_lint.config"
+                    )
+                ),
             ],
             "execute_during_discovery": False,
             "observed": {
-                "rebar_config_script_present": (target_root / "rebar.config.script").is_file(),
+                "rebar_config_script_present": _resolve_contained_target_path(
+                    target_root,
+                    "rebar.config.script",
+                    "toolchain.rebar.config.script",
+                ).is_file(),
                 "erlang_ls_config_present": config_path.is_file(),
-                "elp_lint_config_present": (target_root / ".elp_lint.toml").is_file(),
+                "elp_lint_config_present": _resolve_contained_target_path(
+                    target_root,
+                    ".elp_lint.toml",
+                    "toolchain.elp_lint.config",
+                ).is_file(),
             },
         },
     }
@@ -1524,14 +1791,19 @@ def _compare_manifest_revision(
 
 
 def _compare_lockfiles(target_root: Path, dependencies: Mapping[str, Any]) -> list[dict[str, Any]]:
+    target_root = target_root.expanduser().resolve(strict=False)
     diagnostics: list[dict[str, Any]] = []
-    for item in dependencies.get("lockfiles", []):
+    for index, item in enumerate(
+        _list(dependencies.get("lockfiles", []), "manifest.dependencies.lockfiles")
+    ):
         if not isinstance(item, Mapping):
             continue
         relative_path = item.get("path")
-        if not isinstance(relative_path, str):
-            continue
-        path = target_root / relative_path
+        path = _resolve_contained_target_path(
+            target_root,
+            relative_path,
+            f"manifest.dependencies.lockfiles[{index}].path",
+        )
         if not path.is_file():
             diagnostics.append(
                 _diagnostic(
@@ -1558,12 +1830,20 @@ def _compare_lockfiles(target_root: Path, dependencies: Mapping[str, Any]) -> li
 
 
 def _cache_state(target_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    cache_paths = manifest.get("analysis", {}).get("cache_paths", [])
+    target_root = target_root.expanduser().resolve(strict=False)
+    analysis = manifest.get("analysis", {})
+    analysis_mapping = _mapping(analysis, "manifest.analysis")
+    cache_paths = _list(
+        analysis_mapping.get("cache_paths", []),
+        "manifest.analysis.cache_paths",
+    )
     state: list[dict[str, Any]] = []
-    for relative_path in cache_paths if isinstance(cache_paths, list) else []:
-        if not isinstance(relative_path, str):
-            continue
-        path = target_root / relative_path
+    for index, relative_path in enumerate(cache_paths):
+        path = _resolve_contained_target_path(
+            target_root,
+            relative_path,
+            f"manifest.analysis.cache_paths[{index}]",
+        )
         state.append(
             {
                 "path": relative_path,
@@ -1613,7 +1893,11 @@ def _corpus_summary(
                         if isinstance(endpoint, Mapping) and isinstance(endpoint.get("file"), str):
                             paths.add(endpoint["file"])
         for relative_path in sorted(paths):
-            path = target_root / relative_path
+            path = _resolve_contained_target_path(
+                target_root,
+                relative_path,
+                f"corpus.cases[{case.get('id', 'unknown')}].anchor",
+            )
             if not path.is_file():
                 diagnostics.append(
                     _diagnostic(
@@ -1650,8 +1934,11 @@ def execute_corpus(
     selected checkout and reports the remaining graph/lifecycle work as
     ``not_run`` rather than treating an unmeasured case as a pass.
     """
+    validate_manifest(manifest, "manifest")
+    validate_corpus(corpus, "corpus")
     target = _mapping(manifest["target"], "manifest.target")
-    root = Path(target_root or str(target["path"])).expanduser().resolve()
+    root = Path(target_root or str(target["path"])).expanduser().resolve(strict=False)
+    _validate_target_artifact_paths(manifest, corpus, root)
     case_results: list[dict[str, Any]] = []
     for case in corpus.get("cases", []):
         if not isinstance(case, Mapping):
@@ -1676,7 +1963,15 @@ def execute_corpus(
                         endpoint = relation.get(endpoint_kind)
                         if isinstance(endpoint, Mapping) and isinstance(endpoint.get("file"), str):
                             paths.add(endpoint["file"])
-        missing = sorted(path for path in paths if not (root / path).is_file())
+        missing = sorted(
+            path
+            for path in paths
+            if not _resolve_contained_target_path(
+                root,
+                path,
+                f"corpus.cases[{case_id}].anchor",
+            ).is_file()
+        )
         if not root.is_dir():
             status = "blocked"
             reason = "target_missing"
@@ -1746,8 +2041,16 @@ def discover_environment(
     checkout cannot accidentally evaluate its ``rebar.config.script``.
     """
 
+    # Validate the complete artifact shape before any Git, generated-data,
+    # cache, or corpus-anchor read.  The second pass below resolves every
+    # target-relative path through the filesystem to catch symlink escapes.
+    validate_manifest(manifest, "manifest")
+    validate_corpus(corpus, "corpus")
     manifest_target = _mapping(manifest["target"], "manifest.target")
-    root = Path(target_root or str(manifest_target["path"])).expanduser().resolve()
+    root = Path(target_root or str(manifest_target["path"])).expanduser().resolve(
+        strict=False
+    )
+    _validate_target_artifact_paths(manifest, corpus, root)
     safe_probe_root = Path(probe_root or MODULE_ROOT).expanduser().resolve()
     repository, diagnostics = _discover_repository(root)
     generated, generated_diagnostics = _discover_generated_data(
@@ -1759,22 +2062,32 @@ def discover_environment(
     if adapter_index is None:
         adapter_policy = inspect_adapter_manifests()
     else:
-        try:
-            index = _mapping(adapter_index, "manifest.adapters")
-            index_root = Path(
-                manifest_root or MODULE_ROOT / "evaluate" / "erlang"
-            ).expanduser().resolve(strict=False)
-            adapter_directory = _resolve_contained_manifest_path(
-                index_root,
-                index["directory"],
-                "manifest.adapters.directory",
+        # Resolve the parent index and every child before entering the
+        # best-effort policy inspection boundary.  Invalid policy contents may
+        # be reported as ``unavailable``, but a path escape is an input
+        # violation and must fail closed for direct callers.
+        index = _mapping(adapter_index, "manifest.adapters")
+        index_root = Path(
+            manifest_root or MODULE_ROOT / "evaluate" / "erlang"
+        ).expanduser().resolve(strict=False)
+        adapter_directory = _resolve_contained_manifest_path(
+            index_root,
+            index["directory"],
+            "manifest.adapters.directory",
+        )
+        child_paths = {
+            str(name).casefold(): str(child)
+            for name, child in _mapping(
+                index["files"], "manifest.adapters.files"
+            ).items()
+        }
+        for name, child in child_paths.items():
+            _resolve_contained_manifest_path(
+                adapter_directory,
+                child,
+                f"manifest.adapters.files.{name}",
             )
-            child_paths = {
-                str(name).casefold(): str(child)
-                for name, child in _mapping(
-                    index["files"], "manifest.adapters.files"
-                ).items()
-            }
+        try:
             adapter_policy = inspect_adapter_manifests(adapter_directory, paths=child_paths)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             adapter_policy = _unavailable_adapter_policy(exc)
@@ -1830,7 +2143,11 @@ def discover_environment(
                 )
             )
 
-    if (root / "rebar.config.script").is_file():
+    if _resolve_contained_target_path(
+        root,
+        "rebar.config.script",
+        "target.rebar.config.script",
+    ).is_file():
         diagnostics.append(
             _diagnostic(
                 "project_config_script_not_executed",
