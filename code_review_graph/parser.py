@@ -753,6 +753,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".ksh": "bash",  # Korn shell — close enough to bash for tree-sitter-bash (#235)
     ".ex": "elixir",
     ".exs": "elixir",
+    ".erl": "erlang",
+    ".hrl": "erlang",
     ".ipynb": "notebook",
     ".zig": "zig",
     ".ps1": "powershell",
@@ -1216,6 +1218,7 @@ _TEST_PATTERNS = [
     re.compile(r"^test_"),
     re.compile(r"^Test"),
     re.compile(r"_test$"),
+    re.compile(r"_test_$"),
     re.compile(r"\.test\."),
     re.compile(r"\.spec\."),
     re.compile(r"_spec$"),
@@ -1234,6 +1237,10 @@ _TEST_FILE_PATTERNS = [
     re.compile(r"tests/testthat/"),
     re.compile(r".*Test\.kt$"),
     re.compile(r".*Test\.java$"),
+    # Erlang convention: EUnit modules use *_test.erl and Common Test
+    # suites use *_SUITE.erl. Keep this case-insensitive for .ERL files.
+    re.compile(r".*_test\.erl$", re.IGNORECASE),
+    re.compile(r".*_suite\.erl$", re.IGNORECASE),
     re.compile(r".*_test\.resi?$"),
     re.compile(r".*\.test\.resi?$"),
     re.compile(r"test/runtests\.jl$"),
@@ -2500,6 +2507,11 @@ class CodeParser:
         """
         if path.name.lower().endswith(".blade.php"):
             return "blade"
+        # ``.app.src`` is an Erlang application term, but Path.suffix only
+        # exposes its final ``.src`` component.  Keep ordinary .src files
+        # unknown and recognize this exact rebar3 convention instead.
+        if path.name.lower().endswith(".app.src"):
+            return "erlang"
         suffix = path.suffix.lower()
         lang = self._extension_map.get(suffix)
         if lang == "yaml" and _is_ansible_path(path):
@@ -2670,6 +2682,13 @@ class CodeParser:
         if language == "sql":
             return self._parse_sql(path, source)
 
+        # Erlang has a useful packaged grammar, but its AST deliberately uses
+        # Erlang-specific shapes (atoms, fun_decl/function_clause wrappers,
+        # and call.expr).  Keep this adapter separate from the generic tables
+        # so those shapes do not change extraction for other languages.
+        if language == "erlang":
+            return self._parse_erlang(path, source)
+
         # Ansible YAML: path heuristic promoted to "ansible".
         if language == "ansible":
             if _yaml is None:
@@ -2789,6 +2808,773 @@ class CodeParser:
                     ))
 
         return nodes, edges
+
+    @staticmethod
+    def _erlang_atom_text(node) -> Optional[str]:
+        """Return a normalized Erlang atom or ``None`` for another shape.
+
+        Quoted atoms are identifiers in Erlang, rather than strings.  Keep the
+        spelling stable by decoding the small escape vocabulary accepted by
+        the grammar while leaving unknown escapes conservative and visible.
+        """
+        if node is None or node.type != "atom":
+            return None
+        text = node.text.decode("utf-8", errors="replace").strip()
+        if len(text) >= 2 and text[0] == text[-1] == "'":
+            text = text[1:-1]
+            chars: list[str] = []
+            index = 0
+            while index < len(text):
+                char = text[index]
+                if char == "\\" and index + 1 < len(text):
+                    escaped = text[index + 1]
+                    escapes = {
+                        "n": "\n", "r": "\r", "t": "\t", "b": "\b",
+                        "f": "\f", "v": "\v", "\\": "\\", "'": "'",
+                    }
+                    chars.append(escapes.get(escaped, escaped))
+                    index += 2
+                    continue
+                chars.append(char)
+                index += 1
+            text = "".join(chars)
+        return text or None
+
+    @classmethod
+    def _erlang_node_arity(cls, node) -> Optional[int]:
+        """Return the arity represented by ``expr_args``/``var_args``."""
+        if node is None:
+            return None
+        args = node if node.type in ("expr_args", "var_args") else None
+        if args is None:
+            args = next(
+                (
+                    child for child in node.named_children
+                    if child.type in ("expr_args", "var_args")
+                ),
+                None,
+            )
+        if args is None:
+            return None
+        return len(args.named_children)
+
+    @classmethod
+    def _erlang_fa_value(cls, node) -> Optional[str]:
+        """Normalize a function/type ``name/arity`` AST node."""
+        if node is None or node.type != "fa":
+            return None
+        atom = next(
+            (child for child in node.named_children if child.type == "atom"),
+            None,
+        )
+        arity = next(
+            (child for child in node.named_children if child.type == "arity"),
+            None,
+        )
+        if atom is None or arity is None:
+            return None
+        raw_arity = arity.text.decode("utf-8", errors="replace").lstrip("/")
+        if not raw_arity.isdigit():
+            return None
+        name = cls._erlang_atom_text(atom)
+        return f"{name}/{int(raw_arity)}" if name else None
+
+    @classmethod
+    def _erlang_function_info(cls, clause) -> Optional[tuple[str, int]]:
+        """Extract a function's atom name and arity from a function_clause."""
+        name = cls._erlang_atom_text(clause.child_by_field_name("name"))
+        args = clause.child_by_field_name("arguments")
+        if args is None:
+            args = next(
+                (child for child in clause.named_children if child.type == "expr_args"),
+                None,
+            )
+        if name is None or args is None:
+            return None
+        return name, len(args.named_children)
+
+    @classmethod
+    def _erlang_call_target(cls, call) -> Optional[tuple[str, int, bool]]:
+        """Return ``(raw target, arity, dynamic)`` for a call expression.
+
+        A variable module/function is deliberately reported as dynamic.  The
+        caller can retain a diagnostic without fabricating a cross-file edge.
+        """
+        expr = call.child_by_field_name("expr")
+        args = call.child_by_field_name("arguments")
+        if args is None:
+            args = next(
+                (child for child in call.named_children if child.type == "expr_args"),
+                None,
+            )
+        if expr is None or args is None:
+            return None
+        arity = len(args.named_children)
+        if expr.type == "atom":
+            name = cls._erlang_atom_text(expr)
+            return (name, arity, False) if name else None
+        if expr.type == "remote":
+            module_node = expr.child_by_field_name("module")
+            function_node = expr.child_by_field_name("function")
+            if module_node is None:
+                module_node = next(
+                    (
+                        child for child in expr.named_children
+                        if child.type == "remote_module"
+                    ),
+                    None,
+                )
+            if function_node is None:
+                function_node = next(
+                    (
+                        child for child in reversed(expr.named_children)
+                        if child.type == "atom"
+                    ),
+                    None,
+                )
+            module_name = None
+            if module_node is not None:
+                module_node = cls._erlang_unwrap_paren(module_node)
+                if module_node is not None and module_node.type == "remote_module":
+                    module_atom = next(
+                        (
+                            child for child in module_node.named_children
+                            if child.type == "atom"
+                        ),
+                        None,
+                    )
+                    module_name = cls._erlang_atom_text(module_atom)
+                elif module_node is not None and module_node.type == "atom":
+                    module_name = cls._erlang_atom_text(module_node)
+            function_name = cls._erlang_atom_text(function_node)
+            if module_name and function_name:
+                return f"{module_name}:{function_name}", arity, False
+            return (call.text.decode("utf-8", errors="replace").strip(), arity, True)
+        # Parenthesized literal callees are legal and remain static when the
+        # wrapped expression is an atom/remote.  Anything else is dynamic.
+        unwrapped = cls._erlang_unwrap_paren(expr)
+        if unwrapped is not expr:
+            if unwrapped is not None and unwrapped.type == "atom":
+                name = cls._erlang_atom_text(unwrapped)
+                return (name, arity, False) if name else None
+            if unwrapped is not None and unwrapped.type == "remote":
+                module_node = unwrapped.child_by_field_name("module")
+                function_node = unwrapped.child_by_field_name("function")
+                if module_node is None:
+                    module_node = next(
+                        (child for child in unwrapped.named_children
+                         if child.type == "remote_module"), None,
+                    )
+                if function_node is None:
+                    function_node = next(
+                        (child for child in reversed(unwrapped.named_children)
+                         if child.type == "atom"), None,
+                    )
+                module_atom = next(
+                    (child for child in (module_node.named_children if module_node else ())
+                     if child.type == "atom"), None,
+                )
+                module_name = cls._erlang_atom_text(module_atom)
+                function_name = cls._erlang_atom_text(function_node)
+                if module_name and function_name:
+                    return f"{module_name}:{function_name}", arity, False
+            return (expr.text.decode("utf-8", errors="replace").strip(), arity, True)
+        return None
+
+    @staticmethod
+    def _erlang_unwrap_paren(node):
+        """Unwrap nested Erlang parenthesized expressions."""
+        while node is not None and node.type in ("paren_expr", "parenthesized"):
+            children = list(node.named_children)
+            if len(children) != 1:
+                break
+            node = children[0]
+        return node
+
+    @staticmethod
+    def _erlang_walk(node, max_nodes: int = 100_000):
+        """Iteratively yield named descendants, avoiding recursion overflow."""
+        pending = list(reversed(node.named_children))
+        seen = 0
+        while pending and seen < max_nodes:
+            current = pending.pop()
+            seen += 1
+            yield current
+            pending.extend(reversed(current.named_children))
+
+    @staticmethod
+    def _erlang_string_text(node) -> Optional[str]:
+        if node is None or node.type != "string":
+            return None
+        text = node.text.decode("utf-8", errors="replace").strip()
+        if len(text) >= 2 and text[0] == text[-1] == '"':
+            return text[1:-1]
+        return text or None
+
+    def _parse_erlang(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse Erlang source and rebar3 application terms conservatively."""
+        parser = self._get_parser("erlang")
+        if parser is None:
+            return [], []
+        tree = parser.parse(source)
+        file_path = normalize_file_path(path)
+        test_file = _is_test_file(file_path)
+        file_extra: dict = {}
+        nodes: list[NodeInfo] = [NodeInfo(
+            kind="File", name=file_path, file_path=file_path,
+            line_start=1, line_end=source.count(b"\n") + 1,
+            language="erlang", is_test=test_file, extra=file_extra,
+        )]
+        edges: list[EdgeInfo] = []
+
+        # .app.src is data, not a module source file.  Preserve only the
+        # application identity and explicit module list as file metadata.
+        if path.name.lower().endswith(".app.src"):
+            root_terms = tree.root_node.named_children
+            app = next((n for n in root_terms if n.type == "tuple"), None)
+            if app is not None:
+                terms = list(app.named_children)
+                if len(terms) >= 2 and self._erlang_atom_text(terms[0]) == "application":
+                    app_name = self._erlang_atom_text(terms[1])
+                    if app_name:
+                        file_extra["erlang_application"] = app_name
+                        edges.append(EdgeInfo(
+                            kind="REFERENCES", source=file_path,
+                            target=app_name, file_path=file_path,
+                            line=app.start_point[0] + 1,
+                            extra={"erlang_reference_kind": "application"},
+                        ))
+                    options = terms[2] if len(terms) > 2 else None
+                    if options is not None and options.type == "list":
+                        modules: list[str] = []
+                        for option in options.named_children:
+                            if option.type != "tuple":
+                                continue
+                            fields = list(option.named_children)
+                            key = self._erlang_atom_text(fields[0]) if fields else None
+                            if (
+                                key == "modules"
+                                and len(fields) > 1
+                                and fields[1].type == "list"
+                            ):
+                                modules = [
+                                    value for value in (
+                                        self._erlang_atom_text(item)
+                                        for item in fields[1].named_children
+                                    ) if value
+                                ]
+                            if (
+                                key == "mod"
+                                and len(fields) > 1
+                                and fields[1].type == "tuple"
+                            ):
+                                mod_fields = list(fields[1].named_children)
+                                mod_name = (
+                                    self._erlang_atom_text(mod_fields[0])
+                                    if mod_fields else None
+                                )
+                                if mod_name:
+                                    file_extra["erlang_application_module"] = mod_name
+                            if (
+                                key in {"applications", "included_applications"}
+                                and len(fields) > 1
+                                and fields[1].type == "list"
+                            ):
+                                dependencies = [
+                                    value for value in (
+                                        self._erlang_atom_text(item)
+                                        for item in fields[1].named_children
+                                    ) if value
+                                ]
+                                if dependencies:
+                                    file_extra.setdefault(
+                                        "erlang_application_dependencies", [],
+                                    ).extend(dependencies)
+                        if modules:
+                            file_extra["erlang_application_modules"] = modules
+            dependencies = file_extra.get("erlang_application_dependencies", [])
+            if dependencies:
+                # Keep application dependency facts at application/file
+                # granularity; no function-level ownership is implied.
+                for dependency in dict.fromkeys(dependencies):
+                    edges.append(EdgeInfo(
+                        kind="DEPENDS_ON", source=file_path, target=dependency,
+                        file_path=file_path, line=1,
+                        extra={"erlang_reference_kind": "application_dependency"},
+                    ))
+            return nodes, edges
+
+        module_name: Optional[str] = None
+        function_groups: dict[tuple[str, int], list[object]] = {}
+        exports: list[str] = []
+        specs: list[str] = []
+        callbacks: list[str] = []
+        optional_callbacks: set[str] = set()
+        callback_decls: list[tuple[object, str, int]] = []
+        spec_decls: list[tuple[object, str, int]] = []
+        export_all = False
+        for child in tree.root_node.named_children:
+            if child.type == "module_attribute":
+                module_name = self._erlang_atom_text(child.child_by_field_name("name"))
+                if module_name:
+                    file_extra["erlang_module"] = module_name
+                    nodes.append(NodeInfo(
+                        kind="Class", name=module_name, file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1, language="erlang",
+                        extra={"erlang_kind": "module"},
+                    ))
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS", source=file_path,
+                        target=self._qualify(module_name, file_path, None),
+                        file_path=file_path, line=child.start_point[0] + 1,
+                    ))
+            elif child.type == "record_decl":
+                name = self._erlang_atom_text(child.child_by_field_name("name"))
+                if name:
+                    identity = f"#{name}{{}}"
+                    nodes.append(NodeInfo(
+                        kind="Type", name=name, file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1, language="erlang",
+                        parent_name=module_name,
+                        identity_name=identity,
+                        extra={"erlang_kind": "record", "record_identity": identity},
+                    ))
+                    if module_name:
+                        edges.append(EdgeInfo(
+                            kind="CONTAINS",
+                            source=self._qualify(module_name, file_path, None),
+                            target=self._qualify(identity, file_path, module_name),
+                            file_path=file_path,
+                            line=child.start_point[0] + 1,
+                        ))
+            elif child.type in ("type_alias", "opaque"):
+                type_name = child.child_by_field_name("name")
+                type_atom = next(
+                    (
+                        item for item in type_name.named_children
+                        if item.type == "atom"
+                    ),
+                    None,
+                ) if type_name is not None else None
+                name = self._erlang_atom_text(type_atom)
+                if name:
+                    arity = self._erlang_node_arity(type_name) or 0
+                    identity = f"{name}/{arity}"
+                    nodes.append(NodeInfo(
+                        kind="Type", name=name, file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1, language="erlang",
+                        parent_name=module_name,
+                        identity_name=identity,
+                        extra={"erlang_kind": child.type, "arity": arity},
+                    ))
+                    if module_name:
+                        edges.append(EdgeInfo(
+                            kind="CONTAINS",
+                            source=self._qualify(module_name, file_path, None),
+                            target=self._qualify(identity, file_path, module_name),
+                            file_path=file_path,
+                            line=child.start_point[0] + 1,
+                        ))
+            elif child.type in ("export_attribute", "spec", "callback"):
+                if child.type == "export_attribute":
+                    exports.extend(
+                        value for value in (
+                            self._erlang_fa_text(item)
+                            for item in child.named_children
+                            if item.type == "fa"
+                        ) if value
+                    )
+                else:
+                    atom = next(
+                        (
+                            item for item in child.named_children
+                            if item.type == "atom"
+                        ),
+                        None,
+                    )
+                    if atom is not None:
+                        value = self._erlang_atom_text(atom)
+                        if value:
+                            type_sig = next(
+                                (item for item in child.named_children if item.type == "type_sig"),
+                                None,
+                            )
+                            arity = self._erlang_node_arity(type_sig) or 0
+                            identity = f"{value}/{arity}"
+                            (specs if child.type == "spec" else callbacks).append(identity)
+                            if child.type == "spec":
+                                spec_decls.append((child, value, arity))
+                            else:
+                                callback_decls.append((child, value, arity))
+            elif child.type == "optional_callbacks_attribute":
+                optional_callbacks.update(
+                    value for value in (
+                        self._erlang_fa_value(item)
+                        for item in child.named_children
+                    ) if value
+                )
+            elif child.type == "compile_options_attribute":
+                # ``export_all`` is a top-level compile option.  Do not scan
+                # nested type expressions for the same atom.
+                option_nodes = list(child.named_children)
+                export_all = export_all or any(
+                    item.type == "atom" and self._erlang_atom_text(item) == "export_all"
+                    for item in option_nodes
+                )
+            elif child.type == "fun_decl":
+                clause = next(
+                    (
+                        n for n in child.named_children
+                        if n.type == "function_clause"
+                    ),
+                    None,
+                )
+                info = (
+                    self._erlang_function_info(clause)
+                    if clause is not None else None
+                )
+                if info and clause is not None:
+                    function_groups.setdefault(info, []).append((child, clause))
+
+        if exports:
+            file_extra["erlang_exports"] = exports
+        if specs:
+            file_extra["erlang_specs"] = specs
+        if callbacks:
+            file_extra["erlang_callbacks"] = callbacks
+        if optional_callbacks:
+            file_extra["erlang_optional_callbacks"] = sorted(optional_callbacks)
+        if export_all:
+            file_extra["erlang_export_all"] = True
+
+        exported_functions = set(exports)
+        spec_by_identity = {
+            f"{name}/{arity}": decl for decl, name, arity in spec_decls
+        }
+
+        # Callback declarations are explicit function identities.  Modeling
+        # them as synthetic Function nodes lets callers query behaviour
+        # contracts without pretending that a callback is executable code in
+        # this module.
+        callback_parent = module_name
+        for callback_node, callback_name, callback_arity in callback_decls:
+            callback_identity = f"$callback.{callback_name}/{callback_arity}"
+            callback_qname = self._qualify(
+                callback_identity, file_path, callback_parent,
+            )
+            nodes.append(NodeInfo(
+                kind="Function", name=callback_name,
+                identity_name=callback_identity, file_path=file_path,
+                line_start=callback_node.start_point[0] + 1,
+                line_end=callback_node.end_point[0] + 1, language="erlang",
+                parent_name=callback_parent,
+                extra={
+                    "erlang_kind": "callback",
+                    "arity": callback_arity,
+                    "required": f"{callback_name}/{callback_arity}" not in optional_callbacks,
+                    "optional": f"{callback_name}/{callback_arity}" in optional_callbacks,
+                },
+            ))
+            container = (
+                self._qualify(callback_parent, file_path, None)
+                if callback_parent else file_path
+            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS", source=container, target=callback_qname,
+                file_path=file_path, line=callback_node.start_point[0] + 1,
+            ))
+
+        module_qualifier = module_name
+        function_qualified = {
+            key: self._qualify(
+                f"{key[0]}/{key[1]}", file_path, module_qualifier,
+            )
+            for key in function_groups
+        }
+        for (name, arity), clauses in function_groups.items():
+            line_start = min(item[0].start_point[0] for item in clauses) + 1
+            line_end = max(item[0].end_point[0] for item in clauses) + 1
+            is_test = _is_test_function(name, file_path)
+            if path.name.lower().endswith("_suite.erl") and arity == 1:
+                # Common Test case callbacks have a one-argument signature;
+                # framework hooks are excluded from this classification.
+                is_test = name not in {
+                    "init_per_suite", "end_per_suite", "init_per_group",
+                    "end_per_group", "init_per_testcase", "end_per_testcase",
+                }
+            parent = module_qualifier
+            identity = f"{name}/{arity}"
+            qualified = self._qualify(identity, file_path, parent)
+            nodes.append(NodeInfo(
+                kind="Test" if is_test else "Function", name=name,
+                identity_name=identity, file_path=file_path,
+                line_start=line_start, line_end=line_end, language="erlang",
+                parent_name=parent, is_test=is_test,
+                extra={
+                    "erlang_kind": "function",
+                    "arity": arity,
+                    "clause_count": len(clauses),
+                    "clause_lines": [item[0].start_point[0] + 1 for item in clauses],
+                    "exported": export_all or identity in exported_functions,
+                },
+            ))
+            if is_test:
+                nodes[-1].extra["erlang_test_framework"] = (
+                    "common_test" if path.name.lower().endswith("_suite.erl")
+                    else "eunit"
+                )
+            if identity in spec_by_identity:
+                spec_node = spec_by_identity[identity]
+                nodes[-1].extra["spec_line"] = spec_node.start_point[0] + 1
+            container = self._qualify(parent, file_path, None) if parent else file_path
+            edges.append(EdgeInfo(
+                kind="CONTAINS", source=container, target=qualified,
+                file_path=file_path, line=line_start,
+            ))
+            for _fun_decl, clause in clauses:
+                for call in self._erlang_walk(clause):
+                    if call.type != "call":
+                        if call.type in ("internal_fun", "external_fun"):
+                            raw_fun = call.text.decode(
+                                "utf-8", errors="replace",
+                            ).strip().removeprefix("fun ")
+                            if raw_fun:
+                                edges.append(EdgeInfo(
+                                    kind="REFERENCES", source=qualified,
+                                    target=raw_fun,
+                                    file_path=file_path,
+                                    line=call.start_point[0] + 1,
+                                    extra={
+                                        "erlang_raw_target": raw_fun,
+                                        "erlang_reference_kind": "function_reference",
+                                    },
+                                ))
+                        elif call.type in {
+                            "record_expr", "record_index", "record_index_expr",
+                            "record_field_expr", "record_update_expr",
+                        }:
+                            record_name = next(
+                                (
+                                    item for item in self._erlang_walk(call)
+                                    if item.type == "record_name"
+                                ),
+                                None,
+                            )
+                            atom = next(
+                                (
+                                    item for item in self._erlang_walk(record_name)
+                                    if item.type == "atom"
+                                ),
+                                None,
+                            ) if record_name is not None else None
+                            record = self._erlang_atom_text(atom)
+                            if record:
+                                edges.append(EdgeInfo(
+                                    kind="REFERENCES", source=qualified,
+                                    target=record,
+                                    file_path=file_path,
+                                    line=call.start_point[0] + 1,
+                                    extra={
+                                        "erlang_raw_target": record,
+                                        "erlang_reference_kind": "record",
+                                    },
+                                ))
+                        target = self._erlang_call_target(call)
+                    else:
+                        target = self._erlang_call_target(call)
+                    if target is None:
+                        continue
+                    target_name, target_arity, dynamic = target
+                    if dynamic:
+                        # Keep a bounded diagnostic on the file node rather
+                        # than guessing a module/function from a variable.
+                        file_extra.setdefault("erlang_diagnostics", []).append(
+                            "dynamic_call_not_resolved:"
+                            f"{call.start_point[0] + 1}:{target_name[:160]}"
+                        )
+                        continue
+                    target_qname = function_qualified.get(
+                        (target_name, target_arity),
+                    )
+                    raw_target = (
+                        f"{target_name}/{target_arity}"
+                        if ":" not in target_name
+                        else f"{target_name}/{target_arity}"
+                    )
+                    edges.append(EdgeInfo(
+                        kind="CALLS", source=qualified,
+                        target=(
+                            target_qname
+                            if target_qname is not None
+                            else raw_target
+                        ),
+                        file_path=file_path, line=call.start_point[0] + 1,
+                        extra={
+                            "erlang_raw_target": raw_target,
+                            "erlang_resolution": (
+                                "same_file" if target_qname else "syntactic"
+                            ),
+                            "arity": target_arity,
+                        },
+                    ))
+
+        # Type expressions use the same ``call`` AST node as runtime calls.
+        # Traverse declaration-only subtrees and emit REFERENCES so they never
+        # become executable CALLS edges.
+        type_declaration_types = {
+            "record_decl", "type_alias", "opaque", "callback", "spec",
+        }
+        for declaration in tree.root_node.named_children:
+            if declaration.type not in type_declaration_types:
+                continue
+            if declaration.type == "spec":
+                atom = next(
+                    (item for item in declaration.named_children if item.type == "atom"),
+                    None,
+                )
+                name = self._erlang_atom_text(atom)
+                sig = next(
+                    (item for item in declaration.named_children if item.type == "type_sig"),
+                    None,
+                )
+                arity = self._erlang_node_arity(sig) or 0
+                source_id = self._qualify(
+                    f"{name}/{arity}" if name else "spec",
+                    file_path,
+                    module_name,
+                )
+            elif declaration.type == "callback":
+                atom = next(
+                    (item for item in declaration.named_children if item.type == "atom"),
+                    None,
+                )
+                name = self._erlang_atom_text(atom) or "callback"
+                sig = next(
+                    (item for item in declaration.named_children if item.type == "type_sig"),
+                    None,
+                )
+                arity = self._erlang_node_arity(sig) or 0
+                source_id = self._qualify(
+                    f"$callback.{name}/{arity}", file_path, module_name,
+                )
+            elif declaration.type == "record_decl":
+                name = self._erlang_atom_text(
+                    declaration.child_by_field_name("name"),
+                )
+                source_id = self._qualify(
+                    f"#{name}{{}}" if name else "record",
+                    file_path,
+                    module_name,
+                )
+            else:
+                type_name = declaration.child_by_field_name("name")
+                atom = next(
+                    (item for item in (type_name.named_children if type_name else ())
+                     if item.type == "atom"),
+                    None,
+                )
+                name = self._erlang_atom_text(atom) or "type"
+                arity = self._erlang_node_arity(type_name) or 0
+                source_id = self._qualify(
+                    f"{name}/{arity}", file_path, module_name,
+                )
+            for candidate in self._erlang_walk(declaration):
+                if candidate.type != "call":
+                    continue
+                target = self._erlang_call_target(candidate)
+                if target is None or target[2]:
+                    continue
+                target_name, target_arity, _dynamic = target
+                raw_target = f"{target_name}/{target_arity}"
+                edges.append(EdgeInfo(
+                    kind="REFERENCES", source=source_id, target=raw_target,
+                    file_path=file_path, line=candidate.start_point[0] + 1,
+                    extra={
+                        "erlang_raw_target": raw_target,
+                        "erlang_reference_kind": "type",
+                    },
+                ))
+
+        for child in tree.root_node.named_children:
+            if child.type in ("import_attribute",):
+                target = self._erlang_atom_text(child.child_by_field_name("module"))
+                if target:
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM", source=file_path, target=target,
+                        file_path=file_path, line=child.start_point[0] + 1,
+                        extra={"erlang_import_kind": "import"},
+                    ))
+            elif child.type in ("pp_include", "pp_include_lib"):
+                strings = [n for n in child.named_children if n.type == "string"]
+                target = self._erlang_string_text(strings[0]) if strings else None
+                if target:
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM", source=file_path, target=target,
+                        file_path=file_path, line=child.start_point[0] + 1,
+                        extra={"erlang_import_kind": child.type},
+                    ))
+            elif child.type == "behaviour_attribute":
+                target = self._erlang_atom_text(child.child_by_field_name("name"))
+                if target:
+                    edges.append(EdgeInfo(
+                        kind="IMPLEMENTS",
+                        source=(
+                            self._qualify(module_name, file_path, None)
+                            if module_name else file_path
+                        ),
+                        target=target,
+                        file_path=file_path, line=child.start_point[0] + 1,
+                        extra={
+                            "erlang_reference_kind": "behaviour",
+                            "erlang_raw_target": target,
+                        },
+                    ))
+        test_qnames = {
+            self._node_qualified(node)
+            for node in nodes
+            if node.is_test and node.kind in ("Function", "Test")
+        }
+        for edge in list(edges):
+            if edge.kind == "CALLS" and edge.source in test_qnames:
+                edges.append(EdgeInfo(
+                    kind="TESTED_BY",
+                    source=edge.target,
+                    target=edge.source,
+                    file_path=edge.file_path,
+                    line=edge.line,
+                    extra=edge.extra.copy(),
+                ))
+        return nodes, edges
+
+    @staticmethod
+    def _erlang_fa_text(node) -> Optional[str]:
+        """Return an Erlang export function/arity pair such as ``foo/1``."""
+        if node.type != "fa":
+            return None
+        atoms = [child for child in node.named_children if child.type == "atom"]
+        arity = next(
+            (child for child in node.named_children if child.type == "arity"),
+            None,
+        )
+        if not atoms or arity is None:
+            return None
+        arity_text = arity.text.decode().lstrip("/")
+        return f"{CodeParser._erlang_atom_text(atoms[0])}/{arity_text}"
+
+    @staticmethod
+    def _erlang_descendants(node, node_type: str):
+        """Yield named descendants with one requested Erlang node type."""
+        # Keep this compatibility helper iterative as well: legal Erlang
+        # expressions can be deeply nested, and a recursive walk would turn a
+        # valid source file into a Python recursion failure.
+        for child in CodeParser._erlang_walk(node):
+            if child.type == node_type:
+                yield child
 
     @staticmethod
     def _has_cpp_header_evidence(root) -> bool:

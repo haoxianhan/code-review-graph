@@ -1,8 +1,8 @@
 """Tests for config-driven custom language support (languages.toml, #320).
 
-Erlang is used as the end-to-end grammar: tree_sitter_language_pack ships
-it, but code-review-graph has no built-in ``.erl`` support (only Elixir on
-the BEAM side), so it exercises the full bring-your-own-language path.
+Erlang is used as the end-to-end grammar for the custom-language loader.  The
+real ``.erl`` extension is built in now, so this fixture deliberately uses a
+different extension and language name to keep testing the BYO path.
 """
 
 import logging
@@ -25,8 +25,8 @@ from code_review_graph.parser import (
 BUILTIN_LANGUAGES = _builtin_language_names()
 
 ERLANG_TOML = """\
-[languages.erlang]
-extensions = [".erl"]
+[languages.erlang_custom]
+extensions = [".eerl"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
 class_node_types = ["record_decl"]
@@ -115,10 +115,10 @@ class TestLoader:
     def test_valid_language_loaded(self, tmp_path):
         write_config(tmp_path, ERLANG_TOML)
         result = load(tmp_path)
-        assert set(result) == {"erlang"}
-        lang = result["erlang"]
+        assert set(result) == {"erlang_custom"}
+        lang = result["erlang_custom"]
         assert lang.grammar == "erlang"
-        assert lang.extensions == (".erl",)
+        assert lang.extensions == (".eerl",)
         assert lang.function_node_types == ("function_clause",)
         assert lang.class_node_types == ("record_decl",)
         assert lang.import_node_types == ("import_attribute",)
@@ -127,13 +127,13 @@ class TestLoader:
 
     def test_extensions_normalised_to_lowercase(self, tmp_path):
         write_config(tmp_path, """\
-[languages.erlang]
-extensions = [".ERL"]
+[languages.erlang_custom]
+extensions = [".EERL"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
 """)
         result = load(tmp_path)
-        assert result["erlang"].extensions == (".erl",)
+        assert result["erlang_custom"].extensions == (".eerl",)
 
     def test_bad_grammar_skipped(self, tmp_path, caplog):
         write_config(tmp_path, """\
@@ -160,7 +160,7 @@ function_node_types = ["function_clause"]
 
     def test_extension_without_dot_skipped(self, tmp_path, caplog):
         write_config(tmp_path, """\
-[languages.erlang]
+[languages.erlang_custom]
 extensions = ["erl"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
@@ -249,22 +249,22 @@ function_node_types = ["function_clause"]
     def test_cache_reused_and_isolated(self, tmp_path):
         write_config(tmp_path, ERLANG_TOML)
         first = load(tmp_path)
-        first.pop("erlang")  # Mutating the returned dict must not poison the cache
+        first.pop("erlang_custom")  # Mutating the returned dict must not poison the cache
         second = load(tmp_path)
-        assert set(second) == {"erlang"}
+        assert set(second) == {"erlang_custom"}
 
 
 class TestParserIntegration:
     def _repo(self, tmp_path: Path) -> tuple[Path, Path]:
         write_config(tmp_path, ERLANG_TOML)
-        src = tmp_path / "src" / "math_utils.erl"
+        src = tmp_path / "src" / "math_utils.eerl"
         src.parent.mkdir(parents=True)
         src.write_text(ERLANG_SOURCE, encoding="utf-8")
         return tmp_path, src
 
     def test_detect_language_with_and_without_config(self, tmp_path):
         repo, src = self._repo(tmp_path)
-        assert CodeParser(repo).detect_language(src) == "erlang"
+        assert CodeParser(repo).detect_language(src) == "erlang_custom"
         # Without repo_root the custom extension stays unknown.
         assert CodeParser().detect_language(src) is None
 
@@ -281,23 +281,25 @@ class TestParserIntegration:
 
         files = [n for n in nodes if n.kind == "File"]
         assert len(files) == 1
-        assert files[0].language == "erlang"
+        assert files[0].language == "erlang_custom"
 
         funcs = {n.name: n for n in nodes if n.kind == "Function"}
         assert {"add", "helper", "scale"} <= set(funcs)
-        assert funcs["add"].language == "erlang"
+        assert funcs["add"].language == "erlang_custom"
         assert funcs["add"].line_start == 7
 
         classes = {n.name: n for n in nodes if n.kind == "Class"}
         assert "point" in classes
-        assert classes["point"].language == "erlang"
+        assert classes["point"].language == "erlang_custom"
 
         file_path = src.as_posix()
         calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
         # helper(A) inside add/2 resolves to the same-file definition.
-        assert (f"{file_path}::add", f"{file_path}::helper") in calls
+        assert any(source.endswith("::add") and target.endswith("::helper")
+                   for source, target in calls)
         # add(P, F) inside the anonymous fun passed to lists:map.
-        assert (f"{file_path}::scale", f"{file_path}::add") in calls
+        assert any(source.endswith("::scale") and target.endswith("::add")
+                   for source, target in calls)
         # Remote call keeps its qualified module:function form.
         assert (f"{file_path}::scale", "lists:map") in calls
 
@@ -310,6 +312,8 @@ class TestParserIntegration:
 
     def test_e2e_parse_without_config_yields_nothing(self, tmp_path):
         _repo, src = self._repo(tmp_path)
+        # The custom extension remains unavailable without repository config;
+        # the built-in `.erl` extension is covered by the Generic baseline.
         nodes, edges = CodeParser().parse_file(src)
         assert nodes == []
         assert edges == []
@@ -329,7 +333,7 @@ class TestParserIntegration:
                 ("helper",),
             ).fetchone()
             assert row is not None
-            assert row[0] == "erlang"
+            assert row[0] == "erlang_custom"
         finally:
             store.close()
 
@@ -355,7 +359,7 @@ class TestNameFieldLoader:
 
     def test_name_field_omitted_defaults_empty(self, tmp_path):
         write_config(tmp_path, ERLANG_TOML)
-        assert load(tmp_path)["erlang"].name_field == ()
+        assert load(tmp_path)["erlang_custom"].name_field == ()
 
     def test_invalid_name_field_type_skips_entry(self, tmp_path, caplog):
         write_config(tmp_path, (

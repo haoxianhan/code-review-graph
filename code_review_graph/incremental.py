@@ -1151,6 +1151,27 @@ def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
             if e.kind in ("CALLS", "IMPORTS_FROM", "INHERITS", "IMPLEMENTS"):
                 dependents.add(e.file_path)
 
+    # Erlang preprocessor includes are stored as the include spelling (for
+    # example ``sample.hrl``), while the graph stores the included file under
+    # its repository path.  Resolve an unqualified include only when its
+    # basename is unique in the current graph; this keeps ambiguous include
+    # trees unresolved instead of invalidating unrelated consumers.
+    target_name = Path(file_path).name
+    if target_name.endswith(".hrl"):
+        matching_files = {
+            candidate
+            for candidate in store.get_all_files()
+            if Path(candidate).name == target_name
+        }
+        if matching_files == {file_path}:
+            rows = store._conn.execute(
+                "SELECT file_path FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND "
+                "(target_qualified = ? OR target_qualified LIKE ?)",
+                (target_name, f"%/{target_name}"),
+            ).fetchall()
+            dependents.update(row["file_path"] for row in rows)
+
     dependents.discard(file_path)
     return dependents
 
@@ -1452,7 +1473,14 @@ def incremental_update(
             raw = abs_path.read_bytes()
             fhash = hashlib.sha256(raw).hexdigest()
             existing_nodes = store.get_nodes_by_file(str(abs_path))
-            if existing_nodes and existing_nodes[0].file_hash == fhash:
+            # Dependents must be re-parsed even when their own bytes are
+            # unchanged: an included header/module may have changed the
+            # syntax or resolution context of their edges.
+            if (
+                existing_nodes
+                and existing_nodes[0].file_hash == fhash
+                and rel_path not in dependent_files
+            ):
                 continue
         except (OSError, PermissionError):
             pass
