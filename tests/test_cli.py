@@ -435,6 +435,106 @@ class TestBuildUpdateCommands:
         assert "Incremental:" not in out
 
 
+class TestErlangAdoptionEvalCommand:
+    """The top-level eval command delegates explicitly to the Erlang runner."""
+
+    def test_forwards_adoption_options_to_evaluator(self):
+        argv = [
+            "code-review-graph",
+            "eval",
+            "--erlang-adoption",
+            "--manifest",
+            "manifest.json",
+            "--corpus",
+            "corpus.json",
+            "--target-root",
+            "target",
+            "--probe-root",
+            "probe",
+            "--output-dir",
+            "reports",
+            "--timeout",
+            "2.5",
+            "--dry-run",
+            "--allow-dirty",
+            "--watch-smoke",
+            "--json",
+            "--pretty",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            with patch(
+                "code_review_graph.eval.erlang_adoption.main", return_value=0
+            ) as adoption_main:
+                cli.main()
+
+        adoption_main.assert_called_once_with([
+            "--manifest",
+            "manifest.json",
+            "--corpus",
+            "corpus.json",
+            "--target-root",
+            "target",
+            "--probe-root",
+            "probe",
+            "--output-dir",
+            "reports",
+            "--timeout",
+            "2.5",
+            "--dry-run",
+            "--allow-dirty",
+            "--watch-smoke",
+            "--json",
+            "--pretty",
+        ])
+
+    def test_adoption_blocked_result_is_nonzero(self):
+        argv = ["code-review-graph", "eval", "--erlang-adoption", "--dry-run"]
+
+        with patch.object(sys, "argv", argv):
+            with patch(
+                "code_review_graph.eval.erlang_adoption.main", return_value=1
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli.main()
+
+        assert exc_info.value.code == 1
+
+    def test_generic_eval_still_uses_benchmark_runner(self):
+        argv = [
+            "code-review-graph",
+            "eval",
+            "--benchmark",
+            "token_efficiency",
+            "--repo",
+            "fixture",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            with patch(
+                "code_review_graph.eval.runner.run_eval", return_value=[]
+            ) as run_eval:
+                cli.main()
+
+        run_eval.assert_called_once_with(
+            repos=["fixture"],
+            benchmarks=["token_efficiency"],
+            output_dir=None,
+            embed=False,
+            embedding_provider=None,
+            embedding_model=None,
+        )
+
+    def test_adoption_only_options_require_explicit_mode(self):
+        argv = ["code-review-graph", "eval", "--dry-run"]
+
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main()
+
+        assert exc_info.value.code == 2
+
+
 class TestDetectChangesCommand:
     def test_churn_flag_is_forwarded_to_analysis(self, tmp_path, capsys):
         repo = tmp_path / "repo"

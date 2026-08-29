@@ -137,6 +137,17 @@ CRG reduces review context by sending graph-derived structural context instead o
 code-review-graph eval --all
 ```
 
+The repository-specific Erlang adoption evaluator is exposed as an explicit
+mode of the same command. It never writes to the target checkout:
+
+```bash
+code-review-graph eval --erlang-adoption \
+  --target-root /path/to/server_flexible --json --output-dir evaluate/reports
+```
+
+Use `--dry-run` for manifest/corpus preflight only. A blocked preflight exits
+non-zero; missing measurements are not treated as an adoption pass.
+
 Since v2.3.4, review and impact tools include compact `context_savings` metadata. In v2.3.5 the CLI surfaces this as a boxed `Token Savings` panel on both `detect-changes --brief` and `update --brief`, with a per-category breakdown (Functions / Tests / Risk / Other) that sums exactly to the graph response size. Add `--verify` to cross-check the displayed numbers against OpenAI's `cl100k_base` tokenizer (requires `pip install tiktoken`). All numbers are labelled estimated because they use a conservative approximation rather than model-specific tokenisation; calibration shows the estimate stays within ~1% of real GPT-4 tokens in aggregate. Small single-file changes can occasionally use more context than the raw file because graph metadata has overhead.
 
 ## Supported Languages

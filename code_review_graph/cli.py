@@ -24,6 +24,7 @@ Usage:
     code-review-graph daemon logs [--repo ALIAS] [--follow] [--lines N]
     code-review-graph daemon add <path> [--alias NAME]
     code-review-graph daemon remove <path_or_alias>
+    code-review-graph eval --erlang-adoption [options]
 """
 
 from __future__ import annotations
@@ -102,6 +103,84 @@ def _erlang_parse_error_requires_failure(result: Mapping[str, object]) -> bool:
         if path.endswith((".erl", ".hrl", ".app.src")) or "erlang" in path:
             return True
     return False
+
+
+def _run_erlang_adoption_eval(args: argparse.Namespace) -> None:
+    """Dispatch the opt-in Erlang adoption evaluator.
+
+    The evaluator owns its report schema and exit-code policy, so the main CLI
+    only translates the shared ``eval`` options into the evaluator's standalone
+    argv shape.  Importing it lazily keeps the existing benchmark command's
+    dependency and startup behavior unchanged.
+    """
+    from .eval import erlang_adoption
+
+    conflicting = []
+    if getattr(args, "benchmark", None):
+        conflicting.append("--benchmark")
+    if getattr(args, "run_all", False):
+        conflicting.append("--all")
+    if getattr(args, "report", False):
+        conflicting.append("--report")
+    if getattr(args, "embed", False):
+        conflicting.append("--embed")
+    if getattr(args, "embed_provider", None):
+        conflicting.append("--embed-provider")
+    if getattr(args, "embed_model", None):
+        conflicting.append("--embed-model")
+    if conflicting:
+        joined = ", ".join(conflicting)
+        print(
+            f"{joined} cannot be combined with --erlang-adoption; "
+            "use the adoption-specific options instead.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    forwarded: list[str] = []
+
+    # ``--repo`` historically names benchmark configs.  In adoption mode a
+    # single value is accepted as a convenient target-root alias; the explicit
+    # ``--target-root`` spelling remains canonical and avoids ambiguity.
+    target_root = getattr(args, "target_root", None)
+    repo = getattr(args, "repo", None)
+    if target_root is not None and repo is not None:
+        print(
+            "--repo and --target-root cannot both be used with --erlang-adoption.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if target_root is None:
+        target_root = repo
+
+    option_values = (
+        ("--manifest", getattr(args, "manifest", None)),
+        ("--corpus", getattr(args, "corpus", None)),
+        ("--target-root", target_root),
+        ("--probe-root", getattr(args, "probe_root", None)),
+        ("--output-dir", getattr(args, "output_dir", None)),
+        ("--timeout", getattr(args, "timeout", None)),
+    )
+    for option, value in option_values:
+        if value is not None:
+            forwarded.extend((option, str(value)))
+
+    for option, enabled in (
+        ("--dry-run", getattr(args, "erlang_dry_run", False)),
+        ("--allow-dirty", getattr(args, "allow_dirty", False)),
+        ("--watch-smoke", getattr(args, "watch_smoke", False)),
+        ("--json", getattr(args, "erlang_json", False)),
+        ("--pretty", getattr(args, "pretty", False)),
+    ):
+        if enabled:
+            forwarded.append(option)
+
+    exit_code = erlang_adoption.main(forwarded)
+    if exit_code:
+        # ``cli.main`` is also used directly in tests and by ``python -m``;
+        # raising here preserves the evaluator's non-zero shell contract in
+        # all entry-point forms.
+        raise SystemExit(exit_code)
 
 
 def _get_version() -> str:
@@ -1064,6 +1143,14 @@ def main() -> None:
     # eval
     eval_cmd = sub.add_parser("eval", help="Run evaluation benchmarks")
     eval_cmd.add_argument(
+        "--erlang-adoption",
+        action="store_true",
+        help=(
+            "Run the fail-closed Erlang server_flexible adoption evaluator "
+            "instead of the generic benchmark runner"
+        ),
+    )
+    eval_cmd.add_argument(
         "--benchmark",
         default=None,
         help="Comma-separated benchmarks to run (token_efficiency, impact_accuracy, "
@@ -1074,6 +1161,61 @@ def main() -> None:
     eval_cmd.add_argument("--all", action="store_true", dest="run_all", help="Run all benchmarks")
     eval_cmd.add_argument("--report", action="store_true", help="Generate report from results")
     eval_cmd.add_argument("--output-dir", default=None, help="Output directory for results")
+    eval_cmd.add_argument(
+        "--manifest",
+        "--erlang-manifest",
+        default=None,
+        help="Erlang adoption manifest path (only with --erlang-adoption)",
+    )
+    eval_cmd.add_argument(
+        "--corpus",
+        "--erlang-corpus",
+        default=None,
+        help="Erlang adoption corpus path (only with --erlang-adoption)",
+    )
+    eval_cmd.add_argument(
+        "--target-root",
+        default=None,
+        help="Erlang adoption target checkout (only with --erlang-adoption)",
+    )
+    eval_cmd.add_argument(
+        "--probe-root",
+        default=None,
+        help="Probe root for Erlang adoption checks (only with --erlang-adoption)",
+    )
+    eval_cmd.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Adapter command timeout in seconds (only with --erlang-adoption)",
+    )
+    eval_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="erlang_dry_run",
+        help="Skip graph/lifecycle execution in the Erlang evaluator",
+    )
+    eval_cmd.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow exploratory execution on a dirty Erlang checkout",
+    )
+    eval_cmd.add_argument(
+        "--watch-smoke",
+        action="store_true",
+        help="Record a bounded watch smoke check in the Erlang evaluator",
+    )
+    eval_cmd.add_argument(
+        "--json",
+        action="store_true",
+        dest="erlang_json",
+        help="Emit the Erlang adoption result as JSON",
+    )
+    eval_cmd.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Indent Erlang adoption JSON output",
+    )
     eval_cmd.add_argument(
         "--embed",
         action="store_true",
@@ -1502,6 +1644,37 @@ def main() -> None:
         return
 
     if args.command == "eval":
+        if getattr(args, "erlang_adoption", False):
+            _run_erlang_adoption_eval(args)
+            return
+
+        # Adoption-only options must not be silently ignored on the generic
+        # benchmark path.  ``--output-dir`` remains shared with --report and
+        # ordinary benchmark runs for backwards compatibility.
+        adoption_only = (
+            ("--manifest", getattr(args, "manifest", None)),
+            ("--corpus", getattr(args, "corpus", None)),
+            ("--target-root", getattr(args, "target_root", None)),
+            ("--probe-root", getattr(args, "probe_root", None)),
+            ("--timeout", getattr(args, "timeout", None)),
+            ("--dry-run", getattr(args, "erlang_dry_run", False)),
+            ("--allow-dirty", getattr(args, "allow_dirty", False)),
+            ("--watch-smoke", getattr(args, "watch_smoke", False)),
+            ("--json", getattr(args, "erlang_json", False)),
+            ("--pretty", getattr(args, "pretty", False)),
+        )
+        supplied_adoption_options = [
+            name
+            for name, value in adoption_only
+            if value is not None and value is not False
+        ]
+        if supplied_adoption_options:
+            print(
+                f"{', '.join(supplied_adoption_options)} requires --erlang-adoption.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
         from .eval.reporter import generate_full_report, generate_readme_tables
         from .eval.runner import run_eval
 

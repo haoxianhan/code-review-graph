@@ -175,6 +175,17 @@ missing tools or stale evidence never disable Generic indexing. See the
 [Erlang support plan](erlang-support-plan.md) and the checked-in evaluation
 artifacts under `evaluate/erlang/` for the adoption boundary.
 
+The executable adoption check is available through the top-level CLI:
+
+```bash
+code-review-graph eval --erlang-adoption --target-root /path/to/server_flexible --json
+```
+
+It is read-only and fail-closed: a blocked preflight returns a non-zero exit
+status, while `--dry-run` validates the manifest and corpus without building a
+temporary graph. Use `--output-dir` to write the JSON and Markdown report
+outside the target checkout.
+
 ### Add your own language (no fork needed)
 
 If your repo uses a language the parser does not cover yet, drop a `languages.toml` into `.code-review-graph/` mapping file extensions to any grammar bundled in `tree_sitter_language_pack`, plus the tree-sitter node types for functions, classes, imports, and calls:
@@ -382,6 +393,7 @@ code-review-graph daemon start     # Start multi-repo watch daemon
 code-review-graph daemon stop      # Stop the daemon
 code-review-graph daemon status    # Show daemon status and repos
 code-review-graph eval             # Run evaluation benchmarks
+code-review-graph eval --erlang-adoption --dry-run --json  # Check Erlang adoption preflight
 code-review-graph serve            # Start MCP server
 ```
 

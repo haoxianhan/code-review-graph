@@ -418,6 +418,9 @@ code-review-graph daemon remove <path_or_alias>     # Remove a repo from daemon 
 
 # Evaluation
 code-review-graph eval                         # Run evaluation benchmarks
+code-review-graph eval --erlang-adoption --target-root /path/to/server_flexible --json
+                                               # Run the read-only, fail-closed Erlang adoption evaluator
+                                               # Add --dry-run to validate anchors without graph execution
 
 # Server
 code-review-graph serve                        # Start MCP server (stdio)
