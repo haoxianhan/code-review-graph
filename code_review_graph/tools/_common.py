@@ -167,6 +167,7 @@ def _read_semantic_context(
         "semantic_evidence": [],
         "semantic_diagnostics": [],
     }
+    matched_analysis_keys: set[str] = set()
     try:
         if include_evidence:
             raw_evidence = store.get_semantic_evidence(
@@ -179,6 +180,14 @@ def _read_semantic_context(
                 ):
                     continue
                 output["semantic_evidence"].append(record)
+                provenance = record.get("provenance")
+                if isinstance(provenance, Mapping):
+                    analysis_key = provenance.get("analysis_key")
+                    if isinstance(analysis_key, str) and analysis_key:
+                        # Diagnostics from the same bounded adapter query are
+                        # part of the review context even when the tool did
+                        # not attach a source location to each warning.
+                        matched_analysis_keys.add(analysis_key)
                 if len(output["semantic_evidence"]) >= bounded_limit:
                     break
     except Exception:
@@ -189,7 +198,15 @@ def _read_semantic_context(
         )
         for item in raw_diagnostics:
             record = _semantic_response_record(item)
-            if record is None or not _semantic_record_matches(
+            if record is None:
+                continue
+            provenance = record.get("provenance")
+            same_query = (
+                isinstance(provenance, Mapping)
+                and isinstance(provenance.get("analysis_key"), str)
+                and provenance["analysis_key"] in matched_analysis_keys
+            )
+            if not same_query and not _semantic_record_matches(
                 record, endpoints=endpoint_values, files=file_values, diagnostic=True,
             ):
                 continue

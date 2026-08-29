@@ -14,6 +14,7 @@ from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_staged_and_unstaged
 from ..parser import normalize_file_path
 from ._common import (
+    _attach_semantic_context,
     _bounded,
     _get_store,
     _resolve_graph_file_paths,
@@ -205,6 +206,14 @@ def get_review_context(
                     "get_impact_radius",
                 ],
             }
+            _attach_semantic_context(
+                result,
+                store,
+                root,
+                endpoints=[node.qualified_name for node in impact["changed_nodes"]],
+                files=changed_files + impact["impacted_files"],
+                limit=16,
+            )
             attach_context_savings(result, original_tokens=original_tokens)
             return result
 
@@ -307,6 +316,19 @@ def get_review_context(
             "summary": "\n".join(summary_parts),
             "context": context,
         }
+        _attach_semantic_context(
+            result,
+            store,
+            root,
+            endpoints=(
+                [node.qualified_name for node in impact["changed_nodes"]]
+                + [node.qualified_name for node in impact["impacted_nodes"]]
+                + [edge.source_qualified for edge in impact["edges"]]
+                + [edge.target_qualified for edge in impact["edges"]]
+            ),
+            files=changed_files + impact["impacted_files"],
+            limit=32,
+        )
         attach_context_savings(result, original_tokens=original_tokens)
         return result
     finally:
@@ -649,6 +671,18 @@ def detect_changes_func(
                 "test_gap_count": len(analysis.get("test_gaps", [])),
                 "review_priorities": top_priorities,
             }
+            _attach_semantic_context(
+                result,
+                store,
+                root,
+                endpoints=[
+                    str(item.get("qualified_name", ""))
+                    for item in analysis.get("changed_functions", [])
+                    if isinstance(item, dict)
+                ],
+                files=changed_files,
+                limit=16,
+            )
         else:
             funcs, funcs_total, funcs_cut = _bounded(
                 analysis.get("changed_functions", []),
@@ -688,6 +722,23 @@ def detect_changes_func(
                 "affected_flows_total": flows_total,
                 "truncated": any_cut,
             }
+            _attach_semantic_context(
+                result,
+                store,
+                root,
+                endpoints=[
+                    str(item.get("qualified_name", ""))
+                    for item in analysis.get("changed_functions", [])
+                    if isinstance(item, dict)
+                ]
+                + [
+                    str(item.get("qualified_name", ""))
+                    for item in analysis.get("test_gaps", [])
+                    if isinstance(item, dict)
+                ],
+                files=changed_files,
+                limit=32,
+            )
         result["_hints"] = generate_hints(
             "detect_changes", result, get_session()
         )
