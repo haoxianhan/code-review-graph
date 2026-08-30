@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import time as _time
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -628,6 +629,24 @@ _PARSER_PROBE_RESULTS: dict[str, bool] = {}
 _PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
 _EXPECTED_PARSER_LOAD_ERRORS = (ImportError, LookupError, OSError, ValueError)
+_REAL_TIME_SLEEP = _time.sleep
+
+
+class _ProbeSubprocessTime:
+    """Keep subprocess timeout polling independent of application sleepers.
+
+    Watch tests and embedding applications may replace ``time.sleep`` to drive
+    their own event loop.  ``subprocess.Popen.wait(timeout=...)`` consults the
+    shared ``time`` module while busy-polling; inheriting that replacement can
+    abort a parser probe before the first file is indexed.  A narrow proxy
+    changes only the subprocess module's lookup and leaves signal delivery and
+    the rest of the process untouched.
+    """
+
+    sleep = _REAL_TIME_SLEEP
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_time, name)
 
 
 def _parser_load_timeout_seconds() -> float:
@@ -653,14 +672,23 @@ def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
         "get_parser(sys.argv[1])\n"
     )
     try:
-        completed = subprocess.run(
-            [sys.executable, "-c", code, grammar],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        subprocess_time = getattr(subprocess, "time", None)
+        # ``subprocess`` keeps its time module as a mutable module global.  A
+        # proxy is enough to isolate its polling sleep without mutating the
+        # process-wide ``time.sleep`` seen by callers.
+        subprocess.time = _ProbeSubprocessTime()  # type: ignore[attr-defined]
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", code, grammar],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        finally:
+            if subprocess_time is not None:
+                subprocess.time = subprocess_time  # type: ignore[attr-defined]
     except (OSError, subprocess.TimeoutExpired) as exc:
         _PARSER_PROBE_FAILURE_DETAILS[grammar] = str(exc)
         logger.debug("tree-sitter parser probe failed for %s: %s", grammar, exc)
@@ -3719,7 +3747,13 @@ class CodeParser:
                     edges.append(EdgeInfo(
                         kind="IMPORTS_FROM", source=file_path, target=target,
                         file_path=file_path, line=child.start_point[0] + 1,
-                        extra={"erlang_import_kind": child.type},
+                        extra={
+                            "erlang_import_kind": child.type,
+                            # Keep the source spelling so a post-build
+                            # resolver can restore it after a target/header is
+                            # deleted or becomes ambiguous.
+                            "erlang_raw_target": target,
+                        },
                     ))
             elif child.type == "behaviour_attribute":
                 target = self._erlang_atom_text(child.child_by_field_name("name"))

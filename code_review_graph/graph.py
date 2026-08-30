@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -36,7 +37,7 @@ from .constants import (
     MAX_IMPACT_NODES,
 )
 from .migrations import get_schema_version, run_migrations
-from .parser import EdgeInfo, NodeInfo, normalize_file_path
+from .parser import EdgeInfo, NodeInfo, normalize_file_path, parse_erlang_mfa
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,66 @@ logger = logging.getLogger(__name__)
 # ``EXTENSION_TO_LANGUAGE``; TSX keeps its own grammar name.
 _JAVASCRIPT_LANGUAGE_FAMILY = ("javascript", "typescript", "tsx")
 _JAVASCRIPT_LANGUAGE_FAMILY_SET = frozenset(_JAVASCRIPT_LANGUAGE_FAMILY)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:/|^//")
+_WINDOWS_DRIVE_RELATIVE_PATH_RE = re.compile(r"^[A-Za-z]:(?:$|[^/])")
+
+
+def _graph_path_belongs_to_root(
+    file_path: str | Path,
+    repo_root: str | Path | None,
+    *,
+    allow_relative: bool = False,
+) -> bool:
+    """Check a graph file path against an explicitly selected checkout.
+
+    Graph identities use forward slashes even on Windows.  Relative legacy
+    rows are interpreted under the requested root; absolute rows must remain
+    inside it.  Keeping this check local to the graph layer prevents a shared
+    database from resolving an Erlang MFA against a sibling checkout.
+    """
+    if repo_root is None:
+        return True
+    raw_root = normalize_file_path(str(repo_root))
+    # ``C:foo`` is relative to the process' current directory on drive C,
+    # rather than rooted at ``C:/``.  It has no stable repository boundary;
+    # reject it before either POSIX resolution or the Windows prefix check.
+    if _WINDOWS_DRIVE_RELATIVE_PATH_RE.match(raw_root):
+        return False
+    root_is_windows = bool(_WINDOWS_ABSOLUTE_PATH_RE.match(raw_root))
+    if root_is_windows:
+        root = None
+        root_text = raw_root.rstrip("/")
+    else:
+        root = Path(repo_root).expanduser().resolve(strict=False)
+        root_text = normalize_file_path(root).rstrip("/")
+    raw = normalize_file_path(file_path)
+    if not raw or raw == ".":
+        return False
+    if _WINDOWS_DRIVE_RELATIVE_PATH_RE.match(raw):
+        return False
+    if _WINDOWS_ABSOLUTE_PATH_RE.match(raw):
+        # A Windows-qualified path cannot be resolved reliably on a POSIX
+        # host.  Keep the historical separator/case-insensitive comparison for
+        # that representation, while still rejecting lexical traversal.
+        folded = raw.casefold()
+        expected = root_text.casefold()
+        if "../" in folded or folded.endswith("/.."):
+            return False
+        return folded == expected or folded.startswith(expected + "/")
+    path = Path(raw)
+    if path.is_absolute():
+        if root is None:
+            return False
+        try:
+            path.resolve(strict=False).relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
+    # A relative Erlang row has no repository identity in a shared database:
+    # ``src/worker.erl`` may have originated in any checkout.  Callers that
+    # intentionally preserve the older generic relative-path behavior opt in
+    # explicitly; semantic Erlang lookup remains fail-closed by default.
+    return allow_relative and ".." not in path.parts
 
 # Semantic adapters are optional and their output can originate in external
 # tools. Keep persistence and response paths bounded even when an adapter
@@ -103,6 +164,25 @@ def _semantic_json(value: Any) -> str:
 
 def _semantic_digest(value: Any) -> str:
     return hashlib.sha256(_semantic_json(value).encode("utf-8")).hexdigest()
+
+
+def _safe_extra_mapping(value: Any) -> dict[str, Any]:
+    """Decode optional node/edge metadata without escaping the graph boundary.
+
+    ``extra`` is auxiliary provenance, not graph identity. Legacy databases
+    can therefore contain invalid UTF-8 blobs or deeply nested JSON from an
+    interrupted writer. A malformed value must not make ordinary node/edge
+    reads fail; callers can continue using the stable identity columns.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, (str, bytes, bytearray)):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return {}
+    return dict(decoded) if isinstance(decoded, Mapping) else {}
 
 
 def _decode_semantic_mapping(value: Any) -> dict[str, Any]:
@@ -1332,10 +1412,10 @@ class GraphStore:
                 "indirect": indirect,
             }
 
-        def _has_unresolved_metadata(raw_extra: str | None) -> bool:
+        def _has_unresolved_metadata(raw_extra: Any) -> bool:
             try:
                 edge_extra = json.loads(raw_extra or "{}")
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, ValueError, UnicodeError, RecursionError):
                 return False
             return isinstance(edge_extra, dict) and (
                 "ambiguous_targets" in edge_extra
@@ -1409,7 +1489,14 @@ class GraphStore:
                 if d:
                     results.append(d)
 
-        # Transitive: follow CALLS edges, then collect TESTED_BY on callees
+        # Transitive: follow CALLS edges, then collect TESTED_BY on callees.
+        # This is the historical direction used by non-Erlang parsers (a
+        # production function calls a helper which has a test).  Erlang test
+        # suites commonly invert that shape: a suite calls a helper, which
+        # calls the production function, and the parser mirrors the suite
+        # call as TESTED_BY on the helper.  The reverse walk below handles that
+        # layout only when every endpoint has a canonical Erlang node; generic
+        # or bare targets remain unresolved rather than being guessed.
         frontier = set(input_qns)
         for _ in range(max_depth):
             next_frontier: set[str] = set()
@@ -1423,8 +1510,8 @@ class GraphStore:
                         continue
                     next_frontier.add(row["target_qualified"])
             if len(next_frontier) > max_frontier:
-                next_frontier = set(list(next_frontier)[:max_frontier])
-            for callee in next_frontier:
+                next_frontier = set(sorted(next_frontier)[:max_frontier])
+            for callee in sorted(next_frontier):
                 # A bare callee has no stable identity. Endpoint resolution
                 # qualifies it when graph evidence exists; otherwise following
                 # TESTED_BY here would attribute every same-named test.
@@ -1445,6 +1532,82 @@ class GraphStore:
                             results.append(d)
             frontier = next_frontier
 
+        # Erlang's parser stores a TESTED_BY mirror on the function directly
+        # called by a test.  To answer tests_for(production), walk incoming
+        # canonical CALLS edges (test/helper -> production) and inspect each
+        # caller's TESTED_BY mirror.  Restrict the traversal to Erlang source
+        # nodes and preserve the same frontier cap as the forward walk.
+        erlang_input = False
+        for qn in input_qns:
+            input_row = conn.execute(
+                "SELECT language FROM nodes WHERE qualified_name = ?", (qn,)
+            ).fetchone()
+            if input_row and str(input_row["language"] or "").casefold() == "erlang":
+                erlang_input = True
+                break
+        if erlang_input and max_depth > 0:
+            reverse_frontier = set(input_qns)
+            reverse_seen = set(input_qns)
+            for _ in range(max_depth):
+                reverse_next: set[str] = set()
+                for qn in sorted(reverse_frontier):
+                    rows = conn.execute(
+                        "SELECT e.source_qualified, e.extra "
+                        "FROM edges e JOIN nodes n "
+                        "ON n.qualified_name = e.source_qualified "
+                        "WHERE e.target_qualified = ? AND e.kind = 'CALLS' "
+                        "AND n.language = 'erlang'",
+                        (qn,),
+                    ).fetchall()
+                    for row in rows:
+                        caller = str(row["source_qualified"] or "")
+                        if "::" not in caller or caller in reverse_seen:
+                            continue
+                        if _has_unresolved_metadata(row["extra"]):
+                            continue
+                        # Do not allow an edge to a missing/deleted node to
+                        # become a synthetic traversal endpoint.
+                        caller_row = conn.execute(
+                            "SELECT 1 FROM nodes WHERE qualified_name = ?",
+                            (caller,),
+                        ).fetchone()
+                        if caller_row is None:
+                            continue
+                        reverse_next.add(caller)
+                if len(reverse_next) > max_frontier:
+                    reverse_next = set(sorted(reverse_next)[:max_frontier])
+                for caller in sorted(reverse_next):
+                    for row in conn.execute(
+                        "SELECT target_qualified, extra FROM edges "
+                        "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
+                        (caller,),
+                    ).fetchall():
+                        if _has_unresolved_metadata(row["extra"]):
+                            continue
+                        test_qn = str(row["target_qualified"] or "")
+                        if "::" not in test_qn or test_qn in seen:
+                            continue
+                        test_row = conn.execute(
+                            "SELECT * FROM nodes WHERE qualified_name = ?",
+                            (test_qn,),
+                        ).fetchone()
+                        if not test_row or str(test_row["language"] or "").casefold() != "erlang":
+                            continue
+                        if not bool(test_row["is_test"]):
+                            continue
+                        seen.add(test_qn)
+                        results.append({
+                            "name": test_row["name"],
+                            "qualified_name": test_row["qualified_name"],
+                            "file_path": test_row["file_path"],
+                            "kind": test_row["kind"],
+                            "indirect": True,
+                        })
+                reverse_seen.update(reverse_next)
+                reverse_frontier = reverse_next
+                if not reverse_frontier:
+                    break
+
         return results
 
     @staticmethod
@@ -1461,7 +1624,11 @@ class GraphStore:
         ]
         return supported[0] if len(supported) == 1 else None
 
-    def resolve_bare_call_targets(self) -> int:
+    def resolve_bare_call_targets(
+        self,
+        *,
+        repo_root: str | Path | None = None,
+    ) -> int:
         """Resolve bare CALLS targets backed by same-file or import evidence.
 
         After parsing, some CALLS edges have bare targets (no ``::`` separator)
@@ -1470,9 +1637,293 @@ class GraphStore:
         matching helper by coincidence. The candidate must be in the call-site
         file or in exactly one file imported by that file.
 
+        Erlang remote MFA targets are handled first when their module,
+        function, and arity identify exactly one repository-local node.  This
+        uses explicit remote-call syntax plus the indexed node identity as
+        evidence; unresolved and ambiguous MFAs remain bare.
+
         Returns the number of resolved edges.
         """
-        return self._resolve_bare_endpoints("CALLS", "target_qualified")
+        resolved = self.resolve_erlang_remote_call_targets(repo_root=repo_root)
+        return resolved + self._resolve_bare_endpoints(
+            "CALLS", "target_qualified", repo_root=repo_root,
+        )
+
+    def resolve_erlang_remote_call_targets(
+        self,
+        *,
+        repo_root: str | Path | None = None,
+    ) -> int:
+        """Resolve unique repository-local Erlang remote MFA call targets.
+
+        Generic Erlang parsing intentionally preserves cross-module calls as
+        ``module:function/arity`` until a repository index can identify the
+        defining module.  A target is promoted only when the indexed MFA has
+        exactly one candidate.  External OTP calls, malformed/dynamic forms,
+        and duplicate module identities stay unresolved so this pass cannot
+        manufacture a cross-file edge from a name-only coincidence.
+
+        Parser-generated ``TESTED_BY`` mirrors copy the original CALLS target.
+        When a CALLS edge is promoted, mirrors at the same source/file/line are
+        updated atomically so tests_for can follow the canonical helper chain.
+
+        Returns the number of CALLS endpoints whose target changed.
+        """
+        conn = self._conn
+        rows = conn.execute(
+            "SELECT e.id, e.source_qualified, e.target_qualified, "
+            "e.file_path, e.line, e.extra, s.file_path AS source_file_path "
+            "FROM edges e JOIN nodes s "
+            "ON s.qualified_name = e.source_qualified "
+            "WHERE e.kind = 'CALLS' AND lower(s.language) = 'erlang' "
+            "AND (e.target_qualified NOT LIKE '%::%' "
+            "OR e.extra LIKE '%\"erlang_raw_target\"%') "
+            "ORDER BY e.id",
+        ).fetchall()
+        if repo_root is not None:
+            rows = [
+                row for row in rows
+                if _graph_path_belongs_to_root(row["file_path"], repo_root)
+                and _graph_path_belongs_to_root(
+                    row["source_file_path"], repo_root,
+                )
+            ]
+        if not rows:
+            return 0
+
+        resolved = 0
+        changed = False
+        if repo_root is None:
+            repository = None
+        else:
+            raw_repository = normalize_file_path(repo_root).rstrip("/")
+            if _WINDOWS_ABSOLUTE_PATH_RE.match(raw_repository):
+                repository = raw_repository
+            else:
+                try:
+                    repository = normalize_file_path(
+                        Path(repo_root).expanduser().resolve(strict=False)
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    repository = raw_repository
+        source_revision = (
+            self.get_metadata("git_head_sha")
+            or self.get_metadata("svn_revision")
+        )
+        generated_data_revision = self.get_metadata(
+            "generated_data_revision"
+        )
+        resolution_metadata_keys = (
+            "ambiguous_targets",
+            "ambiguous_target_count",
+            "ambiguous_targets_truncated",
+            "unresolved_targets",
+            "unresolved_target_count",
+            "unresolved_targets_truncated",
+        )
+
+        def _decode_extra(raw: Any) -> dict[str, Any]:
+            if isinstance(raw, dict):
+                return dict(raw)
+            try:
+                value = json.loads(raw or "{}")
+            except (
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+                RecursionError,
+            ):
+                return {}
+            return dict(value) if isinstance(value, dict) else {}
+
+        def _provenance(raw_target: str) -> dict[str, Any]:
+            """Describe the Generic evidence used by this resolver pass."""
+            return {
+                "source": "generic",
+                "tool": "code-review-graph",
+                "tool_version": None,
+                "otp_version": None,
+                "repository": repository,
+                "source_revision": source_revision,
+                "generated_data_revision": generated_data_revision,
+                "configuration_digest": None,
+                "query_kind": "mfa_resolution",
+                "query_targets": [raw_target],
+                "status": "ok",
+                "analysis_key": None,
+                "command": [],
+                "duration_seconds": None,
+                "cache_state": None,
+            }
+
+        def _state_extra(
+            base: dict[str, Any],
+            raw_target: str,
+            state: str,
+            candidates: list[str],
+            candidate_count: int | None = None,
+        ) -> dict[str, Any]:
+            """Build deterministic metadata for one MFA resolution state."""
+            desired = dict(base)
+            desired["erlang_raw_target"] = raw_target
+            desired["erlang_resolution"] = state
+            desired["provenance"] = _provenance(raw_target)
+            for key in resolution_metadata_keys:
+                desired.pop(key, None)
+            if state in {"ambiguous", "unresolved"}:
+                total = (
+                    len(candidates)
+                    if candidate_count is None
+                    else max(0, int(candidate_count))
+                )
+                desired[f"{state}_targets"] = candidates[:20]
+                desired[f"{state}_target_count"] = total
+                desired[f"{state}_targets_truncated"] = total > 20
+            return desired
+
+        def _sync_mirrors(
+            edge: sqlite3.Row,
+            old_target: str,
+            desired_target: str,
+            raw_target: str,
+            state: str,
+            candidates: list[str],
+            candidate_count: int | None = None,
+        ) -> bool:
+            """Keep parser-generated TESTED_BY mirrors aligned with CALLS."""
+            mirrors = conn.execute(
+                "SELECT id, source_qualified, target_qualified, file_path, "
+                "line, extra FROM edges WHERE kind = 'TESTED_BY' "
+                "AND target_qualified = ? AND file_path = ? AND line = ?",
+                (edge["source_qualified"], edge["file_path"], edge["line"]),
+            ).fetchall()
+            mirror_changed = False
+            for mirror in mirrors:
+                if repo_root is not None and not _graph_path_belongs_to_root(
+                    mirror["file_path"], repo_root,
+                ):
+                    continue
+                mirror_extra = _decode_extra(mirror["extra"])
+                raw_value = mirror_extra.get("erlang_raw_target")
+                mirror_raw = (
+                    raw_value.strip() if isinstance(raw_value, str) else ""
+                )
+                mirror_source = str(mirror["source_qualified"] or "")
+                # A hand-authored edge at the same call site must not be
+                # rewritten merely because another mirror shares its location.
+                if (
+                    mirror_source.strip()
+                    not in {
+                        old_target.strip(),
+                        desired_target.strip(),
+                        raw_target.strip(),
+                    }
+                    and mirror_raw != raw_target.strip()
+                ):
+                    continue
+                desired_source = desired_target if state == "mfa_index" else raw_target
+                desired_extra = _state_extra(
+                    mirror_extra, raw_target, state, candidates, candidate_count,
+                )
+                if (
+                    mirror_source == desired_source
+                    and mirror_extra == desired_extra
+                ):
+                    continue
+                conn.execute(
+                    "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+                    (
+                        desired_source,
+                        json.dumps(desired_extra, sort_keys=True),
+                        mirror["id"],
+                    ),
+                )
+                mirror_changed = True
+            return mirror_changed
+
+        for edge in rows:
+            edge_extra = _decode_extra(edge["extra"])
+            current_target = str(edge["target_qualified"] or "")
+            raw_value = edge_extra.get("erlang_raw_target")
+            raw_text = raw_value.strip() if isinstance(raw_value, str) else ""
+            managed_raw = bool(raw_text)
+            raw_target = raw_text if managed_raw else current_target.strip()
+            canonical_target = "::" in current_target
+            # A managed raw spelling cannot override a changed bare endpoint.
+            # Canonical targets are intentionally different from raw MFAs and
+            # are re-evaluated below when they carry owned raw metadata.
+            if managed_raw and not canonical_target and (
+                raw_target != current_target.strip()
+            ):
+                continue
+            if canonical_target and not managed_raw:
+                # No owned raw MFA means this may be a generic canonical edge.
+                continue
+            try:
+                parsed = parse_erlang_mfa(raw_target, require_module=True)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if parsed is None:
+                continue
+            module, function, arity = parsed
+            if module is None:
+                continue
+            candidates = self.find_erlang_mfa(
+                module,
+                function,
+                arity,
+                limit=21,
+                repo_root=repo_root,
+            )
+            candidate_names = [node.qualified_name for node in candidates]
+            if len(candidates) > 20:
+                candidate_count = self.count_erlang_mfa(
+                    module, function, arity, repo_root=repo_root,
+                )
+            else:
+                candidate_count = len(candidates)
+
+            if candidate_count == 1 and candidates:
+                state = "mfa_index"
+                desired_target = candidates[0].qualified_name
+                metadata_count = candidate_count
+            elif candidate_count > 1:
+                state = "ambiguous"
+                desired_target = raw_target
+                metadata_count = candidate_count
+            else:
+                state = "unresolved"
+                desired_target = raw_target
+                metadata_count = 0
+            desired_extra = _state_extra(
+                edge_extra, raw_target, state, candidate_names, metadata_count,
+            )
+            serialized_extra = json.dumps(desired_extra, sort_keys=True)
+            target_changed = current_target != desired_target
+            extra_changed = edge_extra != desired_extra
+            if target_changed or extra_changed:
+                conn.execute(
+                    "UPDATE edges SET target_qualified = ?, extra = ? "
+                    "WHERE id = ?",
+                    (desired_target, serialized_extra, edge["id"]),
+                )
+                changed = True
+            if target_changed:
+                resolved += 1
+            mirror_changed = _sync_mirrors(
+                edge,
+                current_target,
+                desired_target,
+                raw_target,
+                state,
+                candidate_names,
+                metadata_count,
+            )
+            changed = changed or mirror_changed
+
+        if changed:
+            conn.commit()
+        return resolved
 
     def resolve_cpp_scoped_call_targets(self) -> int:
         """Resolve cross-file C++ ``Scope::call`` targets by stable scope identity.
@@ -1681,7 +2132,11 @@ class GraphStore:
             self._conn.commit()
         return resolved
 
-    def resolve_bare_tested_by_sources(self) -> int:
+    def resolve_bare_tested_by_sources(
+        self,
+        *,
+        repo_root: str | Path | None = None,
+    ) -> int:
         """Resolve bare TESTED_BY sources backed by graph evidence.
 
         TESTED_BY edges copy the target of a test's CALLS edge, so unresolved
@@ -1691,27 +2146,43 @@ class GraphStore:
 
         Returns the number of resolved edges.
         """
-        return self._resolve_bare_endpoints("TESTED_BY", "source_qualified")
+        return self._resolve_bare_endpoints(
+            "TESTED_BY", "source_qualified", repo_root=repo_root,
+        )
 
-    def _resolve_bare_endpoints(self, kind: str, endpoint: str) -> int:
+    def _resolve_bare_endpoints(
+        self,
+        kind: str,
+        endpoint: str,
+        *,
+        repo_root: str | Path | None = None,
+    ) -> int:
         """Resolve a bare edge endpoint only when one candidate has evidence."""
         if endpoint == "target_qualified":
             raw_key = "bare_call_target"
             endpoint_column = "target_qualified"
             select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path, extra "
-                "FROM edges WHERE kind = ? "
-                "AND (target_qualified NOT LIKE '%::%' "
-                "OR extra LIKE '%\"bare_call_target\"%')"
+                "SELECT e.id, e.source_qualified, e.target_qualified, e.file_path, e.extra, "
+                "s.language AS source_language, t.language AS target_language "
+                "FROM edges e "
+                "LEFT JOIN nodes s ON s.qualified_name = e.source_qualified "
+                "LEFT JOIN nodes t ON t.qualified_name = e.target_qualified "
+                "WHERE e.kind = ? "
+                "AND (e.target_qualified NOT LIKE '%::%' "
+                "OR e.extra LIKE '%\"bare_call_target\"%')"
             )
         elif endpoint == "source_qualified":
             raw_key = "bare_tested_by_source"
             endpoint_column = "source_qualified"
             select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path, extra "
-                "FROM edges WHERE kind = ? "
-                "AND (source_qualified NOT LIKE '%::%' "
-                "OR extra LIKE '%\"bare_tested_by_source\"%')"
+                "SELECT e.id, e.source_qualified, e.target_qualified, e.file_path, e.extra, "
+                "s.language AS source_language, t.language AS target_language "
+                "FROM edges e "
+                "LEFT JOIN nodes s ON s.qualified_name = e.source_qualified "
+                "LEFT JOIN nodes t ON t.qualified_name = e.target_qualified "
+                "WHERE e.kind = ? "
+                "AND (e.source_qualified NOT LIKE '%::%' "
+                "OR e.extra LIKE '%\"bare_tested_by_source\"%')"
             )
         else:
             raise ValueError(f"Invalid edge endpoint column: {endpoint!r}")
@@ -1719,15 +2190,34 @@ class GraphStore:
         conn = self._conn
 
         bare_edges = conn.execute(select_sql, (kind,)).fetchall()
+        if repo_root is not None:
+            bare_edges = [
+                row for row in bare_edges
+                if _graph_path_belongs_to_root(
+                    row["file_path"],
+                    repo_root,
+                    allow_relative=(
+                        str(row["source_language"] or row["target_language"] or "")
+                        .casefold()
+                        != "erlang"
+                    ),
+                )
+            ]
         if not bare_edges:
             return 0
 
         # bare_name -> [(qualified_name, defining_file)]
         node_lookup: dict[str, list[tuple[str, str]]] = {}
         for row in conn.execute(
-            "SELECT name, qualified_name, file_path FROM nodes "
+            "SELECT name, qualified_name, file_path, language FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
+            if repo_root is not None and not _graph_path_belongs_to_root(
+                row["file_path"],
+                repo_root,
+                allow_relative=str(row["language"] or "").casefold() != "erlang",
+            ):
+                continue
             node_lookup.setdefault(row["name"], []).append(
                 (row["qualified_name"], row["file_path"]),
             )
@@ -1744,13 +2234,24 @@ class GraphStore:
             "SELECT DISTINCT file_path, target_qualified, extra FROM edges "
             "WHERE kind = 'IMPORTS_FROM'"
         ).fetchall():
+            try:
+                decoded_import = json.loads(row["extra"] or "{}")
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                decoded_import = {}
+            erlang_import = (
+                isinstance(decoded_import, dict)
+                and bool(decoded_import.get("erlang_import_kind"))
+            ) or str(row["file_path"] or "").replace("\\", "/").casefold().endswith(
+                (".erl", ".hrl", ".app.src")
+            )
+            if repo_root is not None and not _graph_path_belongs_to_root(
+                row["file_path"], repo_root, allow_relative=not erlang_import,
+            ):
+                continue
             target = row["target_qualified"]
             target_file = target.split("::", 1)[0] if "::" in target else target
             import_targets.setdefault(row["file_path"], set()).add(target_file)
-            try:
-                import_extra = json.loads(row["extra"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                import_extra = {}
+            import_extra = decoded_import
             if (
                 isinstance(import_extra, dict)
                 and import_extra.get("import_resolution") == "ambiguous"
@@ -1774,6 +2275,10 @@ class GraphStore:
             "SELECT file_path, extra FROM nodes "
             "WHERE kind = 'File' AND extra LIKE '%\"csharp_namespaces\"%'"
         ).fetchall():
+            if repo_root is not None and not _graph_path_belongs_to_root(
+                row["file_path"], repo_root, allow_relative=True,
+            ):
+                continue
             try:
                 node_extra = json.loads(row["extra"] or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -1923,7 +2428,12 @@ class GraphStore:
         # inventory and are managed by their owning resolver.
         rows = self._conn.execute(
             "SELECT file_path FROM nodes "
-            "WHERE json_extract(extra, '$.virtual') IS NULL "
+            # SQLite may evaluate json_extract on legacy BLOB/deeply nested
+            # metadata before a validity predicate. Keep the extraction in a
+            # CASE expression so malformed optional metadata cannot abort file
+            # inventory and incremental reconciliation.
+            "WHERE CASE WHEN typeof(extra) = 'text' AND json_valid(extra) = 1 "
+            "THEN json_extract(extra, '$.virtual') ELSE NULL END IS NULL "
             "UNION "
             "SELECT file_path FROM edges "
             "ORDER BY file_path"
@@ -1993,6 +2503,7 @@ class GraphStore:
         arity: int,
         *,
         limit: int | None = None,
+        repo_root: str | Path | None = None,
     ) -> list[GraphNode]:
         """Return bounded repository-local matches for an Erlang MFA alias.
 
@@ -2013,11 +2524,19 @@ class GraphStore:
         sql = (
             "SELECT * FROM nodes WHERE language = 'erlang' "
             "AND kind IN ('Function', 'Test') AND parent_name = ? "
-            "AND COALESCE(json_extract(extra, '$.erlang_kind'), '') != 'callback' "
+            "AND (extra IS NULL OR (typeof(extra) = 'text' "
+            "AND json_valid(extra) = 1)) "
+            "AND COALESCE("
+            "CASE WHEN json_valid(extra) THEN "
+            "json_extract(extra, '$.erlang_kind') END, ''"
+            ") != 'callback' "
             "AND substr(qualified_name, -length(?)) = ? ORDER BY qualified_name"
         )
         params: list[Any] = [module_value, suffix, suffix]
-        if limit is not None:
+        # Apply the SQL limit only when no repository scope is requested.  A
+        # shared store may have foreign rows ordered before the local match;
+        # filtering after a small SQL LIMIT would incorrectly hide that match.
+        if limit is not None and repo_root is None:
             try:
                 limit_value = max(0, min(int(limit), 10_000))
             except (TypeError, ValueError, OverflowError):
@@ -2025,14 +2544,40 @@ class GraphStore:
             sql += " LIMIT ?"
             params.append(limit_value)
         rows = self._conn.execute(sql, params).fetchall()
-        return [
+        candidates = [
             self._row_to_node(row)
             for row in rows
             if row["qualified_name"].endswith(suffix)
         ]
+        if repo_root is not None:
+            candidates = [
+                node
+                for node in candidates
+                if _graph_path_belongs_to_root(node.file_path, repo_root)
+            ]
+            if limit is not None:
+                try:
+                    limit_value = max(0, min(int(limit), 10_000))
+                except (TypeError, ValueError, OverflowError):
+                    limit_value = 10_000
+                candidates = candidates[:limit_value]
+        return candidates
 
-    def count_erlang_mfa(self, module: str, function: str, arity: int) -> int:
-        """Count repository-local Erlang MFA matches without loading rows."""
+    def count_erlang_mfa(
+        self,
+        module: str,
+        function: str,
+        arity: int,
+        *,
+        repo_root: str | Path | None = None,
+    ) -> int:
+        """Count Erlang MFA matches, optionally scoped to one checkout.
+
+        A shared ``GraphStore`` can contain nodes from several repositories.
+        Keep the unscoped form for legacy callers, but apply the same path
+        boundary as :meth:`find_erlang_mfa` whenever a repository root is
+        supplied so ambiguity checks cannot count foreign definitions.
+        """
         try:
             arity_value = int(arity)
         except (TypeError, ValueError, OverflowError):
@@ -2040,14 +2585,32 @@ class GraphStore:
         if arity_value < 0 or arity_value > 255:
             return 0
         suffix = f".{function}/{arity_value}"
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS count FROM nodes WHERE language = 'erlang' "
+        where_sql = (
+            "FROM nodes WHERE language = 'erlang' "
             "AND kind IN ('Function', 'Test') AND parent_name = ? "
-            "AND COALESCE(json_extract(extra, '$.erlang_kind'), '') != 'callback' "
-            "AND substr(qualified_name, -length(?)) = ?",
-            (str(module), suffix, suffix),
-        ).fetchone()
-        return int(row["count"] if row else 0)
+            "AND (extra IS NULL OR (typeof(extra) = 'text' "
+            "AND json_valid(extra) = 1)) "
+            "AND COALESCE("
+            "CASE WHEN json_valid(extra) THEN "
+            "json_extract(extra, '$.erlang_kind') END, ''"
+            ") != 'callback' "
+            "AND substr(qualified_name, -length(?)) = ?"
+        )
+        params = (str(module), suffix, suffix)
+        if repo_root is None:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count " + where_sql,
+                params,
+            ).fetchone()
+            return int(row["count"] if row else 0)
+        rows = self._conn.execute(
+            "SELECT file_path " + where_sql,
+            params,
+        ).fetchall()
+        return sum(
+            _graph_path_belongs_to_root(row["file_path"], repo_root)
+            for row in rows
+        )
 
     def count_search_nodes(self, query: str) -> int:
         """Count nodes using the same FTS-first semantics as ``search_nodes``."""
@@ -2993,11 +3556,11 @@ class GraphStore:
             return_type=row["return_type"],
             is_test=bool(row["is_test"]),
             file_hash=row["file_hash"],
-            extra=json.loads(row["extra"]) if row["extra"] else {},
+            extra=_safe_extra_mapping(row["extra"]),
         )
 
     def _row_to_edge(self, row: sqlite3.Row) -> GraphEdge:
-        extra = json.loads(row["extra"]) if row["extra"] else {}
+        extra = _safe_extra_mapping(row["extra"])
         confidence = row["confidence"] if "confidence" in row.keys() else 1.0
         confidence_tier = row["confidence_tier"] if "confidence_tier" in row.keys() else "EXTRACTED"
         return GraphEdge(

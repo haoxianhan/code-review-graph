@@ -567,6 +567,70 @@ class TestGraphStore:
         )
         assert match["indirect"] is True
 
+    def test_get_transitive_tests_ignores_malformed_edge_metadata(self):
+        """Corrupt edge metadata must not abort direct or transitive lookup.
+
+        ``extra`` is optional provenance, so rows written by older or
+        interrupted writers can contain invalid bytes or an excessively deep
+        JSON value.  The graph query should keep using the edge identity and
+        remain fail-soft in both traversal paths.
+        """
+        production_qn = "/src/prod.py::produce"
+        helper_qn = "/src/helper.py::prepare"
+        direct_test_qn = "/tests/direct.py::test_direct"
+        transitive_test_qn = "/tests/transitive.py::test_helper"
+
+        self.store.upsert_node(self._make_file_node("/src/prod.py"))
+        self.store.upsert_node(self._make_func_node("produce", "/src/prod.py"))
+        self.store.upsert_node(self._make_file_node("/src/helper.py"))
+        self.store.upsert_node(self._make_func_node("prepare", "/src/helper.py"))
+        self.store.upsert_node(self._make_file_node("/tests/direct.py"))
+        self.store.upsert_node(self._make_func_node(
+            "test_direct", "/tests/direct.py", is_test=True,
+        ))
+        self.store.upsert_node(self._make_file_node("/tests/transitive.py"))
+        self.store.upsert_node(self._make_func_node(
+            "test_helper", "/tests/transitive.py", is_test=True,
+        ))
+
+        direct_edge_id = self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY",
+            source=production_qn,
+            target=direct_test_qn,
+            file_path="/tests/direct.py",
+            line=1,
+        ))
+        calls_edge_id = self.store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source=production_qn,
+            target=helper_qn,
+            file_path="/src/prod.py",
+            line=2,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY",
+            source=helper_qn,
+            target=transitive_test_qn,
+            file_path="/tests/transitive.py",
+            line=1,
+        ))
+        # Bypass the normal JSON serializer to model corrupt persisted rows.
+        self.store._conn.execute(
+            "UPDATE edges SET extra = ? WHERE id = ?",
+            (sqlite3.Binary(b"\xff"), direct_edge_id),
+        )
+        deeply_nested_json = "[" * 100_000 + "]" * 100_000
+        self.store._conn.execute(
+            "UPDATE edges SET extra = ? WHERE id = ?",
+            (deeply_nested_json, calls_edge_id),
+        )
+        self.store.commit()
+
+        results = self.store.get_transitive_tests(production_qn, max_depth=1)
+        by_qn = {result["qualified_name"]: result for result in results}
+        assert by_qn[direct_test_qn]["indirect"] is False
+        assert by_qn[transitive_test_qn]["indirect"] is True
+
     def test_parse_store_get_transitive_tests_end_to_end(self):
         """End-to-end producer->store->consumer guard for #515.
 
