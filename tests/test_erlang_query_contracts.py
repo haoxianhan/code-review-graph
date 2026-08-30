@@ -170,6 +170,53 @@ def test_semantic_evidence_round_trip_is_visible_for_mfa_query(tmp_path: Path):
     assert result["semantic_diagnostics"][0]["code"] == "elp_note"
 
 
+def test_semantic_query_discards_evidence_from_stale_source_revision(tmp_path: Path):
+    root = _repo(tmp_path)
+    caller_file, _worker_file = _seed_erlang(root)
+    old_key, old_evidence, old_diagnostic = _semantic_records(root, caller_file)
+    current_toolchain = ToolchainIdentity(
+        repository=root.as_posix(),
+        source_revision="revision-2",
+        otp_version="27",
+        elp_executable="/opt/elp",
+        elp_version="0.12.0",
+    )
+    current_key = AnalysisKey.from_toolchain(
+        current_toolchain, "elp", "callers_of", "worker:run/0"
+    )
+    current_provenance = Provenance.from_key(current_key)
+    current_evidence = EvidenceRecord(
+        kind="CALLS",
+        source=old_evidence.source,
+        target=old_evidence.target,
+        file_path=old_evidence.file_path,
+        line=old_evidence.line,
+        provenance=current_provenance,
+    )
+    current_diagnostic = Diagnostic(
+        code="elp_current", message="current warning", provenance=current_provenance
+    )
+    with GraphStore(root / ".code-review-graph" / "graph.db") as store:
+        store.set_metadata("git_head_sha", "revision-2")
+        store.store_semantic_snapshot(
+            {"evidence": [old_evidence], "diagnostics": [old_diagnostic]},
+            analysis_key=old_key,
+            purge_stale=False,
+        )
+        store.store_semantic_snapshot(
+            {"evidence": [current_evidence], "diagnostics": [current_diagnostic]},
+            analysis_key=current_key,
+            purge_stale=False,
+        )
+
+    result = query_graph("callers_of", "worker:run/0", repo_root=str(root))
+
+    assert [item["provenance"]["source_revision"] for item in result["semantic_evidence"]] == [
+        "revision-2"
+    ]
+    assert [item["code"] for item in result["semantic_diagnostics"]] == ["elp_current"]
+
+
 def test_unrelated_targetless_diagnostic_is_not_leaked_into_scoped_query(
     tmp_path: Path,
 ):

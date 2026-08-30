@@ -130,6 +130,60 @@ def _semantic_record_matches(
     return False
 
 
+def _current_semantic_scope(store: GraphStore, root: Path) -> dict[str, str | None]:
+    """Return repository scope fields that the graph can verify locally.
+
+    Semantic records are keyed by a complete adapter analysis key, but normal
+    review queries intentionally do not know which adapter produced them. The
+    graph metadata still provides a conservative current scope for fields that
+    are independently observable. Missing values remain unknown rather than
+    being guessed from an old record.
+    """
+    scope: dict[str, str | None] = {
+        "repository": normalize_file_path(root),
+        "source_revision": None,
+        "generated_data_revision": None,
+        "configuration_digest": None,
+        "otp_version": None,
+    }
+    try:
+        scope["source_revision"] = (
+            store.get_metadata("git_head_sha")
+            or store.get_metadata("svn_revision")
+            or _read_live_git_head(root)
+        )
+        for field in (
+            "generated_data_revision",
+            "configuration_digest",
+            "otp_version",
+        ):
+            value = store.get_metadata(field)
+            if isinstance(value, str) and value:
+                scope[field] = value
+    except Exception:
+        logger.debug("Could not read semantic graph scope", exc_info=True)
+    return scope
+
+
+def _semantic_scope_matches(
+    record: Mapping[str, Any], scope: Mapping[str, str | None]
+) -> bool:
+    """Reject semantic records whose known provenance is from another scope."""
+    provenance = record.get("provenance")
+    if not isinstance(provenance, Mapping):
+        # Without provenance there is no safe way to validate a known current
+        # revision. Legacy records remain usable only when the current scope
+        # itself is unknown.
+        return not any(scope.get(field) for field in scope if field != "repository")
+    for field, expected in scope.items():
+        if expected is None:
+            continue
+        observed = provenance.get(field)
+        if observed is None or str(observed) != expected:
+            return False
+    return True
+
+
 def _read_semantic_context(
     store: GraphStore,
     root: Path,
@@ -167,6 +221,7 @@ def _read_semantic_context(
         "semantic_evidence": [],
         "semantic_diagnostics": [],
     }
+    semantic_scope = _current_semantic_scope(store, root)
     matched_analysis_keys: set[str] = set()
     try:
         if include_evidence:
@@ -175,7 +230,9 @@ def _read_semantic_context(
             )
             for item in raw_evidence:
                 record = _semantic_response_record(item)
-                if record is None or not _semantic_record_matches(
+                if record is None or not _semantic_scope_matches(
+                    record, semantic_scope
+                ) or not _semantic_record_matches(
                     record, endpoints=endpoint_values, files=file_values,
                 ):
                     continue
@@ -198,7 +255,7 @@ def _read_semantic_context(
         )
         for item in raw_diagnostics:
             record = _semantic_response_record(item)
-            if record is None:
+            if record is None or not _semantic_scope_matches(record, semantic_scope):
                 continue
             provenance = record.get("provenance")
             same_query = (
