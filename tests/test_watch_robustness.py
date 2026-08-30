@@ -871,6 +871,96 @@ class TestWatchLoop:
         assert (str(tmp_path / "src"), True) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
 
+    def test_stop_bounds_a_debouncer_join_that_ignores_timeout(self, tmp_path):
+        """A broken debouncer join cannot hold watcher teardown forever."""
+        from watchdog.utils.event_debouncer import EventDebouncer
+
+        class StuckJoinDebouncer(EventDebouncer):
+            def join(self, timeout=None):
+                # Deliberately ignore the timeout to model a third-party
+                # implementation that wedges while joining its worker.
+                threading.Event().wait()
+
+        store = GraphStore(tmp_path / "graph.db")
+        try:
+            with (
+                patch(
+                    "watchdog.utils.event_debouncer.EventDebouncer",
+                    StuckJoinDebouncer,
+                ),
+                patch("code_review_graph.incremental._WATCH_STOP_TIMEOUT", 0.05),
+            ):
+                handler = _create_watch_handler(tmp_path, store, None)
+                handler.start()
+                started = time.monotonic()
+                handler.stop()
+                elapsed = time.monotonic() - started
+
+            assert elapsed < 1.0
+            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
+                handler.raise_if_failed()
+            assert isinstance(exc_info.value.__cause__, TimeoutError)
+            assert "debouncer join" in str(exc_info.value.__cause__)
+        finally:
+            handler.stop()
+            store.close()
+
+    def test_stop_bounds_a_callback_that_never_returns(self, tmp_path):
+        """An inflight update callback is bounded by the same teardown deadline."""
+        from watchdog.events import FileCreatedEvent
+        from watchdog.utils.event_debouncer import EventDebouncer
+
+        class FastJoinDebouncer(EventDebouncer):
+            def join(self, timeout=None):
+                # Leave callback completion to the lifecycle condition below;
+                # this isolates the inflight-batch wait from the worker join.
+                return None
+
+        source = tmp_path / "blocked.py"
+        source.write_text("def blocked():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+        callback_exited = threading.Event()
+        release_callback = threading.Event()
+
+        def blocking_callback(_store):
+            callback_entered.set()
+            try:
+                release_callback.wait()
+            finally:
+                callback_exited.set()
+
+        with patch(
+            "watchdog.utils.event_debouncer.EventDebouncer", FastJoinDebouncer
+        ):
+            handler = _create_watch_handler(tmp_path, store, blocking_callback)
+        try:
+            with patch("code_review_graph.incremental._WATCH_STOP_TIMEOUT", 0.05):
+                handler.start()
+                handler.dispatch(FileCreatedEvent(str(source)))
+                assert callback_entered.wait(5), "debounced callback never ran"
+
+                started = time.monotonic()
+                handler.stop()
+                elapsed = time.monotonic() - started
+
+            assert elapsed < 1.0
+            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
+                handler.raise_if_failed()
+            assert isinstance(exc_info.value.__cause__, TimeoutError)
+            assert "watch update callback" in str(exc_info.value.__cause__)
+        finally:
+            release_callback.set()
+            callback_exited.wait(5)
+            deadline = time.monotonic() + 5
+            with handler._lifecycle_condition:
+                while handler._inflight and time.monotonic() < deadline:
+                    handler._lifecycle_condition.wait(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+            handler.stop()
+            store.close()
+
     def test_postprocess_failure_is_retried_after_hash_only_replay(self, tmp_path):
         """A failed derived pass must survive restart even when parsing is skipped."""
         from watchdog.events import FileModifiedEvent

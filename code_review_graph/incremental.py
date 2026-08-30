@@ -2450,7 +2450,9 @@ def _plan_watch_paths(
     return [(repo_root, True)]
 
 
-def _run_time_boxed(operation: Callable[[], Any], description: str, timeout: float = 10.0) -> None:
+def _run_time_boxed(
+    operation: Callable[[], Any], description: str, timeout: float = 10.0
+) -> bool:
     """Run *operation* on a throwaway thread so a wedged watcher cannot hang exit.
 
     Watchdog's teardown joins its emitter threads, and the whole point of this
