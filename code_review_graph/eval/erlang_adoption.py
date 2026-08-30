@@ -38,6 +38,8 @@ from ..postprocessing import run_post_processing
 from .erlang import (
     DEFAULT_CORPUS,
     DEFAULT_MANIFEST,
+    TOOL_STATUSES,
+    _discover_repository,
     discover_environment,
     load_corpus,
     load_manifest,
@@ -49,6 +51,7 @@ from .erlang import (
 SCHEMA_VERSION = 1
 RESULT_KIND = "erlang_adoption_evaluation"
 DEFAULT_OUTPUT_STEM = "server_flexible_adoption"
+_CORPUS_CONTRACT_VERSION = 1
 _KNOWN_CASE_STATUSES = frozenset({"executed", "not_run", "blocked", "error"})
 _KNOWN_LIFECYCLE_STATUSES = frozenset({"executed", "not_run", "blocked", "error"})
 _SUPPORTED_QUERIES = frozenset(
@@ -87,6 +90,8 @@ _REQUIRED_ADOPTION_GATES = frozenset(
         "working_tree_state_known",
         "remote_identity",
         "dependencies_consistent",
+        "generated_data_consistent",
+        "runtime_policy_enforced",
         "semantic_tools",
         "semantic_adapters_executed",
         "precision_100",
@@ -119,6 +124,7 @@ _REQUIRED_RESULT_KEYS = frozenset(
         "metrics",
         "adoption",
         "diagnostics",
+        "corpus_contract",
     }
 )
 _REQUIRED_METRIC_KEYS = frozenset(
@@ -133,6 +139,48 @@ _REQUIRED_METRIC_KEYS = frozenset(
         "impact",
     }
 )
+
+# Lifecycle runners may add diagnostics and resolver-specific fields, but the
+# phase's core evidence must always be present and typed.  Keeping the minimum
+# contract here prevents a generic ``status: ok`` envelope from being reused
+# for a different phase or from hiding a missing measurement.
+_LIFECYCLE_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
+    "full_build": frozenset({"files_parsed", "errors", "total_nodes", "total_edges"}),
+    "incremental_update": frozenset({"files_updated", "errors", "changed_files", "graph_changed"}),
+    "standalone_postprocess": frozenset(
+        {"bare_edges_resolved", "fts_indexed", "signatures_computed"}
+    ),
+    "forget": frozenset({"forgotten", "reparsed", "embeddings_purged"}),
+    "watch": frozenset({"events", "updates", "graph_changed", "notifications"}),
+}
+_LIFECYCLE_COUNT_FIELDS: frozenset[str] = frozenset(
+    {
+        "files_parsed",
+        "files_updated",
+        "stale_files_removed",
+        "total_nodes",
+        "total_edges",
+        "bare_edges_resolved",
+        "cpp_scoped_edges_resolved",
+        "fts_indexed",
+        "signatures_computed",
+        "flows_detected",
+        "communities_detected",
+        "embeddings_purged",
+    }
+)
+_LIFECYCLE_LIST_FIELDS: frozenset[str] = frozenset(
+    {"changed_files", "dependent_files", "forgotten", "reparsed"}
+)
+_LIFECYCLE_BOOL_FIELDS: frozenset[str] = frozenset(
+    {"graph_changed", "relation_layout_changed"}
+)
+_GENERATED_DATA_MARKERS: tuple[str, ...] = (
+    "tools/gen_data/data_rev_info",
+    "tools/gen_data/server_cfg_structure_version",
+)
+_LATENCY_REQUIRED_OPERATIONS: tuple[str, ...] = ("full_build", "targeted_query")
+_LATENCY_MIN_SAMPLES = 1
 
 
 def _diagnostic(code: str, severity: str, message: str, **details: Any) -> dict[str, Any]:
@@ -758,6 +806,116 @@ def _repository_gates(
     return gates, diagnostics, can_build
 
 
+def _normalise_repository_observation(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the fields returned by the read-only Git observer.
+
+    Paths and unordered status collections are canonicalized before comparing
+    them with a serialized report.  This keeps validation deterministic while
+    still treating every observed value as evidence rather than as a caller
+    supplied verdict.
+    """
+    normalized = dict(value)
+    path = normalized.get("path")
+    if isinstance(path, str) and path:
+        normalized["path"] = str(_canonical_path(path))
+    top_level = normalized.get("top_level")
+    if isinstance(top_level, str) and top_level:
+        normalized["top_level"] = str(_canonical_path(top_level))
+    dirty_paths = normalized.get("dirty_paths")
+    if isinstance(dirty_paths, list):
+        normalized["dirty_paths"] = sorted(str(item) for item in dirty_paths)
+    submodules = normalized.get("submodules")
+    if isinstance(submodules, list):
+        normalized["submodules"] = sorted(
+            [
+                (
+                    dict(item)
+                    if isinstance(item, Mapping)
+                    else {"__malformed__": repr(item)}
+                )
+                for item in submodules
+            ],
+            key=lambda item: str(item.get("path", "")),
+        )
+    return normalized
+
+
+def _validate_repository_observation(
+    target: Mapping[str, Any], repository: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Recompute raw target observations and reject stale/forged reports.
+
+    Adoption reports are commonly persisted and validated later, so checking
+    only relationships between their own fields is insufficient.  Git and
+    filesystem facts are cheap, read-only observations; when the target is
+    present we obtain them again and compare the complete discovery payload.
+    Missing/non-Git targets use the same empty shape as ``discover_environment``
+    and are still checked for internally impossible values.
+    """
+    target_path = target.get("path")
+    if not isinstance(target_path, str) or not target_path:
+        raise ValueError("result.target.path: expected non-empty string")
+    root = _canonical_path(target_path)
+    recorded = _normalise_repository_observation(repository)
+    recorded_path = recorded.get("path")
+    if not isinstance(recorded_path, str) or _canonical_path(recorded_path) != root:
+        raise ValueError("result.environment.repository.path: inconsistent with target.path")
+    if not isinstance(recorded.get("exists"), bool):
+        raise ValueError("result.environment.repository.exists: expected boolean")
+
+    try:
+        observed, _diagnostics = _discover_repository(root)
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        raise ValueError(
+            "result.environment.repository: could not recompute read-only observation"
+        ) from exc
+    expected = _normalise_repository_observation(observed)
+
+    # ``_discover_repository`` always returns the same complete shape.  Keep
+    # the comparison explicit so an additive future field cannot accidentally
+    # become a required compatibility break in old reports.
+    fields = (
+        "path",
+        "exists",
+        "top_level",
+        "revision",
+        "branch",
+        "remote",
+        "working_tree_clean",
+        "dirty_paths",
+        "submodules",
+    )
+    for field in fields:
+        # Remote identity is checked after the report's gate/verdict reducer.
+        # Deferring that one field preserves the useful ``adoption.verdict``
+        # diagnostic when a caller consistently forges the remote and gate
+        # values together, while still returning the fresh observation for a
+        # final exact comparison before validation succeeds.
+        if field == "remote":
+            continue
+        if recorded.get(field) != expected.get(field):
+            raise ValueError(
+                f"result.environment.repository.{field}: inconsistent with current checkout"
+            )
+
+    if target.get("observed_revision") != recorded.get("revision"):
+        raise ValueError("result.target.observed_revision: inconsistent with repository.revision")
+    if target.get("working_tree_clean") != recorded.get("working_tree_clean"):
+        raise ValueError(
+            "result.target.working_tree_clean: inconsistent with repository.working_tree_clean"
+        )
+
+    # A pinned report can only claim the gate when the requested revision is
+    # the revision actually observed.  The manifest's separate ``observed``
+    # field is unavailable for in-memory reports, so do not infer a positive
+    # gate when the producer already reported a mismatch.
+    if target.get("requested_revision") is not None and not isinstance(
+        target.get("requested_revision"), str
+    ):
+        raise ValueError("result.target.requested_revision: expected string or null")
+    return expected
+
+
 def _node_record(node: GraphNode, root: Path) -> dict[str, Any]:
     return {
         "kind": node.kind,
@@ -998,8 +1156,16 @@ def _endpoint_aliases(endpoint: Any, root: Path, store: GraphStore | None = None
                     f"{module}.{name}/{parsed_arity}",
                 }
             )
-            if store is not None and store.count_erlang_mfa(module, name, parsed_arity) == 1:
-                mfa_nodes = store.find_erlang_mfa(module, name, parsed_arity, limit=2)
+            if (
+                store is not None
+                and store.count_erlang_mfa(
+                    module, name, parsed_arity, repo_root=root
+                )
+                == 1
+            ):
+                mfa_nodes = store.find_erlang_mfa(
+                    module, name, parsed_arity, limit=2, repo_root=root
+                )
                 if len(mfa_nodes) == 1:
                     values.add(mfa_nodes[0].qualified_name)
             return values
@@ -1146,16 +1312,491 @@ def _target_mfa(target: Any) -> tuple[str, str, int] | None:
     return None
 
 
-def _target_mfa_ambiguous(target: Any, store: GraphStore) -> bool:
-    """Return whether an exact repository MFA resolves to multiple nodes."""
+def _target_mfa_ambiguous(
+    target: Any,
+    store: GraphStore,
+    *,
+    repo_root: str | Path | None = None,
+) -> bool:
+    """Return whether an exact MFA resolves to multiple nodes in scope."""
     parsed = _target_mfa(target)
-    return parsed is not None and store.count_erlang_mfa(*parsed) > 1
+    return (
+        parsed is not None
+        and store.count_erlang_mfa(*parsed, repo_root=repo_root) > 1
+    )
 
 
 def _endpoint_matches(value: str, endpoint: Any, root: Path, store: GraphStore) -> bool:
     predicted = _edge_endpoint_aliases(value, root, store)
     expected = _endpoint_aliases(endpoint, root, store)
     return bool(predicted.intersection(expected))
+
+
+def _contract_path_alias(value: Any, root: Path) -> str | None:
+    """Return a stable repository-relative alias for a qualified endpoint."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().replace("\\", "/")
+    if "::" not in text:
+        return text or None
+    qualified = _qualified_path_info(text, root)
+    if qualified is None:
+        return None
+    _absolute, relative, symbol = qualified
+    return f"{relative}::{symbol}"
+
+
+def _endpoint_descriptor(endpoint: Any, root: Path) -> dict[str, Any]:
+    """Describe an endpoint using only repository-relative, pure data.
+
+    ``score_case`` historically asks a live ``GraphStore`` to expand MFA
+    aliases.  Result validation runs after that store is closed, so the
+    corpus contract carries this small descriptor and uses it for matching.
+    The descriptor deliberately keeps file, function, and MFA constraints
+    separate; a same-named function in a foreign file must not satisfy a
+    file-qualified expectation.
+    """
+    descriptor: dict[str, Any] = {
+        "file": None,
+        "symbol": None,
+        "module": None,
+        "arity": None,
+        "mfa": None,
+        "dynamic": None,
+        "literal": None,
+        "qualified": None,
+    }
+    if isinstance(endpoint, str):
+        text = endpoint.strip().replace("\\", "/")
+        if not text:
+            return descriptor
+        if "::" in text:
+            qualified = _qualified_path_info(text, root)
+            if qualified is None:
+                return descriptor
+            _absolute, relative, suffix = qualified
+            descriptor["file"] = relative
+            descriptor["qualified"] = f"{relative}::{suffix}"
+            parsed = _split_erlang_symbol(suffix)
+            if parsed is not None:
+                name, arity = parsed
+                descriptor["symbol"] = name
+                descriptor["arity"] = arity
+                if ":" in name:
+                    module, function = name.split(":", 1)
+                    descriptor["module"] = module.strip("'")
+                    descriptor["symbol"] = function.strip("'")
+                elif "." in name:
+                    module, function = name.rsplit(".", 1)
+                    descriptor["module"] = module.strip("'")
+                    descriptor["symbol"] = function.strip("'")
+                if descriptor["module"] and arity is not None:
+                    descriptor["mfa"] = (
+                        descriptor["module"], descriptor["symbol"], arity
+                    )
+            return descriptor
+        parsed_mfa = _mfa_parts(text)
+        if parsed_mfa is not None:
+            module, function, arity = parsed_mfa
+            descriptor.update(
+                {
+                    "module": module,
+                    "symbol": function,
+                    "arity": arity,
+                    "mfa": parsed_mfa,
+                }
+            )
+            return descriptor
+        dynamic = _dynamic_mfa_spelling(text)
+        if dynamic is not None:
+            descriptor["dynamic"] = dynamic
+        else:
+            descriptor["literal"] = text
+        return descriptor
+    if not isinstance(endpoint, Mapping):
+        return descriptor
+    if "file" in endpoint:
+        descriptor["file"] = _safe_endpoint_file(endpoint.get("file"), root)
+    symbol_value = endpoint.get("symbol")
+    explicit_arity = endpoint.get("arity") if "arity" in endpoint else None
+    if isinstance(symbol_value, str):
+        parsed = _split_erlang_symbol(symbol_value, explicit_arity)
+        if parsed is not None:
+            name, arity = parsed
+            descriptor["arity"] = arity
+            if ":" in name:
+                module, function = name.split(":", 1)
+                descriptor["module"] = module.strip("'")
+                descriptor["symbol"] = function.strip("'")
+            elif "." in name:
+                module, function = name.rsplit(".", 1)
+                descriptor["module"] = module.strip("'")
+                descriptor["symbol"] = function.strip("'")
+            else:
+                descriptor["symbol"] = name.strip("'")
+            if descriptor["module"] and arity is not None:
+                descriptor["mfa"] = (
+                    descriptor["module"], descriptor["symbol"], arity
+                )
+        else:
+            # Invalid endpoint arities are intentionally unmatchable.
+            descriptor["symbol"] = None
+    elif symbol_value is not None:
+        descriptor["symbol"] = str(symbol_value)
+    if descriptor["file"] is not None and descriptor["symbol"] is not None:
+        suffix = str(descriptor["symbol"])
+        if descriptor["arity"] is not None:
+            suffix = f"{suffix}/{descriptor['arity']}"
+        if descriptor["module"]:
+            suffix = f"{descriptor['module']}.{suffix}"
+        descriptor["qualified"] = f"{descriptor['file']}::{suffix}"
+    return descriptor
+
+
+def _prediction_descriptor(value: Any, root: Path) -> dict[str, Any]:
+    """Describe a prediction endpoint without consulting a graph store."""
+    return _endpoint_descriptor(value, root)
+
+
+def _normalise_contract_aliases(aliases: Any, root: Path) -> list[str]:
+    if not isinstance(aliases, (list, tuple, set)):
+        return []
+    normalized: set[str] = set()
+    for alias in aliases:
+        if not isinstance(alias, str) or not alias.strip():
+            continue
+        value = _contract_path_alias(alias, root)
+        if value is not None:
+            normalized.add(value)
+    return sorted(normalized)
+
+
+def _endpoint_binding(endpoint: Any, root: Path, store: GraphStore | None) -> dict[str, Any]:
+    """Freeze endpoint aliases needed by validation after the graph closes."""
+    descriptor = _endpoint_descriptor(endpoint, root)
+    aliases: set[str] = set()
+    if store is not None:
+        aliases.update(_endpoint_aliases(endpoint, root, store))
+    # Structural aliases make dry-run/externally supplied contracts useful and
+    # ensure the binding remains understandable without a graph database.
+    if descriptor.get("literal"):
+        aliases.add(descriptor["literal"])
+    if descriptor.get("dynamic"):
+        aliases.add(descriptor["dynamic"])
+    mfa = descriptor.get("mfa")
+    if isinstance(mfa, tuple) and len(mfa) == 3:
+        module, symbol, arity = mfa
+        aliases.update({f"{module}:{symbol}/{arity}", f"{module}.{symbol}/{arity}"})
+    qualified = descriptor.get("qualified")
+    if isinstance(qualified, str):
+        aliases.add(qualified)
+    normalized = _normalise_contract_aliases(aliases, root)
+    qualified_aliases = sorted(alias for alias in normalized if "::" in alias)
+    return {
+        "aliases": normalized,
+        "qualified_aliases": qualified_aliases,
+        "file": descriptor.get("file"),
+        "symbol": descriptor.get("symbol"),
+        "module": descriptor.get("module"),
+        "arity": descriptor.get("arity"),
+        "mfa": list(mfa) if isinstance(mfa, tuple) else None,
+        "dynamic": descriptor.get("dynamic"),
+        "literal": descriptor.get("literal"),
+    }
+
+
+def _contract_endpoint_matches(
+    predicted_value: Any, binding: Mapping[str, Any], root: Path
+) -> bool:
+    """Match one prediction endpoint against an immutable contract binding."""
+    if not isinstance(binding, Mapping):
+        return False
+    predicted = _prediction_descriptor(predicted_value, root)
+    expected_file = binding.get("file")
+    if expected_file is not None and predicted.get("file") != expected_file:
+        return False
+    expected_mfa = binding.get("mfa")
+    if isinstance(expected_mfa, list) and len(expected_mfa) == 3:
+        if tuple(expected_mfa) != predicted.get("mfa"):
+            return False
+        # A live store may have resolved a bare MFA to one qualified node.  If
+        # the prediction is qualified, require that exact frozen file alias;
+        # this rejects a foreign file reusing the same MFA.
+        qualified_aliases = binding.get("qualified_aliases")
+        predicted_qualified = predicted.get("qualified")
+        if (
+            isinstance(qualified_aliases, list)
+            and qualified_aliases
+            and predicted.get("file") is not None
+            and predicted_qualified not in qualified_aliases
+        ):
+            return False
+        return True
+    expected_dynamic = binding.get("dynamic")
+    if expected_dynamic is not None:
+        return predicted.get("dynamic") == expected_dynamic
+    expected_symbol = binding.get("symbol")
+    if (
+        expected_file is not None
+        and expected_symbol is None
+        and expected_mfa is None
+        and binding.get("literal") is None
+        and binding.get("dynamic") is None
+    ):
+        # A file-only corpus endpoint intentionally accepts any identity from
+        # that file, while still rejecting a same-named endpoint elsewhere.
+        return predicted.get("file") == expected_file
+    if expected_symbol is not None:
+        if predicted.get("symbol") != expected_symbol:
+            return False
+        expected_module = binding.get("module")
+        if expected_module is not None and predicted.get("module") != expected_module:
+            return False
+        expected_arity = binding.get("arity")
+        return expected_arity is None or predicted.get("arity") == expected_arity
+    expected_literal = binding.get("literal")
+    if expected_literal is not None:
+        return predicted.get("literal") == expected_literal
+    aliases = set(binding.get("aliases", [])) if isinstance(binding.get("aliases"), list) else set()
+    predicted_aliases = set()
+    qualified = predicted.get("qualified")
+    if isinstance(qualified, str):
+        predicted_aliases.add(qualified)
+    if isinstance(predicted_value, str):
+        text = predicted_value.strip().replace("\\", "/")
+        if text:
+            predicted_aliases.add(text)
+    return bool(aliases.intersection(predicted_aliases))
+
+
+def _contract_relation_matches(
+    predicted: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    root: Path,
+) -> bool:
+    if str(predicted.get("relation", "")).casefold() != str(
+        expected.get("relation", "")
+    ).casefold():
+        return False
+    matching = expected.get("matching")
+    if not isinstance(matching, Mapping):
+        return False
+    target_binding = matching.get("target")
+    if not _contract_endpoint_matches(predicted.get("target"), target_binding, root):
+        return False
+    if "source" in expected:
+        source_binding = matching.get("source")
+        if not _contract_endpoint_matches(predicted.get("source"), source_binding, root):
+            return False
+    return True
+
+
+def _contract_unresolved_relation_matches(
+    predicted: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    root: Path,
+) -> bool:
+    if _contract_relation_matches(predicted, expected, root):
+        return True
+    if str(predicted.get("relation", "")).casefold() != str(
+        expected.get("relation", "")
+    ).casefold():
+        return False
+    matching = expected.get("matching")
+    if not isinstance(matching, Mapping):
+        return False
+    if "source" in expected and not _contract_endpoint_matches(
+        predicted.get("source"), matching.get("source"), root
+    ):
+        return False
+    target_binding = matching.get("target")
+    if not isinstance(target_binding, Mapping):
+        return False
+    expected_dynamic = target_binding.get("dynamic")
+    predicted_dynamic = _dynamic_mfa_spelling(predicted.get("target"))
+    if expected_dynamic is not None:
+        return expected_dynamic == predicted_dynamic
+    expected_mfa = target_binding.get("mfa")
+    predicted_mfa = _mfa_parts(
+        predicted.get("target", "").rsplit("::", 1)[-1]
+    ) if isinstance(predicted.get("target"), str) else None
+    return isinstance(expected_mfa, list) and tuple(expected_mfa) == predicted_mfa
+
+
+def _canonical_endpoint_value(endpoint: Any, root: Path) -> Any:
+    """Normalize one corpus endpoint into portable JSON data."""
+    if isinstance(endpoint, str):
+        text = endpoint.strip().replace("\\", "/")
+        if "::" in text:
+            qualified = _qualified_path_info(text, root)
+            if qualified is not None:
+                _absolute, relative, suffix = qualified
+                parsed = _split_erlang_symbol(suffix)
+                if parsed is not None:
+                    name, arity = parsed
+                    suffix = f"{name}/{arity}" if arity is not None else name
+                return f"{relative}::{suffix}"
+        parsed = _mfa_parts(text)
+        if parsed is not None:
+            module, name, arity = parsed
+            return f"{module}:{name}/{arity}"
+        return text
+    if isinstance(endpoint, Mapping):
+        normalized: dict[str, Any] = {}
+        for key in sorted(endpoint, key=str):
+            value = endpoint[key]
+            if key == "file" and isinstance(value, str):
+                safe = _safe_endpoint_file(value, root)
+                normalized[key] = safe if safe is not None else value.replace("\\", "/")
+            elif key == "arity":
+                parsed_arity = _parse_erlang_arity(value)
+                normalized[key] = parsed_arity if parsed_arity is not None else value
+            elif key == "symbol" and isinstance(value, str):
+                parsed = _split_erlang_symbol(value, endpoint.get("arity"))
+                if parsed is not None:
+                    name, arity = parsed
+                    normalized[key] = name
+                    if "arity" not in endpoint and arity is not None:
+                        normalized["arity"] = arity
+                else:
+                    normalized[key] = value.strip()
+            else:
+                normalized[key] = _canonical_contract_value(value, root)
+        return normalized
+    return _canonical_contract_value(endpoint, root)
+
+
+def _canonical_contract_value(value: Any, root: Path) -> Any:
+    """Canonicalize arbitrary JSON-like corpus metadata."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_contract_value(value[key], root)
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_contract_value(item, root) for item in value]
+    if isinstance(value, set):
+        return sorted(_canonical_contract_value(item, root) for item in value)
+    if isinstance(value, Path):
+        return value.as_posix()
+    return value
+
+
+def _canonical_contract_relation(
+    relation: Mapping[str, Any], root: Path, store: GraphStore | None
+) -> dict[str, Any]:
+    canonical: dict[str, Any] = {}
+    for key in sorted(relation, key=str):
+        if key in {"source", "target"}:
+            canonical[key] = _canonical_endpoint_value(relation.get(key), root)
+        else:
+            canonical[str(key)] = _canonical_contract_value(relation.get(key), root)
+    if "relation" in canonical:
+        canonical["relation"] = str(canonical["relation"])
+    # Matching data is deliberately separate from the canonical source
+    # payload.  It may contain graph-derived qualified aliases, while the
+    # digest remains stable across temporary GraphStore locations.
+    matching: dict[str, Any] = {
+        "target": _endpoint_binding(canonical.get("target"), root, store),
+    }
+    if "source" in canonical:
+        matching["source"] = _endpoint_binding(canonical.get("source"), root, store)
+    canonical["matching"] = matching
+    return canonical
+
+
+def _contract_payload(contract: Mapping[str, Any], *, include_matching: bool) -> dict[str, Any]:
+    """Return canonical contract data with optional graph-derived bindings."""
+    cases: list[dict[str, Any]] = []
+    raw_cases = contract.get("cases", [])
+    if isinstance(raw_cases, list):
+        for case in raw_cases:
+            if not isinstance(case, Mapping):
+                continue
+            copied = _canonical_contract_value(dict(case), Path("."))
+            if not isinstance(copied, dict):
+                continue
+            if not include_matching:
+                expected = copied.get("expected")
+                if isinstance(expected, Mapping):
+                    expected_copy = dict(expected)
+                    for relation_kind in ("positive", "negative", "unresolved"):
+                        relations = expected_copy.get(relation_kind)
+                        if isinstance(relations, list):
+                            expected_copy[relation_kind] = [
+                                {
+                                    key: value
+                                    for key, value in relation.items()
+                                    if key != "matching"
+                                }
+                                for relation in relations
+                                if isinstance(relation, Mapping)
+                            ]
+                    copied["expected"] = expected_copy
+            cases.append(copied)
+    return {"version": contract.get("version"), "cases": cases}
+
+
+def _contract_digest_payload(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the complete digest input, excluding the digest field itself."""
+    return _contract_payload(contract, include_matching=True)
+
+
+def _contract_source_payload(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the source-corpus portion of a contract for external comparison."""
+    return _contract_payload(contract, include_matching=False)
+
+
+def _build_corpus_contract(
+    corpus: Mapping[str, Any], root: Path, store: GraphStore | None
+) -> dict[str, Any]:
+    """Freeze the case/query/expected contract into a portable result field."""
+    contract_cases: list[dict[str, Any]] = []
+    raw_cases = corpus.get("cases", [])
+    if isinstance(raw_cases, Sequence) and not isinstance(raw_cases, (str, bytes, bytearray)):
+        for case in raw_cases:
+            if not isinstance(case, Mapping):
+                continue
+            expected_raw = case.get("expected", {})
+            expected_mapping = expected_raw if isinstance(expected_raw, Mapping) else {}
+            expected: dict[str, Any] = {}
+            for relation_kind in ("positive", "negative", "unresolved"):
+                raw_relations = expected_mapping.get(relation_kind, [])
+                if not isinstance(raw_relations, list):
+                    raw_relations = []
+                expected[relation_kind] = [
+                    _canonical_contract_relation(relation, root, store)
+                    for relation in raw_relations
+                    if isinstance(relation, Mapping)
+                ]
+            if expected_mapping.get("allow_empty") is True:
+                expected["allow_empty"] = True
+            contract_case: dict[str, Any] = {
+                "id": case.get("id"),
+                "category": case.get("category"),
+                "description": _canonical_contract_value(case.get("description"), root),
+                "query": _canonical_contract_value(case.get("query", {}), root),
+                "expected": expected,
+                "required_diagnostics": _canonical_contract_value(
+                    case.get("required_diagnostics", []), root
+                ),
+                "review": _canonical_contract_value(case.get("review", {}), root),
+            }
+            if isinstance(case.get("impact"), Mapping):
+                contract_case["impact"] = _canonical_contract_value(case["impact"], root)
+            # ``allow_empty`` can live in review in legacy corpora; record the
+            # effective value so validation does not need the source artifact.
+            contract_case["allow_empty"] = _allows_empty(case)
+            contract_cases.append(contract_case)
+    contract: dict[str, Any] = {
+        "version": _CORPUS_CONTRACT_VERSION,
+        "cases": contract_cases,
+    }
+    digest = hashlib.sha256(
+        _canonical_json(_contract_source_payload(contract)).encode("utf-8")
+    ).hexdigest()
+    contract["digest"] = digest
+    return contract
 
 
 def _edge_matches_query_target(
@@ -1189,7 +1830,12 @@ def _edge_matches_query_target(
     edge_mfa = _mfa_parts(edge.target_qualified.rsplit("::", 1)[-1])
     if edge_mfa != (module, node.name, node_arity):
         return False
-    return store.count_erlang_mfa(module, node.name, node_arity) == 1
+    return store.count_erlang_mfa(
+        module,
+        node.name,
+        node_arity,
+        repo_root=root,
+    ) == 1
 
 
 def _resolve_query_node(target: Any, root: Path, store: GraphStore) -> GraphNode | None:
@@ -1286,7 +1932,11 @@ def _resolve_query_node(target: Any, root: Path, store: GraphStore) -> GraphNode
                 parsed_arity = _parse_erlang_arity(raw_arity)
                 if parsed_arity is not None:
                     matches = store.find_erlang_mfa(
-                        module.strip("'"), name.strip("'"), parsed_arity, limit=2
+                        module.strip("'"),
+                        name.strip("'"),
+                        parsed_arity,
+                        limit=2,
+                        repo_root=root,
                     )
                     if len(matches) == 1:
                         return matches[0]
@@ -1314,7 +1964,7 @@ def _query_edges(
     # A bare MFA is authoritative only when it identifies one repository
     # definition.  Otherwise alias matching would return every same-named
     # call and turn an ambiguous query into a false-positive result.
-    if _target_mfa_ambiguous(target, store):
+    if _target_mfa_ambiguous(target, store, repo_root=root):
         return [], None
 
     # A file-qualified function target with no unique node is ambiguous. Do
@@ -1517,10 +2167,27 @@ def score_case(
     predicted: Sequence[Mapping[str, Any]],
     *,
     root: str | Path,
-    store: GraphStore,
+    store: GraphStore | None,
+    relation_matcher: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
+    unresolved_relation_matcher: Callable[
+        [Mapping[str, Any], Mapping[str, Any]], bool
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     """Score one executed corpus case without counting unresolved anchors."""
     root_path = _canonical_path(root)
+    if store is None and (relation_matcher is None or unresolved_relation_matcher is None):
+        raise ValueError("score_case requires a graph store or contract matchers")
+    relation_matches = relation_matcher or (
+        lambda candidate, expected_item: _relation_matches(
+            candidate, expected_item, root_path, store  # type: ignore[arg-type]
+        )
+    )
+    unresolved_relation_matches = unresolved_relation_matcher or (
+        lambda candidate, expected_item: _unresolved_relation_matches(
+            candidate, expected_item, root_path, store  # type: ignore[arg-type]
+        )
+    )
     expected = case.get("expected", {})
     if not isinstance(expected, Mapping):
         expected = {}
@@ -1541,7 +2208,7 @@ def score_case(
         matches_unresolved = [
             item
             for item in unresolved
-            if _unresolved_relation_matches(candidate, item, root_path, store)
+            if unresolved_relation_matches(candidate, item)
         ]
         if not matches_unresolved:
             continue
@@ -1557,7 +2224,7 @@ def score_case(
             (
                 index
                 for index, item in enumerate(unresolved_remaining)
-                if _unresolved_relation_matches(candidate, item, root_path, store)
+                if unresolved_relation_matches(candidate, item)
             ),
             None,
         )
@@ -1578,7 +2245,7 @@ def score_case(
             (
                 index
                 for index, candidate in enumerate(remaining)
-                if _relation_matches(candidate, item, root_path, store)
+                if relation_matches(candidate, item)
             ),
             None,
         )
@@ -1598,7 +2265,7 @@ def score_case(
     forbidden = sum(
         1
         for candidate in predicted
-        if any(_relation_matches(candidate, item, root_path, store) for item in negative)
+        if any(relation_matches(candidate, item) for item in negative)
     )
     # An intentionally unresolved anchor requires an explicit candidate.  A
     # missing prediction is an unmeasured/failed case, while a resolved edge
@@ -1624,7 +2291,7 @@ def score_case(
             (
                 index
                 for index, item in enumerate(ranked_remaining)
-                if _relation_matches(candidate, item, root_path, store)
+                if relation_matches(candidate, item)
             ),
             None,
         )
@@ -1695,8 +2362,20 @@ def _nonnegative_count(value: Any) -> int | None:
     return None
 
 
-def _latency_metric(samples: Mapping[str, Sequence[float]]) -> dict[str, Any]:
+def _latency_metric(
+    samples: Mapping[str, Sequence[float]],
+    sample_provenance: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Summarize measured durations and retain their evidence binding.
+
+    The old report only carried percentile summaries.  Those summaries could
+    be edited without changing the lifecycle/case records that supposedly
+    produced them.  Keep one bounded record per accepted input sample so the
+    result validator can tie each duration back to its lifecycle phase or
+    targeted corpus case and recompute the percentiles.
+    """
     by_operation: dict[str, Any] = {}
+    sample_records: dict[str, list[dict[str, Any]]] = {}
     all_samples: list[float] = []
     invalid_total = 0
     if not isinstance(samples, Mapping):
@@ -1707,7 +2386,9 @@ def _latency_metric(samples: Mapping[str, Sequence[float]]) -> dict[str, Any]:
             "p50_ms": None,
             "p95_ms": None,
             "by_operation": {},
+            "sample_provenance": {},
         }
+    provenance_map = sample_provenance if isinstance(sample_provenance, Mapping) else {}
     for operation in sorted(samples, key=str):
         values: list[float] = []
         invalid = 0
@@ -1718,7 +2399,28 @@ def _latency_metric(samples: Mapping[str, Sequence[float]]) -> dict[str, Any]:
             raw_values: Sequence[Any] = raw_value
         else:
             raw_values = [raw_value]
-        for value in raw_values:
+        raw_provenance = provenance_map.get(operation, ())
+        if isinstance(raw_provenance, Sequence) and not isinstance(
+            raw_provenance, (str, bytes, bytearray)
+        ):
+            provenance_values: Sequence[Any] = raw_provenance
+        else:
+            provenance_values = ()
+        records: list[dict[str, Any]] = []
+        for index, value in enumerate(raw_values):
+            metadata = provenance_values[index] if index < len(provenance_values) else None
+            if isinstance(metadata, Mapping):
+                provenance = dict(metadata)
+            else:
+                provenance = {
+                    "source": "timings",
+                    "operation": str(operation),
+                    "sample_index": index,
+                }
+            # The duration belongs in the provenance record itself.  Keep the
+            # original value for invalid samples so the validator can fail
+            # closed instead of silently dropping malformed evidence.
+            records.append({"duration_seconds": value, "provenance": provenance})
             if isinstance(value, bool):
                 invalid += 1
                 continue
@@ -1731,6 +2433,7 @@ def _latency_metric(samples: Mapping[str, Sequence[float]]) -> dict[str, Any]:
                 values.append(parsed)
             else:
                 invalid += 1
+        sample_records[str(operation)] = records
         invalid_total += invalid
         all_samples.extend(values)
         by_operation[operation] = {
@@ -1746,7 +2449,205 @@ def _latency_metric(samples: Mapping[str, Sequence[float]]) -> dict[str, Any]:
         "p50_ms": round((_percentile(all_samples, 0.50) or 0.0) * 1000, 3) if all_samples else None,
         "p95_ms": round((_percentile(all_samples, 0.95) or 0.0) * 1000, 3) if all_samples else None,
         "by_operation": by_operation,
+        "sample_provenance": sample_records,
     }
+
+
+def _latency_source_records(
+    lifecycle: Mapping[str, Mapping[str, Any]],
+    cases: Sequence[Mapping[str, Any]],
+    environment: Mapping[str, Any],
+    operations: Mapping[str, Sequence[float]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return the durations that a result is allowed to report.
+
+    Lifecycle timings and targeted-query timings are already present in the
+    public envelope.  Reconstructing this list gives the validator a stable
+    provenance boundary without trusting a percentile or an arbitrary sample
+    array supplied by the producer.
+    """
+    repository = environment.get("repository", {})
+    generated_data = environment.get("generated_data", {})
+    cache = environment.get("cache", {})
+    common: dict[str, Any] = {
+        "repository": repository.get("path") if isinstance(repository, Mapping) else None,
+        "source_revision": (
+            repository.get("revision") if isinstance(repository, Mapping) else None
+        ),
+        "generated_data_revision": (
+            generated_data.get("revision") if isinstance(generated_data, Mapping) else None
+        ),
+        "cache_state": (
+            cache.get("stale_evidence_policy") if isinstance(cache, Mapping) else None
+        ),
+    }
+    records: dict[str, list[dict[str, Any]]] = {}
+    for operation in (
+        "full_build",
+        "incremental_update",
+        "standalone_postprocess",
+        "forget",
+        "watch",
+    ):
+        if operation not in operations:
+            continue
+        phase = lifecycle.get(operation)
+        if not isinstance(phase, Mapping):
+            continue
+        duration = phase.get("duration_seconds")
+        if _finite_nonnegative(duration) is None:
+            continue
+        records[operation] = [
+            {
+                "duration_seconds": duration,
+                "provenance": {
+                    **common,
+                    "source": "lifecycle",
+                    "phase": operation,
+                    "status": phase.get("status"),
+                },
+            }
+        ]
+
+    query_records: list[dict[str, Any]] = []
+    for item in cases:
+        if not isinstance(item, Mapping):
+            continue
+        duration = item.get("duration_seconds")
+        if _finite_nonnegative(duration) is None:
+            continue
+        query_records.append(
+            {
+                "duration_seconds": duration,
+                "provenance": {
+                    **common,
+                    "source": "case",
+                    "case_id": item.get("id"),
+                    "query_kind": item.get("query_kind"),
+                },
+            }
+        )
+    if query_records:
+        records["targeted_query"] = query_records
+    return records
+
+
+def _validate_latency_contract(
+    latency: Mapping[str, Any],
+    lifecycle: Mapping[str, Mapping[str, Any]],
+    cases: Sequence[Mapping[str, Any]],
+    environment: Mapping[str, Any],
+) -> None:
+    """Validate latency samples, provenance, and minimum operation coverage."""
+    provenance = latency.get("sample_provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("result.metrics.latency.sample_provenance: expected object")
+    by_operation = latency.get("by_operation")
+    if not isinstance(by_operation, Mapping):
+        raise ValueError("result.metrics.latency.by_operation: expected object")
+
+    # Rebuild the only samples that this evaluator can legitimately emit.  A
+    # report copied from another run, or one with a hand-written duration,
+    # therefore cannot pass merely by supplying matching percentile numbers.
+    expected_records = _latency_source_records(
+        lifecycle,
+        cases,
+        environment,
+        {str(name): () for name in by_operation},
+    )
+    reported_operations = set(by_operation)
+    provenance_operations = set(provenance)
+    if provenance_operations != reported_operations:
+        raise ValueError(
+            "result.metrics.latency.sample_provenance: operations are inconsistent"
+        )
+    if set(expected_records) != reported_operations:
+        raise ValueError(
+            "result.metrics.latency: operations are inconsistent with lifecycle evidence"
+        )
+
+    all_values: list[float] = []
+    for operation, summary in by_operation.items():
+        if not isinstance(operation, str) or not operation:
+            raise ValueError("result.metrics.latency.by_operation: invalid operation name")
+        if not isinstance(summary, Mapping):
+            raise ValueError(f"result.metrics.latency.by_operation.{operation}: expected object")
+        records = provenance.get(operation)
+        if not isinstance(records, list):
+            raise ValueError(
+                f"result.metrics.latency.sample_provenance.{operation}: expected array"
+            )
+        expected = expected_records.get(operation, [])
+        if len(records) != len(expected):
+            raise ValueError(
+                f"result.metrics.latency.sample_provenance.{operation}: inconsistent sample count"
+            )
+        values: list[float] = []
+        for index, (record, expected_record) in enumerate(zip(records, expected)):
+            if not isinstance(record, Mapping):
+                raise ValueError(
+                    f"result.metrics.latency.sample_provenance.{operation}[{index}]: "
+                    "expected object"
+                )
+            duration = _finite_nonnegative(record.get("duration_seconds"))
+            expected_duration = _finite_nonnegative(expected_record.get("duration_seconds"))
+            if duration is None or expected_duration is None or not math.isclose(
+                duration, expected_duration, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    f"result.metrics.latency.sample_provenance.{operation}[{index}]: "
+                    "duration is inconsistent with lifecycle evidence"
+                )
+            record_provenance = record.get("provenance")
+            expected_provenance = expected_record.get("provenance")
+            if not isinstance(record_provenance, Mapping):
+                raise ValueError(
+                    f"result.metrics.latency.sample_provenance.{operation}[{index}].provenance: "
+                    "expected object"
+                )
+            for key, expected_value in expected_provenance.items():
+                if record_provenance.get(key) != expected_value:
+                    raise ValueError(
+                        f"result.metrics.latency.sample_provenance.{operation}[{index}]"
+                        ".provenance: "
+                        f"inconsistent {key}"
+                    )
+            values.append(duration)
+        sample_count = _nonnegative_count(summary.get("samples"))
+        invalid_count = _nonnegative_count(summary.get("invalid_samples"))
+        if sample_count != len(values) or invalid_count != 0:
+            raise ValueError(
+                f"result.metrics.latency.by_operation.{operation}: inconsistent sample evidence"
+            )
+        expected_p50 = round((_percentile(values, 0.50) or 0.0) * 1000, 3) if values else None
+        expected_p95 = round((_percentile(values, 0.95) or 0.0) * 1000, 3) if values else None
+        if summary.get("p50_ms") != expected_p50 or summary.get("p95_ms") != expected_p95:
+            raise ValueError(
+                f"result.metrics.latency.by_operation.{operation}: percentiles are inconsistent"
+            )
+        all_values.extend(values)
+
+    if latency.get("samples") != len(all_values) or latency.get("invalid_samples") != 0:
+        raise ValueError("result.metrics.latency: sample totals are inconsistent with provenance")
+    expected_p50 = round((_percentile(all_values, 0.50) or 0.0) * 1000, 3) if all_values else None
+    expected_p95 = round((_percentile(all_values, 0.95) or 0.0) * 1000, 3) if all_values else None
+    if latency.get("p50_ms") != expected_p50 or latency.get("p95_ms") != expected_p95:
+        raise ValueError("result.metrics.latency: percentiles are inconsistent with provenance")
+
+    if latency.get("status") == "executed":
+        for operation in _LATENCY_REQUIRED_OPERATIONS:
+            summary = by_operation.get(operation)
+            if (
+                not isinstance(summary, Mapping)
+                or _nonnegative_count(summary.get("samples")) is None
+                or int(summary.get("samples", 0)) < _LATENCY_MIN_SAMPLES
+                or not isinstance(provenance.get(operation), list)
+                or len(provenance.get(operation, [])) < _LATENCY_MIN_SAMPLES
+            ):
+                raise ValueError(
+                    f"result.metrics.latency: executed metrics require at least "
+                    f"{_LATENCY_MIN_SAMPLES} {operation} sample"
+                )
 
 
 _SPECIAL_QUERY_KINDS = frozenset({"mfa", "diagnostics", "cache"})
@@ -2386,6 +3287,86 @@ def _lifecycle_call(
     return _invoke_with_optional_config(function, root, store, **kwargs)
 
 
+def _require_lifecycle_count(value: Any, phase: str, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError(f"{phase} runner returned invalid {field}")
+
+
+def _require_lifecycle_list(value: Any, phase: str, field: str) -> None:
+    if not isinstance(value, list):
+        raise TypeError(f"{phase} runner returned invalid {field}")
+    if field in {"changed_files", "dependent_files", "forgotten", "reparsed"} and any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise TypeError(f"{phase} runner returned invalid {field}")
+
+
+def _validate_lifecycle_payload_shape(value: Mapping[str, Any], phase: str) -> None:
+    """Validate the phase-specific core fields without applying failure policy."""
+    required = _LIFECYCLE_REQUIRED_FIELDS.get(phase)
+    if required is None:
+        raise ValueError(f"unsupported lifecycle phase {phase!r}")
+
+    # Runners may include their phase as an explicit discriminator.  Treat it
+    # as a contract field rather than accepting an envelope produced for a
+    # different lifecycle call.  Omitted phase remains valid for the concrete
+    # built-in helpers, whose return values predate this discriminator.
+    if "phase" in value:
+        declared_phase = value["phase"]
+        if not isinstance(declared_phase, str):
+            raise TypeError(f"{phase} runner returned invalid phase")
+        if declared_phase != phase:
+            raise ValueError(
+                f"{phase} runner returned envelope for phase {declared_phase!r}"
+            )
+
+    # A status is optional for the built-in summaries, but when a runner emits
+    # one it must be a string.  Coercing arbitrary values (for example, an
+    # integer or ``None``) would make malformed evidence look successful.
+    if "status" in value and not isinstance(value["status"], str):
+        raise TypeError(f"{phase} runner returned invalid status")
+    missing = required - set(value)
+    if missing:
+        raise ValueError(
+            f"{phase} runner returned incomplete envelope: missing {', '.join(sorted(missing))}"
+        )
+
+    # All numeric counters in the public lifecycle summaries are bounded
+    # integers.  Unknown additive counters remain allowed for forward
+    # compatibility, while known counters cannot smuggle booleans or negatives.
+    for field in _LIFECYCLE_COUNT_FIELDS.intersection(value):
+        _require_lifecycle_count(value[field], phase, field)
+    for field in _LIFECYCLE_LIST_FIELDS.intersection(value):
+        _require_lifecycle_list(value[field], phase, field)
+    for field in _LIFECYCLE_BOOL_FIELDS.intersection(value):
+        if not isinstance(value[field], bool):
+            raise TypeError(f"{phase} runner returned invalid {field}")
+
+    errors = value.get("errors")
+    if phase in {"full_build", "incremental_update"}:
+        if not isinstance(errors, list) or any(not isinstance(item, Mapping) for item in errors):
+            raise TypeError(f"{phase} runner returned malformed errors")
+    elif errors is not None and (
+        not isinstance(errors, list) or any(not isinstance(item, Mapping) for item in errors)
+    ):
+        raise TypeError(f"{phase} runner returned malformed errors")
+
+    warnings = value.get("warnings")
+    if warnings is not None and (
+        not isinstance(warnings, list)
+        or any(not isinstance(item, (str, Mapping)) for item in warnings)
+    ):
+        raise TypeError(f"{phase} runner returned malformed warnings")
+
+    # Watch evidence is a serialized boundary, so keep all three activity
+    # measurements as bounded counters.  Accepting arbitrary event arrays
+    # would make ``[{}]`` or ``["fake"]`` indistinguishable from a real cycle
+    # once the reducer only looked at list length.
+    if phase == "watch":
+        for field in ("events", "updates", "notifications"):
+            _require_lifecycle_count(value[field], phase, field)
+
+
 def _checked_lifecycle_result(
     value: Any, phase: str, *, reject_errors: bool = True, reject_warnings: bool = True
 ) -> dict[str, Any]:
@@ -2402,42 +3383,139 @@ def _checked_lifecycle_result(
         json.dumps(result, ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise TypeError(f"{phase} runner returned non-serializable data") from exc
+    _validate_lifecycle_payload_shape(result, phase)
     errors = result.get("errors")
-    if errors is not None and (
-        not isinstance(errors, list) or any(not isinstance(item, Mapping) for item in errors)
-    ):
-        raise TypeError(f"{phase} runner returned malformed errors")
     if reject_errors and errors:
         raise RuntimeError(f"{phase} runner reported {len(errors)} error(s)")
     warnings = result.get("warnings")
-    if warnings is not None and (
-        not isinstance(warnings, list)
-        or any(not isinstance(item, (str, Mapping)) for item in warnings)
-    ):
-        raise TypeError(f"{phase} runner returned malformed warnings")
     if reject_warnings and warnings:
         raise RuntimeError(f"{phase} runner reported {len(warnings)} warning(s)")
-    status = str(result.get("status", "")).casefold()
+    raw_status = result.get("status")
+    status = raw_status.casefold() if isinstance(raw_status, str) else ""
     if status in {"error", "failed", "blocked", "not_run", "dry_run"}:
         raise RuntimeError(f"{phase} runner returned status {status!r}")
     if status and status not in {"ok", "executed", "success", "completed"}:
         raise RuntimeError(f"{phase} runner returned unsupported status {status!r}")
-    if not status:
-        expected_keys = {
-            "full_build": {"files_parsed", "errors", "total_nodes", "total_edges"},
-            "incremental_update": {"files_updated", "errors", "changed_files", "graph_changed"},
-            "standalone_postprocess": {
-                "bare_edges_resolved",
-                "fts_indexed",
-                "signatures_computed",
-                "warnings",
-            },
-            "forget": {"forgotten", "reparsed", "embeddings_purged"},
-            "watch": {"events", "updates", "graph_changed", "notifications"},
-        }.get(phase, set())
-        if not expected_keys.intersection(result):
-            raise ValueError(f"{phase} runner returned an unrecognized result envelope")
     return result
+
+
+def _watch_activity_evidence(payload: Mapping[str, Any]) -> tuple[bool, dict[str, int]]:
+    """Return whether a watch smoke payload proves a real notification cycle.
+
+    A syntactically valid envelope with all counters set to zero only proves
+    that a runner returned.  The adoption contract needs an observed event,
+    an applied update, and a delivered notification before it can claim that
+    the watch path was exercised.
+    """
+    counts: dict[str, int] = {}
+    for field in ("events", "updates", "notifications"):
+        value = payload.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            counts[field] = value
+        else:  # ``_validate_lifecycle_payload_shape`` normally catches this.
+            counts[field] = 0
+    return all(counts[field] > 0 for field in counts), counts
+
+
+def _valid_fingerprint(value: Any) -> str | None:
+    """Return a canonical graph fingerprint supplied by an isolated runner."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None
+    return value
+
+
+def _lifecycle_parity_from_evidence(
+    phase: str,
+    item: Mapping[str, Any],
+    *,
+    require_reported: bool = True,
+) -> bool:
+    """Derive lifecycle parity from the phase's explicit evidence fields.
+
+    ``parity`` is retained as a public summary field, but it is never the
+    sole source of truth.  Each phase has a small, deterministic evidence
+    contract so a forged boolean cannot turn an unexercised lifecycle path
+    into a passing adoption gate.
+    """
+    if item.get("status") != "executed":
+        expected = False
+    elif phase == "full_build":
+        payload = item.get("result")
+        errors = payload.get("errors") if isinstance(payload, Mapping) else None
+        expected = isinstance(errors, list) and not errors
+    elif phase == "incremental_update":
+        payload = item.get("result")
+        errors = payload.get("errors") if isinstance(payload, Mapping) else None
+        files_updated = payload.get("files_updated") if isinstance(payload, Mapping) else None
+        changed_files = payload.get("changed_files") if isinstance(payload, Mapping) else None
+        graph_changed = payload.get("graph_changed") if isinstance(payload, Mapping) else None
+        baseline = _valid_fingerprint(item.get("baseline_fingerprint"))
+        observed = _valid_fingerprint(item.get("observed_fingerprint"))
+        expected = (
+            item.get("update_evidence") is True
+            and isinstance(errors, list)
+            and not errors
+            and isinstance(files_updated, int)
+            and not isinstance(files_updated, bool)
+            and files_updated > 0
+            and isinstance(changed_files, list)
+            and bool(changed_files)
+            and graph_changed is True
+            and baseline is not None
+            and observed is not None
+            and baseline == observed
+        )
+    elif phase == "standalone_postprocess":
+        reference = _valid_fingerprint(item.get("reference_fingerprint"))
+        observed = _valid_fingerprint(item.get("observed_fingerprint"))
+        first = _valid_fingerprint(item.get("first_post_fingerprint"))
+        expected = (
+            item.get("idempotence") is True
+            and item.get("reference_match") is True
+            and reference is not None
+            and observed is not None
+            and first is not None
+            and first == observed
+            and observed == reference
+        )
+    elif phase == "watch":
+        payload = item.get("result")
+        activity, _counts = (
+            _watch_activity_evidence(payload)
+            if isinstance(payload, Mapping)
+            else (False, {})
+        )
+        reference = _valid_fingerprint(item.get("reference_fingerprint"))
+        observed = _valid_fingerprint(item.get("observed_fingerprint"))
+        expected = (
+            item.get("activity_evidence") is True
+            and activity
+            and item.get("reference_match") is True
+            and reference is not None
+            and observed == reference
+        )
+    elif phase == "forget":
+        payload = item.get("result")
+        target = item.get("forgotten")
+        forgotten = payload.get("forgotten") if isinstance(payload, Mapping) else None
+        reference = _valid_fingerprint(item.get("baseline_fingerprint"))
+        observed = _valid_fingerprint(item.get("observed_fingerprint"))
+        expected = (
+            item.get("target_absent") is True
+            and isinstance(target, str)
+            and bool(target)
+            and isinstance(forgotten, list)
+            and target in forgotten
+            and reference is not None
+            and observed is not None
+            and reference == observed
+        )
+    else:
+        expected = False
+
+    if require_reported:
+        return item.get("parity") is True and expected
+    return expected
 
 
 def _fresh_forget_fingerprint(
@@ -2495,7 +3573,16 @@ def _fresh_forget_fingerprint(
                 raise RuntimeError(
                     f"fresh forget baseline build reported {len(build_errors)} error(s)"
                 )
-            post_result = run_post_processing(baseline_store)
+            # The temporary database lives beside ``mirror_root`` rather than
+            # at the analyzed repository path.  Pass the explicit root so the
+            # Erlang header resolver does not infer the wrong scope.  Keep the
+            # invocation signature-tolerant for injected one-argument test
+            # doubles and downstream callers.
+            post_result = _invoke_with_optional_config(
+                run_post_processing,
+                baseline_store,
+                repo_root=mirror_root,
+            )
             _checked_lifecycle_result(post_result, "standalone_postprocess")
             return _portable_graph_fingerprint(baseline_store, mirror_root)
         finally:
@@ -2516,6 +3603,7 @@ def _run_lifecycle(
     lifecycle = _empty_lifecycle("lifecycle execution was not reached")
     timings: dict[str, Sequence[float]] = {}
     diagnostics: list[dict[str, Any]] = []
+    full_build_reference: GraphStore | None = None
     started = time.perf_counter()
     try:
         if graph_runner is None:
@@ -2552,6 +3640,27 @@ def _run_lifecycle(
             return store, lifecycle, timings, diagnostics
 
         baseline_fingerprint = graph_fingerprint(store, root)
+        if lifecycle_runner is None:
+            # Keep an exact snapshot of the completed full-build graph.  The
+            # standalone phase must converge to this graph after applying the
+            # same derived processing; a second postprocess pass alone only
+            # proves idempotence and can miss a divergence from a fresh build.
+            try:
+                full_build_reference = GraphStore(temp_root / "full-build-reference.db")
+                store._conn.backup(full_build_reference._conn)
+                full_build_reference._conn.commit()
+            except Exception as exc:
+                diagnostics.append(
+                    _diagnostic(
+                        "full_build_reference_unavailable",
+                        "warning",
+                        "Could not snapshot the full-build graph for lifecycle parity.",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                if full_build_reference is not None:
+                    full_build_reference.close()
+                    full_build_reference = None
         source_files = sorted(
             _relative_path(path, root)
             for path in store.get_all_files()
@@ -2609,6 +3718,8 @@ def _run_lifecycle(
                 "result": update_payload,
                 "parity": update_parity,
                 "update_evidence": files_updated > 0,
+                "baseline_fingerprint": baseline_fingerprint,
+                "observed_fingerprint": update_fingerprint,
             }
             timings["incremental_update"] = [update_duration]
         except Exception as exc:
@@ -2630,7 +3741,11 @@ def _run_lifecycle(
         started = time.perf_counter()
         try:
             if lifecycle_runner is None:
-                post_result = run_post_processing(store)
+                post_result = _invoke_with_optional_config(
+                    run_post_processing,
+                    store,
+                    repo_root=root,
+                )
             else:
                 post_result = _invoke_with_optional_config(
                     lifecycle_runner,
@@ -2642,12 +3757,51 @@ def _run_lifecycle(
             post_payload = _checked_lifecycle_result(post_result, "standalone_postprocess")
             post_duration = time.perf_counter() - started
             first_post_fingerprint = graph_fingerprint(store, root)
+            reference_fingerprint: str | None = None
+            if full_build_reference is not None:
+                try:
+                    reference_result = run_post_processing(
+                        full_build_reference,
+                        repo_root=root,
+                    )
+                    _checked_lifecycle_result(
+                        reference_result,
+                        "standalone_postprocess",
+                    )
+                    reference_fingerprint = graph_fingerprint(
+                        full_build_reference,
+                        root,
+                    )
+                finally:
+                    full_build_reference.close()
+                    full_build_reference = None
+            elif lifecycle_runner is not None:
+                reference_fingerprint = _valid_fingerprint(
+                    post_payload.get("full_build_reference_fingerprint")
+                )
+                if reference_fingerprint is None:
+                        diagnostics.append(
+                            _diagnostic(
+                                "standalone_reference_unavailable",
+                                "warning",
+                                "An isolated lifecycle runner did not provide a valid "
+                                "full-build reference fingerprint.",
+                            )
+                        )
+
             # Post-processing may legitimately resolve bare endpoints on its
-            # first invocation. Verify idempotence with a second invocation,
-            # which is the lifecycle parity contract we can measure without a
-            # second source checkout.
+            # first invocation. Verify both convergence to the full-build
+            # reference and idempotence of the second invocation.
             if lifecycle_runner is None:
-                run_post_processing(store)
+                second_post_result = _invoke_with_optional_config(
+                    run_post_processing,
+                    store,
+                    repo_root=root,
+                )
+                _checked_lifecycle_result(
+                    second_post_result,
+                    "standalone_postprocess",
+                )
             else:
                 second_post_result = _invoke_with_optional_config(
                     lifecycle_runner,
@@ -2658,12 +3812,22 @@ def _run_lifecycle(
                 )
                 _checked_lifecycle_result(second_post_result, "standalone_postprocess")
             post_fingerprint = graph_fingerprint(store, root)
+            idempotence = first_post_fingerprint == post_fingerprint
+            reference_match = (
+                reference_fingerprint is not None
+                and post_fingerprint == reference_fingerprint
+            )
             lifecycle["standalone_postprocess"] = {
                 "status": "executed",
                 "duration_seconds": post_duration,
                 "result": post_payload,
-                "parity": first_post_fingerprint == post_fingerprint,
+                "parity": idempotence and reference_match,
+                "idempotence": idempotence,
+                "reference_match": reference_match,
                 "baseline_fingerprint": baseline_fingerprint,
+                "first_post_fingerprint": first_post_fingerprint,
+                "reference_fingerprint": reference_fingerprint,
+                "observed_fingerprint": post_fingerprint,
             }
             timings["standalone_postprocess"] = [post_duration]
         except Exception as exc:
@@ -2688,7 +3852,6 @@ def _run_lifecycle(
         if lifecycle_runner is not None and watch_smoke:
             started = time.perf_counter()
             try:
-                watch_before = graph_fingerprint(store, root)
                 watch_result = _invoke_with_optional_config(
                     lifecycle_runner,
                     "watch",
@@ -2698,11 +3861,60 @@ def _run_lifecycle(
                 )
                 watch_payload = _checked_lifecycle_result(watch_result, "watch")
                 watch_after = graph_fingerprint(store, root)
+                watch_activity, watch_counts = _watch_activity_evidence(watch_payload)
+                watch_reference = _valid_fingerprint(
+                    watch_payload.get("reference_fingerprint")
+                )
+                if watch_reference is None:
+                    watch_reference = _valid_fingerprint(
+                        watch_payload.get("full_build_reference_fingerprint")
+                    )
+                watch_reference_match = (
+                    watch_reference is not None and watch_after == watch_reference
+                )
+                # A before/after equality is not a reference graph.  Requiring
+                # an isolated runner to provide one prevents a no-op watch
+                # smoke from being reported as lifecycle parity.
+                watch_parity = (
+                    watch_activity
+                    and watch_reference_match
+                )
+                if not watch_activity:
+                    diagnostics.append(
+                        _diagnostic(
+                            "watch_activity_unverified",
+                            "warning",
+                            "Watch smoke returned no complete event/update/notification evidence.",
+                            **watch_counts,
+                        )
+                    )
+                elif watch_reference is None:
+                    diagnostics.append(
+                        _diagnostic(
+                            "watch_reference_unavailable",
+                            "warning",
+                            "Watch smoke did not provide a valid reference fingerprint.",
+                        )
+                    )
+                elif not watch_reference_match:
+                    diagnostics.append(
+                        _diagnostic(
+                            "watch_reference_mismatch",
+                            "warning",
+                            "Watch smoke graph does not match its supplied reference fingerprint.",
+                            reference_fingerprint=watch_reference,
+                            observed_fingerprint=watch_after,
+                        )
+                    )
                 lifecycle["watch"] = {
                     "status": "executed",
                     "duration_seconds": time.perf_counter() - started,
                     "result": watch_payload,
-                    "parity": watch_before == watch_after,
+                    "parity": watch_parity,
+                    "activity_evidence": watch_activity,
+                    "reference_match": watch_reference_match,
+                    "reference_fingerprint": watch_reference,
+                    "observed_fingerprint": watch_after,
                 }
             except Exception as exc:
                 diagnostics.append(
@@ -2757,9 +3969,18 @@ def _run_lifecycle(
                 target = sorted(files)[0]
                 started = time.perf_counter()
                 if lifecycle_runner is None:
-                    forget_kwargs: dict[str, Any] = {}
-                    if erlang_config is not None:
-                        forget_kwargs["erlang_config"] = erlang_config
+                    # ``forget_files`` uses ``None`` to mean "consult the
+                    # environment" for its public API.  The adoption runner's
+                    # default is deliberately Generic-only, so pass an
+                    # explicit disabled config when no opt-in was supplied;
+                    # otherwise an ambient CRG_ERLANG_ENABLED could make this
+                    # one phase execute semantic tools unexpectedly.
+                    forget_config = (
+                        ErlangIntegrationConfig(enabled=False)
+                        if erlang_config is None
+                        else erlang_config
+                    )
+                    forget_kwargs: dict[str, Any] = {"erlang_config": forget_config}
                     forget_result = _invoke_with_optional_config(
                         forget_files,
                         forget_store,
@@ -2782,6 +4003,7 @@ def _run_lifecycle(
                 forget_parity = False
                 forget_baseline_fingerprint: str | None = None
                 forget_observed_fingerprint: str | None = None
+                forget_evidence_error: str | None = None
                 try:
                     forget_observed_fingerprint = _portable_graph_fingerprint(
                         forget_store, root
@@ -2809,17 +4031,30 @@ def _run_lifecycle(
                             )
                         )
                 except Exception as exc:
+                    forget_evidence_error = f"{type(exc).__name__}: {exc}"
                     diagnostics.append(
                         _diagnostic(
                             "forget_parity_unavailable",
                             "error",
                             "Could not build a fresh baseline for forget parity.",
                             target=target,
-                            error=f"{type(exc).__name__}: {exc}",
+                            error=forget_evidence_error,
                         )
                     )
-                lifecycle["forget"] = {
-                    "status": "executed",
+                if (
+                    forget_evidence_error is None
+                    and (
+                        forget_baseline_fingerprint is None
+                        or forget_observed_fingerprint is None
+                    )
+                ):
+                    # A phase cannot be reported as executed when its
+                    # independent parity reference was never measured.  Keep
+                    # the failure explicit so the adoption verdict is blocked
+                    # and the result validator does not require absent hashes.
+                    forget_evidence_error = "parity fingerprints unavailable"
+                forget_record: dict[str, Any] = {
+                    "status": "error" if forget_evidence_error is not None else "executed",
                     "duration_seconds": forget_duration,
                     "result": forget_payload,
                     "forgotten": target,
@@ -2828,6 +4063,9 @@ def _run_lifecycle(
                     "baseline_fingerprint": forget_baseline_fingerprint,
                     "observed_fingerprint": forget_observed_fingerprint,
                 }
+                if forget_evidence_error is not None:
+                    forget_record["reason"] = forget_evidence_error
+                lifecycle["forget"] = forget_record
                 timings["forget"] = [forget_duration]
             except Exception as exc:
                 diagnostics.append(
@@ -2871,6 +4109,9 @@ def _run_lifecycle(
         }
         diagnostics.append(_diagnostic("graph_build_failed", "error", str(exc)))
         return store, lifecycle, timings, diagnostics
+    finally:
+        if full_build_reference is not None:
+            full_build_reference.close()
 
 
 def _impact_metric(corpus: Mapping[str, Any], store: GraphStore, root: Path) -> dict[str, Any]:
@@ -3010,6 +4251,8 @@ def _aggregate_metrics(
     corpus: Mapping[str, Any],
     store: GraphStore | None,
     root: Path,
+    lifecycle: Mapping[str, Mapping[str, Any]] | None = None,
+    environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     scored = [
         item
@@ -3023,6 +4266,69 @@ def _aggregate_metrics(
     recall = true_positive / expected if expected else None
 
     recall_at_10 = _recall_at_10_from_cases(scored)
+    lifecycle_map = lifecycle if isinstance(lifecycle, Mapping) else {}
+    environment_map = environment if isinstance(environment, Mapping) else {}
+    repository_observation = environment_map.get("repository", {})
+    generated_observation = environment_map.get("generated_data", {})
+    cache_observation = environment_map.get("cache", {})
+    common_provenance = {
+        "repository": (
+            str(repository_observation.get("path"))
+            if isinstance(repository_observation, Mapping)
+            and isinstance(repository_observation.get("path"), str)
+            else str(_canonical_path(root))
+        ),
+        "source_revision": (
+            repository_observation.get("revision")
+            if isinstance(repository_observation, Mapping)
+            else None
+        ),
+        "generated_data_revision": (
+            generated_observation.get("revision")
+            if isinstance(generated_observation, Mapping)
+            else None
+        ),
+        "cache_state": (
+            cache_observation.get("stale_evidence_policy")
+            if isinstance(cache_observation, Mapping)
+            else None
+        ),
+    }
+    sample_provenance: dict[str, list[dict[str, Any]]] = {}
+    for operation in (timings if isinstance(timings, Mapping) else {}):
+        operation_name = str(operation)
+        if operation_name == "targeted_query":
+            # ``_evaluate_case_results`` appends targeted-query durations in
+            # the same order as executed cases.  Bind each sample to the
+            # immutable case id and query kind rather than to a bare index.
+            sample_provenance[operation_name] = [
+                {
+                    **common_provenance,
+                    "source": "case",
+                    "case_id": item.get("id"),
+                    "query_kind": item.get("query_kind"),
+                }
+                for item in case_results
+                if item.get("status") == "executed"
+                and item.get("duration_seconds") is not None
+            ]
+        else:
+            phase = lifecycle_map.get(operation_name)
+            sample_provenance[operation_name] = [
+                {
+                    **common_provenance,
+                    "source": "lifecycle",
+                    "phase": operation_name,
+                    "status": phase.get("status")
+                    if isinstance(phase, Mapping)
+                    else "executed",
+                }
+                for _ in (
+                    timings.get(operation, ())
+                    if isinstance(timings, Mapping)
+                    else ()
+                )
+            ]
     result: dict[str, Any] = {
         "status": "executed" if scored else "not_run",
         "cases_scored": len(scored),
@@ -3030,7 +4336,7 @@ def _aggregate_metrics(
         "recall": recall,
         "recall_at_10": recall_at_10,
         "forbidden_matches": sum(int(item.get("forbidden_matches", 0)) for item in case_results),
-        "latency": _latency_metric(timings),
+        "latency": _latency_metric(timings, sample_provenance),
     }
     if store is not None:
         result["impact"] = _impact_metric(corpus, store, root)
@@ -3171,6 +4477,99 @@ def _compact_adapter_policy(
     return policy
 
 
+def _adapter_runtime_policy_enforced(environment: Mapping[str, Any]) -> bool:
+    """Return whether every declared adapter has an enforced runtime policy.
+
+    Generic-only evaluation has no external execution boundary and is treated
+    as not applicable.  Once a semantic adapter is declared, however, an
+    absent or false ``runtime_policy_enforced`` value is an explicit lack of
+    isolation and cannot support a primary adoption verdict.
+    """
+    policy = environment.get("adapter_policy")
+    if not isinstance(policy, Mapping):
+        # An absent policy cannot prove that a semantic execution boundary is
+        # enforced.  Generic-only callers still remain auxiliary because the
+        # semantic execution gate itself has no valid envelope.
+        return False
+    names = _adapter_manifest_names(policy)
+    semantic_names = names - {"generic"}
+    if not semantic_names:
+        return True
+    return policy.get("runtime_policy_enforced") is True
+
+
+def _generated_data_consistency(
+    environment: Mapping[str, Any], corpus: Mapping[str, Any] | None
+) -> tuple[bool, bool, str | None]:
+    """Check generated-data markers against the immutable manifest contract.
+
+    The check is applicable only when both artifacts explicitly exercise the
+    generated-data category.  This keeps small Generic fixtures usable while
+    making a declared generated-data corpus fail closed on missing markers,
+    missing paths, or revision/configuration drift.
+    """
+    observed = environment.get("generated_data")
+    contract = environment.get("generated_data_contract")
+    if not isinstance(contract, Mapping) and isinstance(observed, Mapping):
+        # Public result envelopes carry the expected values under ``expected``
+        # so validation does not need to reopen the manifest artifact.
+        candidate = observed.get("expected")
+        if isinstance(candidate, Mapping):
+            contract = candidate
+    cases = corpus.get("cases", []) if isinstance(corpus, Mapping) else []
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes, bytearray)):
+        cases = []
+    corpus_declared = any(
+        isinstance(item, Mapping) and item.get("category") == "generated_data"
+        for item in cases
+    )
+    if not isinstance(contract, Mapping) or not corpus_declared:
+        return True, False, None
+
+    if not isinstance(observed, Mapping):
+        return False, True, "generated_data_unavailable"
+    expected_revision = contract.get("revision")
+    expected_config = contract.get("config_version")
+    observed_revision = observed.get("revision")
+    observed_config = observed.get("config_version")
+    if (
+        not isinstance(expected_revision, str)
+        or not expected_revision
+        or not isinstance(expected_config, str)
+        or not expected_config
+        or not isinstance(observed_revision, str)
+        or not observed_revision
+        or not isinstance(observed_config, str)
+        or not observed_config
+    ):
+        return False, True, "generated_data_markers_unavailable"
+    if observed_revision != expected_revision or observed_config != expected_config:
+        return False, True, "generated_data_revision_mismatch"
+
+    marker_files = observed.get("marker_files")
+    if not isinstance(marker_files, Mapping) or any(
+        marker_files.get(marker) is not True for marker in _GENERATED_DATA_MARKERS
+    ):
+        return False, True, "generated_data_markers_unavailable"
+
+    expected_paths = contract.get("paths", [])
+    counts = observed.get("counts")
+    if not isinstance(expected_paths, list) or not isinstance(counts, Mapping):
+        return False, True, "generated_data_paths_unavailable"
+    for path in expected_paths:
+        if not isinstance(path, str) or not path:
+            return False, True, "generated_data_paths_unavailable"
+        # ``_discover_generated_data`` records ``None`` when an expected
+        # generated directory/file is absent or unreadable.  A non-negative
+        # count is the only reliable positive evidence for the declared
+        # directory layout used by the adoption corpus.
+        count = counts.get(path)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return False, True, "generated_data_paths_unavailable"
+
+    return True, True, None
+
+
 def _diagnostics_contract(corpus: Mapping[str, Any]) -> dict[str, Any]:
     metrics = corpus.get("metrics")
     if not isinstance(metrics, Mapping):
@@ -3207,6 +4606,7 @@ def _semantic_execution_state(
     integration envelope can satisfy this gate.
     """
     required = _semantic_required_adapters(environment)
+    policy_enforced = _adapter_runtime_policy_enforced(environment)
     seen: set[str] = set()
     statuses: dict[str, str] = {}
     envelopes = 0
@@ -3282,9 +4682,20 @@ def _semantic_execution_state(
     # Even when every optional adapter is explicitly marked ``required: false``,
     # promotion still needs proof that at least one declared semantic adapter
     # ran.  A generic/disabled envelope alone is not semantic execution.
-    valid = bool(envelopes) and bool(explicit_success) and not failures and required.issubset(
-        explicit_success
+    valid = (
+        policy_enforced
+        and bool(envelopes)
+        and bool(explicit_success)
+        and not failures
+        and required.issubset(explicit_success)
     )
+    reason: str | None
+    if valid:
+        reason = None
+    elif not policy_enforced:
+        reason = "adapter_runtime_policy_not_enforced"
+    else:
+        reason = "semantic_adapter_execution_not_verified"
     return {
         "status": "executed" if valid else "not_run",
         "required": sorted(required),
@@ -3292,7 +4703,8 @@ def _semantic_execution_state(
         "statuses": statuses,
         "envelopes": envelopes,
         "valid": valid,
-        "reason": None if valid else "semantic_adapter_execution_not_verified",
+        "policy_enforced": policy_enforced,
+        "reason": reason,
     }
 
 
@@ -3308,6 +4720,9 @@ def _adoption_gates(
     available_tools = _available_semantic_tools(environment)
     semantic_execution = _semantic_execution_state(environment, lifecycle)
     semantic_complete = bool(semantic_execution.get("valid"))
+    generated_data_ok, generated_data_applicable, _generated_data_reason = (
+        _generated_data_consistency(environment, corpus)
+    )
     all_cases_executed = bool(case_results) and all(
         item.get("status") == "executed" for item in case_results
     )
@@ -3383,9 +4798,26 @@ def _adoption_gates(
         else None
     )
     invalid_latency_samples = _nonnegative_count(latency_map.get("invalid_samples"))
+    latency_samples_complete = all(
+        isinstance(by_operation, Mapping)
+        and isinstance(by_operation.get(operation), Mapping)
+        and _nonnegative_count(by_operation[operation].get("samples")) is not None
+        and int(by_operation[operation].get("samples", 0)) >= _LATENCY_MIN_SAMPLES
+        for operation in _LATENCY_REQUIRED_OPERATIONS
+    )
+    latency_provenance_complete = isinstance(
+        latency_map.get("sample_provenance"), Mapping
+    ) and all(
+        isinstance(latency_map["sample_provenance"].get(operation), list)
+        and len(latency_map["sample_provenance"].get(operation, []))
+        >= _LATENCY_MIN_SAMPLES
+        for operation in _LATENCY_REQUIRED_OPERATIONS
+    )
     latency_ok = (
         latency_map.get("status") == "executed"
         and invalid_latency_samples == 0
+        and latency_samples_complete
+        and latency_provenance_complete
         and full_budget is not None
         and targeted_budget is not None
         and full_p95 is not None
@@ -3401,11 +4833,7 @@ def _adoption_gates(
     )
     lifecycle_ok = all(
         isinstance(lifecycle.get(name), Mapping)
-        and lifecycle[name].get("status") == "executed"
-        # Parity is an evidence field, not an opt-out.  Missing parity must
-        # fail closed just like an explicit false value.
-        and lifecycle[name].get("parity") is True
-        and (name != "forget" or lifecycle[name].get("target_absent") is True)
+        and _lifecycle_parity_from_evidence(name, lifecycle[name])
         for name in lifecycle_names
     )
     unresolved_cases = [
@@ -3456,6 +4884,8 @@ def _adoption_gates(
         "working_tree_state_known": bool(gates.get("working_tree_state_known")),
         "remote_identity": bool(gates.get("remote_identity")),
         "dependencies_consistent": bool(gates.get("dependencies_consistent")),
+        "generated_data_consistent": generated_data_ok,
+        "runtime_policy_enforced": _adapter_runtime_policy_enforced(environment),
         "semantic_tools": semantic_complete,
         "semantic_adapters_executed": semantic_complete,
         "precision_100": precision_ok,
@@ -3500,6 +4930,7 @@ def _adoption_gates(
             bool(adoption_gates.get("clean_baseline"))
             and not bool(adoption_gates.get("dependencies_consistent"))
         )
+        or (generated_data_applicable and not generated_data_ok)
     )
     if hard_failure:
         verdict = "blocked"
@@ -3537,10 +4968,47 @@ def _assemble_adoption_result(
     dry_run: bool,
 ) -> dict[str, Any]:
     """Compute metrics, gates, and the validated public result envelope."""
-    metrics = _aggregate_metrics(case_results, timings, corpus_doc, store, root)
+    metrics = _aggregate_metrics(
+        case_results,
+        timings,
+        corpus_doc,
+        store,
+        root,
+        lifecycle=lifecycle,
+        environment=environment,
+    )
     result_adapter_policy = _compact_adapter_policy(environment, manifest_doc)
+    result_generated_data = dict(
+        environment.get("generated_data", {})
+        if isinstance(environment.get("generated_data"), Mapping)
+        else {}
+    )
+    generated_contract = manifest_doc.get("generated_data")
+    if isinstance(generated_contract, Mapping):
+        # Keep the expected values beside the observed markers so a result can
+        # be validated independently of the source manifest path.
+        result_generated_data["expected"] = {
+            key: generated_contract.get(key)
+            for key in ("revision", "config_version", "paths")
+        }
     adoption_environment = dict(environment)
     adoption_environment["adapter_policy"] = result_adapter_policy
+    adoption_environment["generated_data"] = result_generated_data
+    adoption_environment["generated_data_contract"] = generated_contract
+    (
+        generated_data_ok,
+        generated_data_applicable,
+        generated_data_reason,
+    ) = _generated_data_consistency(adoption_environment, corpus_doc)
+    if generated_data_applicable and not generated_data_ok:
+        diagnostics.append(
+            _diagnostic(
+                "generated_data_gate_failed",
+                "error",
+                "Generated-data markers are unavailable or do not match the manifest contract.",
+                reason=generated_data_reason,
+            )
+        )
     observed_codes = {
         str(item.get("code"))
         for item in diagnostics
@@ -3559,6 +5027,7 @@ def _assemble_adoption_result(
     # override allowed the temporary graph to be built.
     if not gates.get("clean_baseline") and adoption["verdict"] == "primary":
         adoption = {**adoption, "verdict": "auxiliary", "pass": False}
+    corpus_contract = _build_corpus_contract(corpus_doc, root, store)
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": RESULT_KIND,
@@ -3587,7 +5056,7 @@ def _assemble_adoption_result(
         "environment": {
             "repository": environment.get("repository", {}),
             "toolchain": environment.get("toolchain", {}),
-            "generated_data": environment.get("generated_data", {}),
+            "generated_data": result_generated_data,
             "available_semantic_tools": sorted(available_tools),
             "cache": environment.get("cache", {}),
             # Preserve the policy inputs used to decide which semantic
@@ -3603,6 +5072,7 @@ def _assemble_adoption_result(
         "metrics": metrics,
         "adoption": adoption,
         "diagnostics": diagnostics,
+        "corpus_contract": corpus_contract,
     }
     result["status"] = (
         "blocked" if adoption["verdict"] == "blocked" else "ok" if adoption["pass"] else "auxiliary"
@@ -3611,7 +5081,133 @@ def _assemble_adoption_result(
     return result
 
 
-def validate_evaluation_result(result: Mapping[str, Any]) -> None:
+def _validate_contract_binding(binding: Any, field: str) -> None:
+    if not isinstance(binding, Mapping):
+        raise ValueError(f"{field}: expected object")
+    aliases = binding.get("aliases")
+    qualified_aliases = binding.get("qualified_aliases")
+    if not isinstance(aliases, list) or any(
+        not isinstance(value, str) or not value for value in aliases
+    ):
+        raise ValueError(f"{field}.aliases: expected string array")
+    if len(set(aliases)) != len(aliases):
+        raise ValueError(f"{field}.aliases: duplicate alias")
+    if not isinstance(qualified_aliases, list) or any(
+        not isinstance(value, str) or "::" not in value for value in qualified_aliases
+    ):
+        raise ValueError(f"{field}.qualified_aliases: expected qualified string array")
+    if not set(qualified_aliases).issubset(set(aliases)):
+        raise ValueError(f"{field}.qualified_aliases: not a subset of aliases")
+    for key in ("file", "symbol", "module", "dynamic", "literal"):
+        value = binding.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{field}.{key}: expected string or null")
+    arity = binding.get("arity")
+    if arity is not None and _parse_erlang_arity(arity) != arity:
+        raise ValueError(f"{field}.arity: expected bounded integer or null")
+    mfa = binding.get("mfa")
+    if mfa is not None:
+        if not isinstance(mfa, list) or len(mfa) != 3:
+            raise ValueError(f"{field}.mfa: expected module/function/arity array or null")
+        if any(not isinstance(value, str) for value in mfa[:2]) or (
+            _parse_erlang_arity(mfa[2]) != mfa[2]
+        ):
+            raise ValueError(f"{field}.mfa: malformed MFA")
+
+
+def _validate_corpus_contract(
+    contract: Any,
+    result_cases: Sequence[Mapping[str, Any]],
+    root: Path,
+    corpus: Mapping[str, Any] | None = None,
+) -> list[Mapping[str, Any]]:
+    """Validate and return immutable expected relation records from a result."""
+    if not isinstance(contract, Mapping):
+        raise ValueError("result.corpus_contract: expected object")
+    if contract.get("version") != _CORPUS_CONTRACT_VERSION:
+        raise ValueError("result.corpus_contract.version: unsupported version")
+    contract_cases = contract.get("cases")
+    if not isinstance(contract_cases, list):
+        raise ValueError("result.corpus_contract.cases: expected array")
+    digest = contract.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("result.corpus_contract.digest: expected lowercase SHA-256")
+    expected_digest = hashlib.sha256(
+        _canonical_json(_contract_source_payload(contract)).encode("utf-8")
+    ).hexdigest()
+    if digest != expected_digest:
+        raise ValueError("result.corpus_contract.digest: inconsistent with cases")
+    if len(contract_cases) != len(result_cases):
+        raise ValueError("result.corpus_contract.cases: inconsistent with result.cases")
+    ids: set[str] = set()
+    normalized_cases: list[Mapping[str, Any]] = []
+    for index, contract_case in enumerate(contract_cases):
+        if not isinstance(contract_case, Mapping):
+            raise ValueError(f"result.corpus_contract.cases[{index}]: expected object")
+        case_id = contract_case.get("id")
+        category = contract_case.get("category")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"result.corpus_contract.cases[{index}].id: expected non-empty string")
+        if case_id in ids:
+            raise ValueError(f"result.corpus_contract.cases[{index}].id: duplicate case id")
+        ids.add(case_id)
+        if not isinstance(category, str) or not category:
+            raise ValueError(
+                f"result.corpus_contract.cases[{index}].category: expected non-empty string"
+            )
+        result_case = result_cases[index]
+        if result_case.get("id") != case_id or result_case.get("category") != category:
+            raise ValueError(
+                f"result.corpus_contract.cases[{index}]: id/category inconsistent with result.cases"
+            )
+        expected = contract_case.get("expected")
+        if not isinstance(expected, Mapping):
+            raise ValueError(f"result.corpus_contract.cases[{index}].expected: expected object")
+        for relation_kind in ("positive", "negative", "unresolved"):
+            relations = expected.get(relation_kind)
+            if not isinstance(relations, list):
+                raise ValueError(
+                    f"result.corpus_contract.cases[{index}].expected."
+                    f"{relation_kind}: expected array"
+                )
+            for relation_index, relation in enumerate(relations):
+                field = (
+                    f"result.corpus_contract.cases[{index}].expected."
+                    f"{relation_kind}[{relation_index}]"
+                )
+                if not isinstance(relation, Mapping):
+                    raise ValueError(f"{field}: expected object")
+                if not isinstance(relation.get("relation"), str) or not relation.get("relation"):
+                    raise ValueError(f"{field}.relation: expected non-empty string")
+                matching = relation.get("matching")
+                if not isinstance(matching, Mapping):
+                    raise ValueError(f"{field}.matching: expected object")
+                if "target" not in matching:
+                    raise ValueError(f"{field}.matching.target: missing field")
+                _validate_contract_binding(matching.get("target"), f"{field}.matching.target")
+                if "source" in relation:
+                    if "source" not in matching:
+                        raise ValueError(f"{field}.matching.source: missing field")
+                    _validate_contract_binding(matching.get("source"), f"{field}.matching.source")
+        allow_empty = contract_case.get("allow_empty")
+        if not isinstance(allow_empty, bool):
+            raise ValueError(f"result.corpus_contract.cases[{index}].allow_empty: expected boolean")
+        normalized_cases.append(contract_case)
+
+    # When the source corpus is available, compare its canonical source payload
+    # as well as the checksum.  This gives callers an authoritative binding
+    # instead of trusting a report that edited both contract fields and digest.
+    if corpus is not None:
+        source_contract = _build_corpus_contract(corpus, root, None)
+        if _contract_source_payload(source_contract) != _contract_source_payload(contract):
+            raise ValueError("result.corpus_contract: does not match source corpus")
+    return normalized_cases
+
+
+def validate_evaluation_result(
+    result: Mapping[str, Any],
+    corpus: str | Path | Mapping[str, Any] | None = None,
+) -> None:
     """Validate the no-fabrication invariants of an adoption result."""
     if not isinstance(result, Mapping):
         raise ValueError("result: expected object")
@@ -3651,6 +5247,7 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
         target.get("working_tree_clean"), bool
     ):
         raise ValueError("result.target.working_tree_clean: expected boolean or null")
+    target_record = target
 
     environment = result.get("environment")
     if not isinstance(environment, Mapping):
@@ -3666,6 +5263,29 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
         if not isinstance(environment.get(key), Mapping):
             raise ValueError(f"result.environment.{key}: expected object")
     repository = environment["repository"]
+    recomputed_repository = _validate_repository_observation(target, repository)
+    toolchain = environment["toolchain"]
+    toolchain_tools = toolchain.get("tools")
+    if not isinstance(toolchain_tools, Mapping):
+        raise ValueError("result.environment.toolchain.tools: expected object")
+    if not toolchain_tools:
+        raise ValueError("result.environment.toolchain.tools: must not be empty")
+    for name, tool in toolchain_tools.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("result.environment.toolchain.tools: invalid tool name")
+        if not isinstance(tool, Mapping):
+            raise ValueError(
+                f"result.environment.toolchain.tools.{name}: expected object"
+            )
+        tool_status = tool.get("status")
+        if not isinstance(tool_status, str) or not tool_status:
+            raise ValueError(
+                f"result.environment.toolchain.tools.{name}.status: expected string"
+            )
+        if tool_status not in TOOL_STATUSES:
+            raise ValueError(
+                f"result.environment.toolchain.tools.{name}.status: unsupported value"
+            )
     if "remote" in repository and repository.get("remote") is not None and not isinstance(
         repository.get("remote"), str
     ):
@@ -3677,6 +5297,44 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
         raise ValueError("result.environment.available_semantic_tools: expected string array")
     if len(set(available_tools)) != len(available_tools):
         raise ValueError("result.environment.available_semantic_tools: duplicate tool")
+    expected_available_tools = _available_semantic_tools(environment)
+    if set(available_tools) != expected_available_tools:
+        raise ValueError(
+            "result.environment.available_semantic_tools: inconsistent with toolchain"
+        )
+
+    generated_data = environment["generated_data"]
+    generated_expected = generated_data.get("expected")
+    if not isinstance(generated_expected, Mapping):
+        raise ValueError("result.environment.generated_data.expected: expected object")
+    for field in ("revision", "config_version"):
+        value = generated_expected.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"result.environment.generated_data.expected.{field}: expected string")
+    expected_paths = generated_expected.get("paths")
+    if not isinstance(expected_paths, list) or any(
+        not isinstance(item, str) or not item for item in expected_paths
+    ):
+        raise ValueError("result.environment.generated_data.expected.paths: expected string array")
+    for field in ("revision", "config_version"):
+        value = generated_data.get(field)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"result.environment.generated_data.{field}: expected string or null")
+    marker_files = generated_data.get("marker_files")
+    if not isinstance(marker_files, Mapping) or any(
+        not isinstance(marker_files.get(marker), bool) for marker in _GENERATED_DATA_MARKERS
+    ):
+        raise ValueError("result.environment.generated_data.marker_files: invalid marker map")
+    counts = generated_data.get("counts")
+    if not isinstance(counts, Mapping):
+        raise ValueError("result.environment.generated_data.counts: expected object")
+    for path, count in counts.items():
+        if not isinstance(path, str) or not path:
+            raise ValueError("result.environment.generated_data.counts: invalid path")
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+        ):
+            raise ValueError(f"result.environment.generated_data.counts.{path}: invalid count")
 
     adapter_policy = environment["adapter_policy"]
     policy_names = adapter_policy.get("manifests")
@@ -4096,6 +5754,8 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
     ):
         raise ValueError("result.adoption.semantic.execution.statuses: expected string map")
     check_count(execution.get("envelopes"), "adoption.semantic.execution.envelopes")
+    if not isinstance(execution.get("policy_enforced"), bool):
+        raise ValueError("result.adoption.semantic.execution.policy_enforced: expected boolean")
     if execution["valid"] and execution["envelopes"] == 0:
         raise ValueError("result.adoption.semantic.execution: executed state needs an envelope")
     if execution.get("reason") is not None and not isinstance(execution.get("reason"), str):
@@ -4258,6 +5918,101 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
                     f"cases[{case_index}].unresolved_satisfied: expected boolean or null"
                 )
 
+    # Every new result is bound to the exact case/query/expected corpus that
+    # produced it.  Prefer an explicitly supplied corpus; otherwise reopen the
+    # recorded artifact when it is still available on disk.  Reports copied
+    # without their source corpus remain verifiable through the embedded
+    # contract digest and frozen matcher bindings.
+    source_corpus: Mapping[str, Any] | None = None
+    if corpus is not None:
+        if isinstance(corpus, Mapping):
+            validate_corpus(corpus)
+            source_corpus = corpus
+        else:
+            source_corpus, _source_corpus_path = _load_corpus_artifact(corpus)
+    elif isinstance(run.get("corpus"), str) and run.get("corpus"):
+        source_path = Path(str(run["corpus"]))
+        if source_path.is_file():
+            source_corpus, _source_corpus_path = _load_corpus_artifact(source_path)
+
+    contract_cases = _validate_corpus_contract(
+        result.get("corpus_contract"), cases, _canonical_path(str(target["path"])), source_corpus
+    )
+    contract_root = _canonical_path(str(target["path"]))
+    contract_derived_fields = (
+        "predicted_count",
+        "unresolved_prediction_count",
+        "expected_positive_count",
+        "true_positive",
+        "false_positive",
+        "forbidden_matches",
+        "ranked_true_positive",
+        "recall",
+        "recall_at_10",
+        "unresolved_expected_count",
+        "unresolved_observed_count",
+        "resolved_unresolved_match_count",
+        "unresolved_satisfied",
+        "measurement_complete",
+    )
+    for case_index, result_case in enumerate(cases):
+        contract_case = contract_cases[case_index]
+        expected_contract = contract_case.get("expected")
+        if not isinstance(expected_contract, Mapping):
+            raise ValueError(
+                f"result.corpus_contract.cases[{case_index}].expected: expected object"
+            )
+        unresolved_contract = expected_contract.get("unresolved", [])
+        expected_unresolved_count = (
+            len(unresolved_contract) if isinstance(unresolved_contract, list) else 0
+        )
+        if result_case.get("unresolved_expected_count") != expected_unresolved_count:
+            raise ValueError(
+                f"cases[{case_index}].unresolved_expected_count: inconsistent with corpus contract"
+            )
+        if result_case.get("status") != "executed":
+            continue
+        scoring_case: dict[str, Any] = {
+            "id": contract_case.get("id"),
+            "expected": dict(expected_contract),
+        }
+        if contract_case.get("allow_empty") is True:
+            scoring_case["expected"]["allow_empty"] = True
+        predictions = result_case.get("predictions")
+        if not isinstance(predictions, list):  # structural validation above should catch this
+            raise ValueError(f"cases[{case_index}].predictions: expected array")
+        rescored = score_case(
+            scoring_case,
+            predictions,
+            root=contract_root,
+            store=None,
+            relation_matcher=lambda candidate, expected: _contract_relation_matches(
+                candidate, expected, contract_root
+            ),
+            unresolved_relation_matcher=(
+                lambda candidate, expected: _contract_unresolved_relation_matches(
+                    candidate, expected, contract_root
+                )
+            ),
+        )
+        for field in contract_derived_fields:
+            actual = result_case.get(field)
+            expected_value = rescored.get(field)
+            if isinstance(expected_value, float) or isinstance(actual, float):
+                if expected_value is None or actual is None:
+                    if expected_value is not actual:
+                        raise ValueError(
+                            f"cases[{case_index}].{field}: inconsistent with corpus contract"
+                        )
+                elif not math.isclose(float(actual), float(expected_value)):
+                    raise ValueError(
+                        f"cases[{case_index}].{field}: inconsistent with corpus contract"
+                    )
+            elif actual != expected_value:
+                raise ValueError(
+                    f"cases[{case_index}].{field}: inconsistent with corpus contract"
+                )
+
     lifecycle = result.get("lifecycle")
     if not isinstance(lifecycle, Mapping):
         raise ValueError("result.lifecycle: expected object")
@@ -4276,14 +6031,194 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
             or float(duration) < 0
         ):
             raise ValueError(f"result.lifecycle.{name}.duration_seconds: invalid value")
-        if "parity" in item and not isinstance(item.get("parity"), bool):
+        if not isinstance(item.get("parity"), bool):
             raise ValueError(f"result.lifecycle.{name}.parity: expected boolean")
         if "target_absent" in item and not isinstance(item.get("target_absent"), bool):
             raise ValueError(f"result.lifecycle.{name}.target_absent: expected boolean")
         if "reason" in item and not isinstance(item.get("reason"), str):
             raise ValueError(f"result.lifecycle.{name}.reason: expected string")
-        if item.get("status") == "executed" and not isinstance(item.get("result"), Mapping):
-            raise ValueError(f"result.lifecycle.{name}.result: executed phase needs an object")
+        phase_result = item.get("result")
+        if phase_result is not None:
+            if not isinstance(phase_result, Mapping):
+                raise ValueError(f"result.lifecycle.{name}.result: expected object")
+            try:
+                _validate_lifecycle_payload_shape(phase_result, name)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"result.lifecycle.{name}.result: {exc}"
+                ) from exc
+        if item.get("status") == "executed":
+            if not isinstance(phase_result, Mapping):
+                raise ValueError(f"result.lifecycle.{name}.result: executed phase needs an object")
+
+            # The nested runner envelope is an evidence boundary too.  A
+            # producer must not mark the outer phase as executed while carrying
+            # an inner failure/not-run status (or an unknown status string).
+            payload_status = phase_result.get("status")
+            if isinstance(payload_status, str):
+                normalized_payload_status = payload_status.casefold()
+                if normalized_payload_status in {
+                    "error",
+                    "failed",
+                    "blocked",
+                    "not_run",
+                    "dry_run",
+                }:
+                    raise ValueError(
+                        f"result.lifecycle.{name}.result.status: "
+                        f"runner reported {normalized_payload_status!r}"
+                    )
+                if normalized_payload_status and normalized_payload_status not in {
+                    "ok",
+                    "executed",
+                    "success",
+                    "completed",
+                }:
+                    raise ValueError(
+                        f"result.lifecycle.{name}.result.status: unsupported value"
+                    )
+
+            # Executed lifecycle records carry phase-specific evidence.  The
+            # public parity bit must agree with that evidence; a report cannot
+            # promote a forged ``parity: true`` by editing only the summary.
+            evidence_parity = _lifecycle_parity_from_evidence(
+                name,
+                item,
+                require_reported=False,
+            )
+            if item["parity"] != evidence_parity:
+                raise ValueError(
+                    f"result.lifecycle.{name}.parity: inconsistent with evidence"
+                )
+
+            if name == "incremental_update":
+                if not isinstance(item.get("update_evidence"), bool):
+                    raise ValueError(
+                        "result.lifecycle.incremental_update.update_evidence: "
+                        "expected boolean"
+                    )
+                for field in ("baseline_fingerprint", "observed_fingerprint"):
+                    value = item.get(field)
+                    if _valid_fingerprint(value) is None:
+                        raise ValueError(
+                            f"result.lifecycle.incremental_update.{field}: "
+                            "invalid fingerprint"
+                        )
+                files_updated = phase_result.get("files_updated")
+                changed_files = phase_result.get("changed_files")
+                graph_changed = phase_result.get("graph_changed")
+                expected_update_evidence = files_updated > 0
+                if item["update_evidence"] != expected_update_evidence:
+                    raise ValueError(
+                        "result.lifecycle.incremental_update.update_evidence: "
+                        "inconsistent with files_updated"
+                    )
+                if expected_update_evidence and (
+                    not isinstance(changed_files, list)
+                    or not changed_files
+                    or graph_changed is not True
+                ):
+                    raise ValueError(
+                        "result.lifecycle.incremental_update: positive update evidence "
+                        "requires changed_files and graph_changed=true"
+                    )
+            elif name == "standalone_postprocess":
+                for field in ("idempotence", "reference_match"):
+                    if not isinstance(item.get(field), bool):
+                        raise ValueError(
+                            f"result.lifecycle.standalone_postprocess.{field}: "
+                            "expected boolean"
+                        )
+                first = _valid_fingerprint(item.get("first_post_fingerprint"))
+                observed = _valid_fingerprint(item.get("observed_fingerprint"))
+                reference_value = item.get("reference_fingerprint")
+                reference = _valid_fingerprint(reference_value)
+                for field in ("first_post_fingerprint", "observed_fingerprint"):
+                    value = item.get(field)
+                    if _valid_fingerprint(value) is None:
+                        raise ValueError(
+                            f"result.lifecycle.standalone_postprocess.{field}: "
+                            "invalid fingerprint"
+                        )
+                if reference_value is not None and reference is None:
+                    raise ValueError(
+                        "result.lifecycle.standalone_postprocess.reference_fingerprint: "
+                        "invalid fingerprint"
+                    )
+                expected_idempotence = (
+                    first is not None and observed is not None and first == observed
+                )
+                if item["idempotence"] != expected_idempotence:
+                    raise ValueError(
+                        "result.lifecycle.standalone_postprocess.idempotence: "
+                        "inconsistent with fingerprints"
+                    )
+                expected_reference_match = (
+                    reference is not None and observed is not None and observed == reference
+                )
+                if item["reference_match"] != expected_reference_match:
+                    raise ValueError(
+                        "result.lifecycle.standalone_postprocess.reference_match: "
+                        "inconsistent with fingerprints"
+                    )
+            elif name == "watch":
+                for field in ("activity_evidence", "reference_match"):
+                    if not isinstance(item.get(field), bool):
+                        raise ValueError(
+                            f"result.lifecycle.watch.{field}: expected boolean"
+                        )
+                observed_value = item.get("observed_fingerprint")
+                observed = _valid_fingerprint(observed_value)
+                reference_value = item.get("reference_fingerprint")
+                reference = _valid_fingerprint(reference_value)
+                if observed is None:
+                    raise ValueError(
+                        "result.lifecycle.watch.observed_fingerprint: invalid fingerprint"
+                    )
+                if reference_value is not None and reference is None:
+                    raise ValueError(
+                        "result.lifecycle.watch.reference_fingerprint: invalid fingerprint"
+                    )
+                if item["activity_evidence"] != (
+                    _watch_activity_evidence(phase_result)[0]
+                ):
+                    raise ValueError(
+                        "result.lifecycle.watch.activity_evidence: inconsistent with result"
+                    )
+                expected_reference_match = (
+                    reference is not None and observed is not None and observed == reference
+                )
+                if item["reference_match"] != expected_reference_match:
+                    raise ValueError(
+                        "result.lifecycle.watch.reference_match: inconsistent with fingerprints"
+                    )
+            elif name == "forget":
+                target = item.get("forgotten")
+                forgotten = phase_result.get("forgotten")
+                if not isinstance(target, str) or not target:
+                    raise ValueError(
+                        "result.lifecycle.forget.forgotten: expected non-empty string"
+                    )
+                if not isinstance(forgotten, list) or target not in forgotten:
+                    raise ValueError(
+                        "result.lifecycle.forget.forgotten: inconsistent with result"
+                    )
+                if not isinstance(item.get("target_absent"), bool):
+                    raise ValueError(
+                        "result.lifecycle.forget.target_absent: expected boolean"
+                    )
+                for field in ("baseline_fingerprint", "observed_fingerprint"):
+                    value = item.get(field)
+                    if _valid_fingerprint(value) is None:
+                        raise ValueError(
+                            f"result.lifecycle.forget.{field}: invalid fingerprint"
+                        )
+        elif item["parity"] is not False:
+            raise ValueError(
+                f"result.lifecycle.{name}.parity: non-executed phase must be false"
+            )
+
+    _validate_latency_contract(latency, lifecycle, cases, environment)
 
     diagnostics = result.get("diagnostics")
     if not isinstance(diagnostics, list):
@@ -4305,7 +6240,7 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
     # manifest activation policy and checks every reported status/count rather
     # than trusting the producer's summary object.
     expected_execution = _semantic_execution_state(environment, lifecycle)
-    for key in ("status", "valid", "envelopes", "reason"):
+    for key in ("status", "valid", "envelopes", "reason", "policy_enforced"):
         if execution.get(key) != expected_execution.get(key):
             raise ValueError(
                 f"result.adoption.semantic.execution.{key}: inconsistent with lifecycle"
@@ -4337,6 +6272,18 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
             raise ValueError(
                 f"result.adoption.gates.{adoption_name}: inconsistent with result.gates.{raw_name}"
             )
+    requested_revision = target_record.get("requested_revision")
+    observed_revision = repository.get("revision")
+    expected_pinned_revision = (
+        isinstance(requested_revision, str)
+        and bool(requested_revision)
+        and isinstance(observed_revision, str)
+        and requested_revision == observed_revision
+    )
+    if gates["pinned_revision"] and not expected_pinned_revision:
+        raise ValueError(
+            "result.target.requested_revision: inconsistent with observed repository revision"
+        )
 
     executed_cases = [item for item in cases if item.get("status") == "executed"]
     scored_cases = [item for item in executed_cases if item.get("precision") is not None]
@@ -4406,6 +6353,14 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
     expected_top_level_diagnostics = _top_level_diagnostics_gate(
         observed_codes, environment["diagnostics_contract"]
     )
+    # Generated-data consistency is derived from the immutable expected
+    # contract embedded in the result and from the categories actually
+    # represented by its cases.  Recompute it here so a producer cannot flip
+    # the gate after discovery (or hide a revision/marker mismatch).
+    expected_generated_data, generated_data_applicable, _generated_data_reason = (
+        _generated_data_consistency(environment, {"cases": cases})
+    )
+    expected_runtime_policy = _adapter_runtime_policy_enforced(environment)
     expected_impact = (
         impact.get("status") == "executed"
         and impact.get("coverage") == 1.0
@@ -4416,12 +6371,9 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
         lifecycle[name].get("status") in {"error", "blocked"} for name in _LIFECYCLE_PHASES
     )
     # A parity gate can only be green when every phase was actually executed
-    # and each phase supplied an explicit parity assertion.  Missing parity is
-    # treated as unknown rather than the old fail-open default.
+    # and its explicit evidence derives the reported parity assertion.
     lifecycle_parity_expected = all(
-        lifecycle[name].get("status") == "executed"
-        and lifecycle[name].get("parity") is True
-        and (name != "forget" or lifecycle[name].get("target_absent") is True)
+        _lifecycle_parity_from_evidence(name, lifecycle[name])
         for name in _LIFECYCLE_PHASES
     )
     observed_codes = {
@@ -4440,6 +6392,8 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
         or available_tools
     )
     derived_gates = {
+        "generated_data_consistent": expected_generated_data,
+        "runtime_policy_enforced": expected_runtime_policy,
         "semantic_tools": bool(execution.get("valid")),
         "semantic_adapters_executed": bool(execution.get("valid")),
         "precision_100": expected_precision_100,
@@ -4501,6 +6455,7 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
             adoption_gates["clean_baseline"]
             and not adoption_gates["dependencies_consistent"]
         )
+        or (generated_data_applicable and not expected_generated_data)
     )
     expected_verdict = (
         "blocked"
@@ -4515,6 +6470,10 @@ def validate_evaluation_result(result: Mapping[str, Any]) -> None:
     expected_status = {"primary": "ok", "auxiliary": "auxiliary", "blocked": "blocked"}[verdict]
     if status != expected_status:
         raise ValueError("result.status: inconsistent with adoption verdict")
+    if repository.get("remote") != recomputed_repository.get("remote"):
+        raise ValueError(
+            "result.environment.repository.remote: inconsistent with current checkout"
+        )
 
 
 def run_adoption_evaluation(

@@ -14,10 +14,14 @@ from code_review_graph.eval.erlang_adoption import (
     RESULT_KIND,
     _adoption_gates,
     _aggregate_metrics,
+    _available_semantic_tools,
     _case_tool_reason,
+    _checked_lifecycle_result,
+    _lifecycle_parity_from_evidence,
     _relation_matches,
     _repository_gates,
     _run_case,
+    _run_lifecycle,
     _semantic_execution_state,
     _top_level_diagnostics_gate,
     render_adoption_report,
@@ -414,6 +418,7 @@ def test_result_validator_derives_optional_semantic_requirements_from_policy(tmp
     result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
     policy = {
         "manifests": ["generic", "elp", "xref", "dialyzer"],
+        "runtime_policy_enforced": True,
         "manifest_activation": {
             "generic": {"mode": "always", "required": True},
             "elp": {"mode": "explicit_opt_in", "required": False},
@@ -434,6 +439,7 @@ def test_result_validator_derives_optional_semantic_requirements_from_policy(tmp
     result["adoption"]["semantic"]["execution"] = expected
     result["adoption"]["gates"]["semantic_tools"] = expected["valid"]
     result["adoption"]["gates"]["semantic_adapters_executed"] = expected["valid"]
+    result["adoption"]["gates"]["runtime_policy_enforced"] = expected["policy_enforced"]
     validate_evaluation_result(result)
 
     forged_required = copy.deepcopy(result)
@@ -447,6 +453,246 @@ def test_result_validator_derives_optional_semantic_requirements_from_policy(tmp
     ]["elp"]["status"] = "failed"
     with pytest.raises(ValueError, match="semantic.execution"):
         validate_evaluation_result(forged_lifecycle)
+
+
+def test_result_validator_recomputes_runtime_policy_gate(tmp_path: Path):
+    """A stale runtime-policy gate cannot be used to promote a report."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    forged["adoption"]["gates"]["runtime_policy_enforced"] = True
+    with pytest.raises(ValueError, match="runtime_policy_enforced"):
+        validate_evaluation_result(forged)
+
+
+def test_result_validator_blocks_generated_data_mismatch(tmp_path: Path):
+    """A declared generated-data case with unavailable markers is hard-blocked."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    corpus["cases"][0]["category"] = "generated_data"
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+    assert result["adoption"]["verdict"] == "blocked"
+
+    forged = copy.deepcopy(result)
+    forged["adoption"]["gates"]["generated_data_consistent"] = True
+    # The validator must derive the failed gate from observed markers rather
+    # than trusting a producer-supplied boolean.
+    with pytest.raises(ValueError, match="generated_data_consistent"):
+        validate_evaluation_result(forged)
+
+
+def test_checked_lifecycle_result_rejects_phase_and_status_mismatch():
+    payload = {
+        "files_parsed": 1,
+        "errors": [],
+        "total_nodes": 1,
+        "total_edges": 0,
+    }
+    with pytest.raises(ValueError, match="phase"):
+        _checked_lifecycle_result({**payload, "phase": "watch"}, "full_build")
+    with pytest.raises(TypeError, match="status"):
+        _checked_lifecycle_result({**payload, "status": 1}, "full_build")
+    with pytest.raises(ValueError, match="incomplete envelope"):
+        _checked_lifecycle_result(
+            {"files_parsed": 1, "errors": [], "total_nodes": 1},
+            "full_build",
+        )
+
+
+def test_lifecycle_watch_requires_activity_evidence(tmp_path: Path):
+    """A zero-event smoke envelope cannot claim that watch was exercised."""
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def runner(phase, *_args, **_kwargs):
+        if phase == "full_build":
+            return {
+                "files_parsed": 0,
+                "errors": [],
+                "total_nodes": 0,
+                "total_edges": 0,
+            }
+        if phase == "incremental_update":
+            return {
+                "files_updated": 1,
+                "errors": [],
+                "changed_files": ["src/worker.erl"],
+                "graph_changed": False,
+            }
+        if phase == "standalone_postprocess":
+            return {
+                "bare_edges_resolved": 0,
+                "fts_indexed": 0,
+                "signatures_computed": 0,
+                "full_build_reference_fingerprint": "0" * 64,
+            }
+        if phase == "watch":
+            return {
+                "events": 0,
+                "updates": 0,
+                "graph_changed": False,
+                "notifications": 0,
+            }
+        raise AssertionError(phase)
+
+    store, lifecycle, _timings, diagnostics = _run_lifecycle(
+        root,
+        tmp_path / "work",
+        lifecycle_runner=runner,
+        watch_smoke=True,
+    )
+    try:
+        assert lifecycle["watch"]["status"] == "executed"
+        assert lifecycle["watch"]["activity_evidence"] is False
+        assert lifecycle["watch"]["parity"] is False
+        assert any(item["code"] == "watch_activity_unverified" for item in diagnostics)
+        assert lifecycle["standalone_postprocess"]["parity"] is False
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("field", ["events", "updates", "notifications"])
+def test_checked_watch_rejects_opaque_activity_arrays(field: str):
+    """Watch counters cannot be forged with arbitrary non-empty arrays."""
+    payload = {
+        "events": 1,
+        "updates": 1,
+        "graph_changed": True,
+        "notifications": 1,
+    }
+    payload[field] = [{}]
+    with pytest.raises(TypeError, match=rf"watch runner returned invalid {field}"):
+        _checked_lifecycle_result(payload, "watch")
+
+
+def test_validator_rejects_opaque_watch_activity_array(tmp_path: Path, monkeypatch):
+    """A report cannot promote an arbitrary watch array to activity evidence."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    forged["lifecycle"]["watch"] = {
+        "status": "executed",
+        "parity": False,
+        "activity_evidence": False,
+        "reference_match": False,
+        "reference_fingerprint": None,
+        "observed_fingerprint": "0" * 64,
+        "result": {
+            "events": [{}],
+            "updates": 1,
+            "graph_changed": True,
+            "notifications": 1,
+        },
+    }
+    with pytest.raises(ValueError, match=r"result\.lifecycle\.watch\.result"):
+        validate_evaluation_result(forged)
+
+
+def test_lifecycle_parity_is_derived_from_phase_evidence(tmp_path: Path, monkeypatch):
+    """Changing only lifecycle summaries cannot manufacture a green parity."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    mutations = {
+        "full_build": lambda item: item["result"]["errors"].append(
+            {"message": "forged build error"}
+        ),
+        "incremental_update": lambda item: item.update({"parity": True}),
+        "standalone_postprocess": lambda item: item.update(
+            {"observed_fingerprint": "f" * 64}
+        ),
+        "forget": lambda item: item.update({"target_absent": False}),
+        "watch": lambda item: item.update({"parity": True}),
+    }
+
+    for phase, mutate in mutations.items():
+        forged = copy.deepcopy(result)
+        mutate(forged["lifecycle"][phase])
+        with pytest.raises(ValueError, match=rf"result\.lifecycle\.{phase}"):
+            validate_evaluation_result(forged)
+
+
+def test_validator_rejects_inconsistent_incremental_evidence(tmp_path: Path, monkeypatch):
+    """Incremental evidence fields must describe the same observed update."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    incremental = forged["lifecycle"]["incremental_update"]
+    # A zero-file update cannot claim that update evidence was observed.
+    incremental["update_evidence"] = True
+    with pytest.raises(ValueError, match="incremental_update.update_evidence"):
+        validate_evaluation_result(forged)
+
+    forged = copy.deepcopy(result)
+    incremental = forged["lifecycle"]["incremental_update"]
+    incremental["result"]["files_updated"] = 1
+    incremental["update_evidence"] = True
+    incremental["result"]["changed_files"] = []
+    incremental["result"]["graph_changed"] = True
+    # Keep the reported parity aligned with the reducer so this assertion
+    # reaches the positive-update evidence contract itself.
+    incremental["parity"] = False
+    with pytest.raises(ValueError, match="positive update evidence"):
+        validate_evaluation_result(forged)
+
+
+def test_validator_rejects_inconsistent_forget_target_evidence(tmp_path: Path, monkeypatch):
+    """The forget wrapper target must be present in its runner summary."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    forget = forged["lifecycle"]["forget"]
+    forget["parity"] = False
+    forget["result"]["forgotten"] = []
+    with pytest.raises(ValueError, match=r"result\.lifecycle\.forget\.forgotten"):
+        validate_evaluation_result(forged)
+
+
+@pytest.mark.parametrize("payload_status", ["failed", "blocked", "not_run", "dry_run"])
+def test_validator_rejects_failed_inner_lifecycle_status(
+    tmp_path: Path, monkeypatch, payload_status: str
+):
+    """An inner failure status cannot be hidden by an executed outer phase."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    forged["lifecycle"]["full_build"]["result"]["status"] = payload_status
+    with pytest.raises(
+        ValueError,
+        match=r"result\.lifecycle\.full_build\.result\.status",
+    ):
+        validate_evaluation_result(forged)
+
+
+def test_watch_parity_requires_a_reference_and_activity_evidence():
+    """The pure reducer rejects a forged watch envelope without graph access."""
+    item = {
+        "status": "executed",
+        "parity": True,
+        "activity_evidence": True,
+        "reference_match": True,
+        "reference_fingerprint": "0" * 64,
+        "observed_fingerprint": "0" * 64,
+        "result": {
+            "events": 1,
+            "updates": 1,
+            "graph_changed": False,
+            "notifications": 1,
+        },
+    }
+    assert _lifecycle_parity_from_evidence("watch", item) is True
+    item["reference_fingerprint"] = None
+    item["reference_match"] = False
+    assert _lifecycle_parity_from_evidence("watch", item) is False
 
 
 def test_semantic_execution_rejects_generic_only_envelope():
@@ -714,6 +960,81 @@ def test_result_validator_rejects_missing_schema_sections(tmp_path: Path):
             validate_evaluation_result(malformed)
 
 
+def test_result_validator_rejects_forged_available_semantic_tools(tmp_path: Path):
+    """The advertised tools must be derived from observed toolchain status."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    forged = copy.deepcopy(result)
+    forged_tools = ["made_up_tool"]
+    forged["environment"]["available_semantic_tools"] = forged_tools
+    forged["adoption"]["semantic"]["available"] = forged_tools
+
+    with pytest.raises(ValueError, match="available_semantic_tools.*toolchain"):
+        validate_evaluation_result(forged)
+
+    stale_status = copy.deepcopy(result)
+    elp = stale_status["environment"]["toolchain"]["tools"]["elp"]
+    elp["status"] = (
+        "unavailable"
+        if elp["status"] in {"available", "available_via_rebar3"}
+        else "available"
+    )
+    with pytest.raises(ValueError, match="available_semantic_tools.*toolchain"):
+        validate_evaluation_result(stale_status)
+
+
+def test_result_validator_rejects_malformed_toolchain_tools(tmp_path: Path):
+    """Tool status evidence must remain a structured mapping."""
+    _repo, manifest, corpus = _fixture(tmp_path)
+    result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
+
+    mutations = []
+
+    def sync_advertised_tools(report: dict) -> None:
+        expected = sorted(_available_semantic_tools(report["environment"]))
+        report["environment"]["available_semantic_tools"] = expected
+        report["adoption"]["semantic"]["available"] = expected
+
+    def non_mapping_tools(report: dict) -> None:
+        report["environment"]["toolchain"]["tools"] = []
+        report["environment"]["available_semantic_tools"] = []
+        report["adoption"]["semantic"]["available"] = []
+
+    mutations.append(non_mapping_tools)
+
+    def empty_tools(report: dict) -> None:
+        report["environment"]["toolchain"]["tools"] = {}
+        report["environment"]["available_semantic_tools"] = []
+        report["adoption"]["semantic"]["available"] = []
+
+    mutations.append(empty_tools)
+
+    def non_mapping_tool(report: dict) -> None:
+        report["environment"]["toolchain"]["tools"]["elp"] = []
+        sync_advertised_tools(report)
+
+    mutations.append(non_mapping_tool)
+
+    def missing_status(report: dict) -> None:
+        report["environment"]["toolchain"]["tools"]["elp"].pop("status")
+        sync_advertised_tools(report)
+
+    mutations.append(missing_status)
+
+    def unsupported_status(report: dict) -> None:
+        report["environment"]["toolchain"]["tools"]["elp"]["status"] = "installed"
+        sync_advertised_tools(report)
+
+    mutations.append(unsupported_status)
+
+    for mutate in mutations:
+        malformed = copy.deepcopy(result)
+        mutate(malformed)
+        with pytest.raises(ValueError, match=r"toolchain\.tools"):
+            validate_evaluation_result(malformed)
+
+
 def test_result_validator_rejects_inconsistent_measured_surfaces(tmp_path: Path):
     """A report mutation must not leave a stale adoption result accepted."""
     _repo, manifest, corpus = _fixture(tmp_path)
@@ -742,6 +1063,14 @@ def test_result_validator_rejects_inconsistent_measured_surfaces(tmp_path: Path)
         report["cases"][0]["predictions"][0]["extra"] = []
 
     mutations.append(malformed_prediction)
+
+    def foreign_prediction_target(report: dict) -> None:
+        # Keep the shape and all reported counts intact while changing only
+        # the endpoint.  The embedded corpus contract must reject this as a
+        # false relation rather than trusting the producer's true_positive.
+        report["cases"][0]["predictions"][0]["target"] = "foreign:run/0"
+
+    mutations.append(foreign_prediction_target)
 
     def inconsistent_impact(report: dict) -> None:
         # The fixture has no impact ground truth, so coverage must remain null.
