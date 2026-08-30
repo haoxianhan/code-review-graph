@@ -1680,13 +1680,22 @@ class GraphStore:
             "OR e.extra LIKE '%\"erlang_raw_target\"%') "
             "ORDER BY e.id",
         ).fetchall()
+        belongs_cache: dict[str, bool] = {}
+
+        def belongs(file_path: str | Path) -> bool:
+            key = str(file_path)
+            cached = belongs_cache.get(key)
+            if cached is not None:
+                return cached
+            observed = _graph_path_belongs_to_root(file_path, repo_root)
+            belongs_cache[key] = observed
+            return observed
+
         if repo_root is not None:
             rows = [
                 row for row in rows
-                if _graph_path_belongs_to_root(row["file_path"], repo_root)
-                and _graph_path_belongs_to_root(
-                    row["source_file_path"], repo_root,
-                )
+                if belongs(row["file_path"])
+                and belongs(row["source_file_path"])
             ]
         if not rows:
             return 0
@@ -1735,6 +1744,48 @@ class GraphStore:
             ):
                 return {}
             return dict(value) if isinstance(value, dict) else {}
+
+        # Build the scoped MFA index once.  Calling find_erlang_mfa for every
+        # remote call edge turns a large repository into an O(edges * nodes)
+        # scan, especially when the graph contains tens of thousands of bare
+        # calls.  This index has the same callback/arity/path filters as the
+        # public lookup, but keeps the result local to this reconciliation
+        # pass so shared-store boundaries remain fail-closed.
+        mfa_index: dict[tuple[str, str, int], list[GraphNode]] = {}
+        for node_row in conn.execute(
+            "SELECT * FROM nodes WHERE language = 'erlang' "
+            "AND kind IN ('Function', 'Test') ORDER BY qualified_name"
+        ).fetchall():
+            if repo_root is not None and not _graph_path_belongs_to_root(
+                node_row["file_path"], repo_root,
+            ):
+                continue
+            raw_node_extra = node_row["extra"]
+            if raw_node_extra not in (None, ""):
+                try:
+                    json.loads(raw_node_extra)
+                except (TypeError, ValueError, UnicodeDecodeError, RecursionError):
+                    # Match find_erlang_mfa: malformed optional metadata is
+                    # not authoritative and must not become an MFA anchor.
+                    continue
+            node_extra = _decode_extra(node_row["extra"])
+            if node_extra.get("erlang_kind") == "callback":
+                continue
+            raw_arity = node_extra.get("arity")
+            if isinstance(raw_arity, bool):
+                continue
+            try:
+                node_arity = int(raw_arity)
+            except (TypeError, ValueError, OverflowError):
+                suffix = str(node_row["qualified_name"]).rsplit(".", 1)[-1]
+                try:
+                    node_arity = int(suffix.rsplit("/", 1)[1])
+                except (IndexError, ValueError, TypeError, OverflowError):
+                    continue
+            if not 0 <= node_arity <= 255:
+                continue
+            key = (str(node_row["parent_name"] or ""), str(node_row["name"] or ""), node_arity)
+            mfa_index.setdefault(key, []).append(self._row_to_node(node_row))
 
         def _provenance(raw_target: str) -> dict[str, Any]:
             """Describe the Generic evidence used by this resolver pass."""
@@ -1799,9 +1850,7 @@ class GraphStore:
             ).fetchall()
             mirror_changed = False
             for mirror in mirrors:
-                if repo_root is not None and not _graph_path_belongs_to_root(
-                    mirror["file_path"], repo_root,
-                ):
+                if repo_root is not None and not belongs(mirror["file_path"]):
                     continue
                 mirror_extra = _decode_extra(mirror["extra"])
                 raw_value = mirror_extra.get("erlang_raw_target")
@@ -1868,20 +1917,10 @@ class GraphStore:
             module, function, arity = parsed
             if module is None:
                 continue
-            candidates = self.find_erlang_mfa(
-                module,
-                function,
-                arity,
-                limit=21,
-                repo_root=repo_root,
-            )
+            mfa_key = (module, function, arity)
+            candidates = mfa_index.get(mfa_key, [])
+            candidate_count = len(candidates)
             candidate_names = [node.qualified_name for node in candidates]
-            if len(candidates) > 20:
-                candidate_count = self.count_erlang_mfa(
-                    module, function, arity, repo_root=repo_root,
-                )
-            else:
-                candidate_count = len(candidates)
 
             if candidate_count == 1 and candidates:
                 state = "mfa_index"
@@ -2189,13 +2228,32 @@ class GraphStore:
 
         conn = self._conn
 
+        # The adoption evaluator passes an explicit repository root.  Bare
+        # endpoint reconciliation scans every edge, node, and import row, so
+        # resolving the same graph path repeatedly dominates large Erlang
+        # repositories.  Cache the boundary decision while retaining the
+        # conservative shared-graph semantics of _graph_path_belongs_to_root.
+        belongs_cache: dict[tuple[str, bool], bool] = {}
+
+        def belongs(file_path: str | Path, *, allow_relative: bool = False) -> bool:
+            key = (str(file_path), allow_relative)
+            cached = belongs_cache.get(key)
+            if cached is not None:
+                return cached
+            observed = _graph_path_belongs_to_root(
+                file_path,
+                repo_root,
+                allow_relative=allow_relative,
+            )
+            belongs_cache[key] = observed
+            return observed
+
         bare_edges = conn.execute(select_sql, (kind,)).fetchall()
         if repo_root is not None:
             bare_edges = [
                 row for row in bare_edges
-                if _graph_path_belongs_to_root(
+                if belongs(
                     row["file_path"],
-                    repo_root,
                     allow_relative=(
                         str(row["source_language"] or row["target_language"] or "")
                         .casefold()
@@ -2212,9 +2270,8 @@ class GraphStore:
             "SELECT name, qualified_name, file_path, language FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
-            if repo_root is not None and not _graph_path_belongs_to_root(
+            if repo_root is not None and not belongs(
                 row["file_path"],
-                repo_root,
                 allow_relative=str(row["language"] or "").casefold() != "erlang",
             ):
                 continue
@@ -2244,8 +2301,8 @@ class GraphStore:
             ) or str(row["file_path"] or "").replace("\\", "/").casefold().endswith(
                 (".erl", ".hrl", ".app.src")
             )
-            if repo_root is not None and not _graph_path_belongs_to_root(
-                row["file_path"], repo_root, allow_relative=not erlang_import,
+            if repo_root is not None and not belongs(
+                row["file_path"], allow_relative=not erlang_import,
             ):
                 continue
             target = row["target_qualified"]
