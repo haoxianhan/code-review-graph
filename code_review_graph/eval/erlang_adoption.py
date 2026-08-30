@@ -2003,15 +2003,53 @@ def _query_edges(
             # exact target alias is enough to inspect them, but not to claim a
             # function-level semantic resolution.
             if kind in {"callers_of", "references", "references_to", "implementers_of"}:
-                for edge in _all_edges(store):
-                    if (
-                        edge.kind == edge_kind
-                        and edge not in edges
-                        and _edge_matches_query_target(edge, target, node, root, store)
-                    ):
+                # Canonical incoming edges were indexed above.  Only bare
+                # endpoints can need alias/MFA reconciliation; avoid
+                # materializing every edge in a large repository for each
+                # targeted review query.
+                bare_values: list[str] = []
+                if node.kind in {"Function", "Test"}:
+                    node_extra = node.extra if isinstance(node.extra, Mapping) else {}
+                    raw_arity = node_extra.get("arity")
+                    if raw_arity is None:
+                        node_tail = node.qualified_name.rsplit("::", 1)[-1]
+                        parsed_tail = _split_erlang_symbol(node_tail)
+                        raw_arity = parsed_tail[1] if parsed_tail else None
+                    if isinstance(raw_arity, int) and 0 <= raw_arity <= _MAX_ERLANG_ARITY:
+                        bare_values.extend(
+                            [
+                                f"{node.name}/{raw_arity}",
+                                f"{node.parent_name}:{node.name}/{raw_arity}",
+                                f"{node.parent_name}.{node.name}/{raw_arity}",
+                            ]
+                        )
+                if bare_values:
+                    placeholders = ",".join("?" for _ in bare_values)
+                    rows = store._conn.execute(
+                        f"SELECT * FROM edges WHERE kind = ? "
+                        f"AND target_qualified IN ({placeholders}) ORDER BY id",
+                        (edge_kind, *bare_values),
+                    ).fetchall()
+                else:
+                    rows = []
+                for row in rows:
+                    edge = store._row_to_edge(row)
+                    if _edge_matches_query_target(edge, target, node, root, store):
                         edges.append(edge)
         else:
-            for edge in _all_edges(store):
+            candidate_edges: list[GraphEdge]
+            if target_values:
+                values = sorted(value for value in target_values if isinstance(value, str))
+                placeholders = ",".join("?" for _ in values)
+                rows = store._conn.execute(
+                    f"SELECT * FROM edges WHERE kind = ? "
+                    f"AND target_qualified IN ({placeholders}) ORDER BY id",
+                    (edge_kind, *values),
+                ).fetchall()
+                candidate_edges = [store._row_to_edge(row) for row in rows]
+            else:
+                candidate_edges = []
+            for edge in candidate_edges:
                 if edge.kind == edge_kind and (
                     edge.target_qualified in target_values
                     or _endpoint_matches(edge.target_qualified, target, root, store)
@@ -2024,15 +2062,12 @@ def _query_edges(
                 # point at tests in that file.  This is useful for corpus
                 # cases that freeze a Common Test/EUnit suite path.
                 node_file = normalize_file_path(node.file_path)
-                edges.extend(
-                    edge
-                    for edge in _all_edges(store)
-                    if edge.kind == "TESTED_BY"
-                    and normalize_file_path(
-                        edge.target_qualified.split("::", 1)[0]
-                    )
-                    == node_file
-                )
+                rows = store._conn.execute(
+                    "SELECT * FROM edges WHERE kind = 'TESTED_BY' "
+                    "AND target_qualified LIKE ? ORDER BY id",
+                    (node_file + "::%",),
+                ).fetchall()
+                edges.extend(store._row_to_edge(row) for row in rows)
             else:
                 # TESTED_BY is stored as source=production, target=test.
                 # Querying incoming edges here silently returns no tests for
@@ -2047,11 +2082,14 @@ def _query_edges(
             relative = _safe_endpoint_file(target.get("file"), root)
             if relative is None:
                 return [], None
-            for edge in _all_edges(store):
-                if (
-                    edge.kind == "TESTED_BY"
-                    and _relative_path(edge.target_qualified.split("::", 1)[0], root) == relative
-                ):
+            rows = store._conn.execute(
+                "SELECT * FROM edges WHERE kind = 'TESTED_BY' "
+                "AND target_qualified LIKE ? ORDER BY id",
+                (normalize_file_path(_canonical_path(root) / relative) + "::%",),
+            ).fetchall()
+            for row in rows:
+                edge = store._row_to_edge(row)
+                if _relative_path(edge.target_qualified.split("::", 1)[0], root) == relative:
                     if edge not in edges:
                         edges.append(edge)
     return sorted(
