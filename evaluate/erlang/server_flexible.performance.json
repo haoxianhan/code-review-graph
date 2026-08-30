@@ -22,17 +22,17 @@
     "edges": 131175
   },
   "samples": {
-    "full_build": {"status": "measured", "seconds": [55.398869], "p50_seconds": 55.398869, "p95_seconds": 55.398869},
-    "incremental_update": {"status": "measured", "seconds": [49.206366], "p50_seconds": 49.206366, "p95_seconds": 49.206366},
-    "restore_update": {"status": "measured", "seconds": [48.900230], "p50_seconds": 48.900230, "p95_seconds": 48.900230},
+    "full_build": {"status": "measured", "seconds": [51.589092, 52.667485, 54.571565], "p50_seconds": 52.667485, "p95_seconds": 54.381173},
+    "incremental_update": {"status": "measured", "seconds": [47.724173, 47.872697, 47.912475], "p50_seconds": 47.872697, "p95_seconds": 47.910486},
+    "restore_update": {"status": "measured", "seconds": [48.900230], "p50_seconds": 48.900230, "p95_seconds": 48.900230, "status_note": "single earlier restore-to-HEAD sample; repeated restore was not isolated in this run"},
     "layout_only": {"status": "not_run", "seconds": [], "reason": "No isolated layout-only lifecycle operation exists in the current evaluator."},
-    "no_op_update": {"status": "measured", "seconds": [24.334089], "p50_seconds": 24.334089, "p95_seconds": 24.334089},
+    "no_op_update": {"status": "measured", "seconds": [23.929298, 23.930824, 23.961169], "p50_seconds": 23.930824, "p95_seconds": 23.958734},
     "resolve_bare_call_targets": {"status": "measured", "seconds": [22.8], "p50_seconds": 22.8, "p95_seconds": 22.8},
     "standalone_postprocess": {"status": "measured", "seconds": [56.4], "p50_seconds": 56.4, "p95_seconds": 56.4}
   },
   "budgets_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000},
   "gates": {
-    "full_build_p95": {"observed_ms": 55398.869, "budget_ms": 30000, "pass": false},
+    "full_build_p95": {"observed_ms": 54381.173, "budget_ms": 30000, "pass": false},
     "targeted_query_p95": {"observed_ms": 299.096, "budget_ms": 2000, "pass": true},
     "layout_only": {"pass": false, "reason": "not_run"},
     "lifecycle_repeatability": {"pass": false, "reason": "full evaluator exceeded 20 minutes and was stopped after a closed-database warning"}

@@ -39,9 +39,11 @@ postprocess, and lifecycle parity are not claimed by this report. The isolated
 watch smoke itself is covered by the committed watch smoke test and focused
 Erlang lifecycle suite.
 
-The performance report records a full-build p95 of `55,398.869 ms` against the
-`30,000 ms` budget. One-file incremental was `49,206.366 ms`, restore update
-`48,900.230 ms`, and no-op update `24,334.089 ms`; layout-only was not run.
+The performance report records three full-build samples (`51.589`, `52.667`,
+and `54.572 s`) with p95 `54,381.173 ms` against the `30,000 ms` budget. Three
+one-file incremental samples were `47.724`, `47.873`, and `47.912 s`; three
+no-op samples were `23.929`, `23.931`, and `23.961 s`. Restore-to-HEAD has one
+earlier `48.900 s` sample, and layout-only was not run.
 
 ELP, `erlang_ls`, and `elp-ls` were unavailable. Runtime OTP 27 differed from
 the manifest's configured OTP 25, and adapter runtime sandbox policy remains
