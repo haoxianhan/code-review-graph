@@ -18,6 +18,7 @@ from code_review_graph.incremental import (
     _parse_single_file,
     _should_ignore,
     _single_hop_dependents,
+    _single_hop_erlang_include_dependents,
     ensure_repo_gitignore_excludes_crg,
     find_dependents,
     find_project_root,
@@ -1295,6 +1296,72 @@ class TestMultiHopDependents:
         finally:
             store.close()
 
+    def test_erlang_include_dependents_skip_malformed_extra(self, tmp_path):
+        """A corrupt include edge must not abort stale-header discovery."""
+        from code_review_graph.parser import EdgeInfo, NodeInfo
+
+        repo = tmp_path / "repo"
+        header = repo / "include" / "shared.hrl"
+        good_source = repo / "src" / "good.erl"
+        bad_source = repo / "src" / "bad.erl"
+        store = GraphStore(tmp_path / "malformed-include.db")
+        try:
+            store.upsert_node(NodeInfo(
+                kind="File", name=header.as_posix(), file_path=header,
+                line_start=1, line_end=1, language="erlang",
+            ))
+            for source in (good_source, bad_source):
+                store.upsert_node(NodeInfo(
+                    kind="File", name=source.as_posix(), file_path=source,
+                    line_start=1, line_end=1, language="erlang",
+                ))
+            good_id = store.upsert_edge(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=good_source.as_posix(),
+                target=header.as_posix(),
+                file_path=good_source,
+                line=1,
+                extra={"erlang_import_kind": "pp_include"},
+            ))
+            store.upsert_edge(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=bad_source.as_posix(),
+                target=header.as_posix(),
+                file_path=bad_source,
+                line=1,
+                extra={"erlang_import_kind": "pp_include"},
+            ))
+            # Simulate a legacy row whose optional metadata was persisted as
+            # an invalid UTF-8 BLOB.  The valid sibling remains discoverable.
+            store._conn.execute(
+                "UPDATE edges SET extra = ? WHERE source_qualified = ?",
+                (b"\xff\xfe", bad_source.as_posix()),
+            )
+            store.commit()
+
+            assert _single_hop_erlang_include_dependents(
+                store, header.as_posix(), repo,
+            ) == {good_source.as_posix()}
+
+            # The legacy dependency path is still used by generic stale-file
+            # reconciliation. It must remain fail-closed on deeply nested
+            # metadata instead of letting RecursionError abort the update.
+            deep_extra = "[" * 10_000 + "0" + "]" * 10_000
+            store._conn.execute(
+                "UPDATE edges SET extra = ? WHERE source_qualified = ?",
+                (deep_extra, bad_source.as_posix()),
+            )
+            store.commit()
+            legacy_dependents = _single_hop_dependents(
+                store, header.as_posix(),
+            )
+            assert good_source.as_posix() in legacy_dependents
+            assert store._conn.execute(
+                "SELECT id FROM edges WHERE id = ?", (good_id,)
+            ).fetchone() is not None
+        finally:
+            store.close()
+
 
 class TestStartWatchThread:
     @patch("code_review_graph.incremental.watch")
@@ -1377,7 +1444,10 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._watch_sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=on_files_updated)
             assert callback_count == 1
@@ -1399,7 +1469,10 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._watch_sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
                 patch(
                     "code_review_graph.search.rebuild_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),
@@ -1545,6 +1618,45 @@ class TestWatchReconciliation:
 
             assert store.get_nodes_by_file(str(source)) == []
         finally:
+            store.close()
+
+    def test_watch_directory_delete_reconciles_legacy_relative_descendants(
+        self, tmp_path
+    ):
+        """Directory deletion also removes rows from legacy relative stores."""
+        from watchdog.events import DirDeletedEvent
+
+        from code_review_graph.parser import NodeInfo
+
+        package = tmp_path / "package"
+        package.mkdir()
+        source = package / "deleted.py"
+        source.write_text("def deleted():\n    pass\n")
+        store = GraphStore(tmp_path / "graph.db")
+        relative_path = "package/deleted.py"
+        store.store_file_nodes_edges(
+            relative_path,
+            [
+                NodeInfo(
+                    kind="File",
+                    name="deleted.py",
+                    file_path=relative_path,
+                    line_start=1,
+                    line_end=2,
+                    language="python",
+                )
+            ],
+            [],
+            "legacy-hash",
+        )
+        source.unlink()
+        package.rmdir()
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            handler.process([DirDeletedEvent(str(package))])
+            assert store.get_nodes_by_file(relative_path) == []
+        finally:
+            handler.stop()
             store.close()
 
     def test_watch_symlink_events_are_rejected(self, tmp_path):

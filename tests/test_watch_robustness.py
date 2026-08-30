@@ -38,6 +38,7 @@ from code_review_graph.incremental import (
     _load_ignore_patterns,
     _plan_watch_paths,
     _should_ignore,
+    _watch_identity,
     _WatchSupervisor,
     clear_nested_ignore_cache,
     incremental_update,
@@ -125,7 +126,7 @@ def _live_thread() -> tuple[threading.Thread, threading.Event]:
 
 
 def _tick_driver(*actions):
-    """Replacement for ``time.sleep`` that runs one scripted action per tick.
+    """Replacement for the watch sleep seam that runs one action per tick.
 
     After the script is exhausted the watch loop is stopped with a
     KeyboardInterrupt, which is how a real ``Ctrl+C`` leaves it.
@@ -360,6 +361,100 @@ class TestNewDirectoryAdoption:
 
         assert vanished == [str(tmp_path / "src")]
         assert observer.unscheduled == [str(tmp_path / "src")]
+
+    def test_recursive_root_replacement_is_re_adopted(self, tmp_path):
+        """A fallback recursive root must not stay stale after an inode swap."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "old.py").write_text("old", encoding="utf-8")
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer,
+            repo,
+            _load_ignore_patterns(repo),
+            health_path=None,
+            max_schedules=1,
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert observer.scheduled == [(str(repo), True)]
+
+        replacement = tmp_path / "repo.incoming"
+        replacement.mkdir()
+        (replacement / "src").mkdir()
+        (replacement / "src" / "new.py").write_text("new", encoding="utf-8")
+        old_identity = supervisor._watches[str(repo)].identity
+        shutil.rmtree(repo)
+        replacement.rename(repo)
+        assert old_identity != _watch_identity(repo)
+
+        adopted, vanished = supervisor.sync_watches()
+
+        assert vanished == [str(repo)]
+        assert adopted == [str(repo)]
+        assert observer.unscheduled == [str(repo)]
+        assert observer.scheduled == [(str(repo), True), (str(repo), True)]
+        assert supervisor.watched_paths == [str(repo)]
+        assert supervisor._shallow == set()
+
+    def test_recursive_root_disappearance_is_re_adopted(self, tmp_path):
+        """A root removed for a tick is released and restored when it returns."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(
+            observer,
+            repo,
+            _load_ignore_patterns(repo),
+            health_path=None,
+            max_schedules=1,
+        )
+        supervisor.schedule_initial(MagicMock())
+        assert observer.scheduled == [(str(repo), True)]
+
+        shutil.rmtree(repo)
+        adopted, vanished = supervisor.sync_watches()
+
+        assert adopted == []
+        assert vanished == [str(repo)]
+        assert supervisor.watched_paths == []
+        assert supervisor._root_pending is True
+
+        repo.mkdir()
+        (repo / "src").mkdir()
+        adopted, vanished = supervisor.sync_watches()
+
+        assert adopted == [str(repo)]
+        assert vanished == []
+        assert supervisor.watched_paths == [str(repo)]
+        assert supervisor._root_pending is False
+        assert observer.scheduled == [(str(repo), True), (str(repo), True)]
+
+    def test_root_deletion_event_reconciles_stored_files(self, tmp_path):
+        """A missing root event still removes files from the old checkout."""
+        from watchdog.events import DirDeletedEvent
+
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        source = repo / "src" / "old.py"
+        source.write_text("def old():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        incremental_update(repo, store, changed_files=["src/old.py"])
+        assert any(path.endswith("old.py") for path in store.get_all_files())
+
+        handler = _create_watch_handler(repo, store, None)
+        try:
+            shutil.rmtree(repo)
+            handler.process([DirDeletedEvent(str(repo))])
+            assert not any(path.endswith("old.py") for path in store.get_all_files())
+        finally:
+            handler.stop()
+            store.close()
 
     def test_a_quiet_tick_touches_nothing(self, tmp_path):
         supervisor, observer = self._supervisor(tmp_path)
@@ -606,6 +701,27 @@ class TestObserverLiveness:
         assert supervisor.check_liveness() == ([], [])
         assert supervisor.check_liveness() == ([], [])
 
+    def test_started_thread_that_dies_before_first_sample_is_repaired(self, tmp_path):
+        """A fast emitter exit must not disappear before its first sample."""
+        watched = tmp_path / "src"
+        watched.mkdir()
+        observer = FakeObserver()
+        supervisor = _WatchSupervisor(observer, tmp_path, [], health_path=None)
+        supervisor._handler = MagicMock()
+        supervisor._schedule(watched, recursive=True)
+
+        thread = threading.Thread(target=lambda: None, name="fast-emitter", daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        assert thread.ident is not None and not thread.is_alive()
+        observer.emitters = [FakeEmitter(thread, root=str(watched))]
+
+        dead, repaired = supervisor.check_liveness()
+
+        assert dead == []
+        assert repaired == [str(watched)]
+        assert str(watched) in supervisor.watched_paths
+
     def test_unschedulable_observer_reports_no_deaths(self, tmp_path):
         """A mock or stub observer must not fake a death every tick."""
         supervisor = _WatchSupervisor(MagicMock(), tmp_path, [], health_path=None)
@@ -742,7 +858,10 @@ class TestWatchLoop:
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
             patch("watchdog.observers.Observer", return_value=observer),
-            patch("time.sleep", side_effect=sleeper),
+            patch(
+                "code_review_graph.incremental._watch_sleep",
+                side_effect=sleeper,
+            ),
             patch(
                 "code_review_graph.incremental._WATCH_HEALTH_INTERVAL",
                 health_interval,
@@ -783,6 +902,24 @@ class TestWatchLoop:
         assert health["observer_alive"] is False
         assert health["stalled"] is True
         assert health["dead_threads"] == ["fake-inotify-buffer"]
+
+    def test_observer_start_failure_does_not_join_unstarted_thread(self, tmp_path):
+        """Startup errors must retain their cause during teardown."""
+        observer = MagicMock()
+        observer.start.side_effect = RuntimeError("observer start failed")
+        store = GraphStore(tmp_path / "graph.db")
+
+        try:
+            with (
+                patch("watchdog.observers.Observer", return_value=observer),
+                pytest.raises(RuntimeError, match="observer start failed"),
+            ):
+                watch(tmp_path, store)
+        finally:
+            store.close()
+
+        observer.stop.assert_called_once()
+        observer.join.assert_not_called()
 
     def test_cli_watch_turns_a_dead_observer_into_exit_code_1(self):
         """The daemon restarts on process exit, so the exit code has to be non-zero."""
@@ -961,6 +1098,249 @@ class TestWatchLoop:
             handler.stop()
             store.close()
 
+    def test_watch_flushes_pending_debounced_event_on_shutdown(self, tmp_path):
+        """Ctrl-C after an event must not silently discard the update."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "src" / "app.py"
+        source.parent.mkdir()
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        observer = FakeObserver()
+        store = GraphStore(tmp_path / "graph.db")
+        callbacks: list[int] = []
+
+        def deliver_event():
+            assert observer.handler is not None
+            observer.handler.dispatch(FileCreatedEvent(str(source)))
+
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 100):
+                self._watch_with(
+                    tmp_path,
+                    store,
+                    observer,
+                    _tick_driver(deliver_event),
+                    on_files_updated=lambda _store: callbacks.append(1),
+                )
+            assert store.get_nodes_by_file(str(source))
+            assert callbacks == [1]
+        finally:
+            store.close()
+
+    def test_handler_stop_is_idempotent_and_rejects_late_events(self, tmp_path):
+        """Teardown can be repeated without reopening the debouncer queue."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "late.py"
+        source.write_text("def late():\n    pass\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            handler.stop()
+            handler.stop()
+            handler.process([FileCreatedEvent(str(source))])
+            assert store.get_nodes_by_file(str(source)) == []
+        finally:
+            store.close()
+
+    def test_callback_self_stop_finishes_debouncer_before_store_close(self, tmp_path):
+        """A callback-triggered stop must hand off finalization to its thread."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "self-stop.py"
+        source.write_text("def self_stop():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+        callback_errors: list[BaseException] = []
+        holder: dict[str, object] = {}
+
+        def stop_from_callback(_store):
+            try:
+                holder["handler"].stop()  # type: ignore[union-attr]
+            except BaseException as exc:  # pragma: no cover - assertion below
+                callback_errors.append(exc)
+            finally:
+                callback_entered.set()
+
+        handler = _create_watch_handler(tmp_path, store, stop_from_callback)
+        holder["handler"] = handler
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0):
+                handler.start()
+                handler.dispatch(FileCreatedEvent(str(source)))
+                assert callback_entered.wait(5), "debounced callback never ran"
+
+                # The callback cannot join itself.  Its enclosing debouncer
+                # callback must nevertheless complete finalization before a
+                # caller is allowed to close the shared store.
+                deadline = time.monotonic() + 5
+                with handler._lifecycle_condition:
+                    while not handler._finalized and time.monotonic() < deadline:
+                        handler._lifecycle_condition.wait(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                assert handler._finalized, "self-stop left the debouncer unfinalized"
+            assert not callback_errors
+        finally:
+            # This must be a no-op after the callback-owned finalization.  It
+            # also makes the test robust if a future implementation chooses a
+            # different callback scheduling policy.
+            handler.stop()
+            store.close()
+
+    def test_external_stop_during_debounced_callback_does_not_deadlock(
+        self, tmp_path
+    ):
+        """A concurrent stop must not wait on the callback's finalizer re-entry."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "concurrent-stop.py"
+        source.write_text("def concurrent_stop():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        stopper: threading.Thread | None = None
+
+        def blocking_callback(_store):
+            callback_entered.set()
+            release_callback.wait(5)
+
+        handler = _create_watch_handler(tmp_path, store, blocking_callback)
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0):
+                handler.start()
+                handler.dispatch(FileCreatedEvent(str(source)))
+                assert callback_entered.wait(5), "debounced callback never ran"
+
+                stopper = threading.Thread(
+                    target=handler.stop,
+                    name="concurrent-watch-stop",
+                    daemon=True,
+                )
+                stopper.start()
+
+                # Ensure the external thread owns finalization before allowing
+                # the callback to return. This makes the join/re-entry cycle
+                # deterministic instead of relying on scheduler timing.
+                deadline = time.monotonic() + 5
+                with handler._lifecycle_condition:
+                    while not handler._finalizing and time.monotonic() < deadline:
+                        handler._lifecycle_condition.wait(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                assert handler._finalizing, "stopper never entered finalization"
+
+                release_callback.set()
+                stopper.join(timeout=5)
+                assert not stopper.is_alive(), "concurrent stop deadlocked"
+                assert handler._finalized
+        finally:
+            release_callback.set()
+            # If an assertion exposes a regression, the stopper is deliberately
+            # left daemonized so cleanup does not turn the useful failure into
+            # a second, unbounded wait on the same deadlock.
+            if stopper is None or not stopper.is_alive():
+                handler.stop()
+            store.close()
+
+    def test_async_base_exception_becomes_a_lifecycle_failure(self, tmp_path):
+        """Fatal callback exceptions must not silently kill the debouncer thread."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "fatal.py"
+        source.write_text("def fatal():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+
+        def fatal_callback(_store):
+            callback_entered.set()
+            raise KeyboardInterrupt("callback interrupt")
+
+        handler = _create_watch_handler(tmp_path, store, fatal_callback)
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0):
+                handler.start()
+                handler.dispatch(FileCreatedEvent(str(source)))
+                assert callback_entered.wait(5), "debounced callback never ran"
+
+                deadline = time.monotonic() + 5
+                failure = None
+                while time.monotonic() < deadline:
+                    try:
+                        handler.raise_if_failed()
+                    except RuntimeError as exc:
+                        failure = exc
+                        break
+                    time.sleep(0.01)
+                assert failure is not None, "fatal callback did not reach the lifecycle boundary"
+                assert isinstance(failure.__cause__, KeyboardInterrupt)
+        finally:
+            handler.stop()
+            store.close()
+
+    def test_abort_initialization_discards_pending_and_debounced_events(self, tmp_path):
+        """Startup cancellation must not mutate the graph during teardown."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "aborted.py"
+        source.write_text("def aborted():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback = MagicMock()
+        handler = _create_watch_handler(
+            tmp_path,
+            store,
+            callback,
+            initializing=True,
+        )
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 100):
+                handler.start()
+                event = FileCreatedEvent(str(source))
+                handler.process([event])
+                handler.dispatch(event)
+                handler.abort_initialization()
+                handler.stop()
+
+            callback.assert_not_called()
+            assert store.get_nodes_by_file(str(source)) == []
+        finally:
+            handler.stop()
+            store.close()
+
+    def test_finalizer_reentry_from_initialization_callback_does_not_deadlock(self, tmp_path):
+        """A callback run by finalization must not wait for its own finalizer."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "reentrant.py"
+        source.write_text("def reentrant():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+        holder: dict[str, object] = {}
+
+        def callback(_store):
+            callback_entered.set()
+            holder["handler"].stop()  # type: ignore[union-attr]
+
+        handler = _create_watch_handler(tmp_path, store, callback, initializing=True)
+        holder["handler"] = handler
+        try:
+            handler.process([FileCreatedEvent(str(source))])
+            # Exercise the finalizer's initialization drain directly.  The
+            # public shutdown path aborts initialization first and therefore
+            # intentionally drops this startup event.
+            with handler._lifecycle_condition:
+                handler._stopping = True
+            finalizer = threading.Thread(target=handler._finalize_stop, daemon=True)
+            finalizer.start()
+            finalizer.join(timeout=5)
+
+            assert not finalizer.is_alive(), "finalizer waited on its own callback"
+            assert callback_entered.is_set()
+            assert handler._finalized
+        finally:
+            handler.stop()
+            store.close()
+
     def test_postprocess_failure_is_retried_after_hash_only_replay(self, tmp_path):
         """A failed derived pass must survive restart even when parsing is skipped."""
         from watchdog.events import FileModifiedEvent
@@ -1086,7 +1466,8 @@ class TestWatchLoop:
         observer = FakeObserver()
         thread, gate = _live_thread()
         reader = GraphStore(tmp_path / "graph.db")
-        # The tick driver replaces time.sleep; keep the real one for polling.
+        # The tick driver replaces only the watch sleep seam; keep the real
+        # sleeper for polling the reader connection.
         real_sleep = time.sleep
 
         def emitter_appears():
@@ -1144,7 +1525,10 @@ class TestWatchLoop:
         try:
             with (
                 patch("watchdog.observers.Observer", return_value=FakeObserver()),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._watch_sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
                 patch(
                     "code_review_graph.incremental.incremental_update",
                     side_effect=record_initial_health,
@@ -1218,6 +1602,15 @@ class TestRealObserver:
             time.sleep(interval)
         return False
 
+    def _wait_until_watching(self, repo):
+        """Wait for the post-build readiness phase, not file creation."""
+        return self._wait_for(
+            lambda: (
+                (health := read_watch_health(repo)) is not None
+                and health.get("phase") == "watching"
+            )
+        )
+
     def test_new_top_level_directory_is_indexed(self, tmp_path):
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
@@ -1242,9 +1635,9 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(
-                    lambda: watch_health_path(repo).exists()
-                ), "the watch loop never started"
+                assert self._wait_until_watching(repo), (
+                    "the watch loop never completed initial reconciliation"
+                )
 
                 # The whole point: this directory did not exist when the
                 # watches were planned.
@@ -1299,7 +1692,9 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._wait_until_watching(repo), (
+                    "the watch loop never completed initial reconciliation"
+                )
 
                 # Delete and recreate back to back, well inside one tick.
                 shutil.rmtree(repo / "src")
@@ -1344,7 +1739,9 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._wait_until_watching(repo), (
+                    "the watch loop never completed initial reconciliation"
+                )
                 shutil.rmtree(repo / "lib")
                 time.sleep(1.0)  # several ticks
                 still_running = thread.is_alive()

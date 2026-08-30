@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, NamedTuple, Optional
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -346,7 +346,23 @@ def _ensure_erlang_identity_current(
     root = _canonical_repo_root(repo_root)
     if _erlang_identity_is_current(store, root):
         return None
-    if not store.has_nodes() or not _repo_contains_erlang_sources(root):
+    if not store.has_nodes():
+        return None
+    # Do not run a Git/filesystem inventory probe for an unrelated graph.  In
+    # particular, watch startup must remain independent of project VCS state
+    # for Python-only repositories.  Legacy stores can still be recognized by
+    # their Erlang file suffixes; only those stores need the authoritative
+    # source inventory check below.
+    if not store.has_nodes_for_language("erlang"):
+        try:
+            represented_erlang = any(
+                _is_erlang_source_path(path) for path in store.get_all_files()
+            )
+        except Exception:  # pragma: no cover - defensive graph boundary
+            represented_erlang = True
+        if not represented_erlang:
+            return None
+    if not _repo_contains_erlang_sources(root):
         return None
 
     logger.info("Erlang graph identity is stale; rebuilding before postprocessing")
@@ -597,6 +613,27 @@ def _run_python_resolver(store: GraphStore) -> Optional[dict]:
         return resolve_python_imports(store)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("Python import resolver failed: %s", exc)
+        return None
+
+
+def _run_erlang_header_resolver(
+    store: GraphStore,
+    repo_root: Path | None = None,
+) -> Optional[dict]:
+    """Resolve repository-local Erlang include and record endpoints.
+
+    The Generic parser remains intentionally syntax-only; this lightweight
+    pass is run at build boundaries so direct ``full_build`` /
+    ``incremental_update`` callers receive the same canonical graph as the
+    higher-level post-processing tools.  Resolver failures are non-fatal and
+    leave raw endpoints available for diagnostics.
+    """
+    try:
+        from .erlang_header_resolver import resolve_erlang_header_records
+
+        return resolve_erlang_header_records(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - optional best-effort pass
+        logger.warning("Erlang header/record resolver failed: %s", exc)
         return None
 
 
@@ -1588,6 +1625,8 @@ def _reconcile_stale_files(
     repo_root: Path,
     store: GraphStore,
     current_files: list[str] | None = None,
+    *,
+    dependent_files: set[str] | None = None,
 ) -> list[str]:
     """Remove current-root files absent from the parseable inventory.
 
@@ -1632,6 +1671,12 @@ def _reconcile_stale_files(
         current_paths = set()
         for stored_file in stored_files:
             path = Path(stored_file)
+            if not path.is_absolute():
+                # Legacy stores may use repository-relative file markers.  The
+                # marker spelling remains unchanged in ``current_paths`` so
+                # reconciliation does not rewrite graph identities merely by
+                # opening an older database.
+                path = repo_root / path
             try:
                 relative = str(path.relative_to(repo_root))
             except ValueError:
@@ -1645,6 +1690,16 @@ def _reconcile_stale_files(
             ):
                 current_paths.add(stored_file)
     stale_files = sorted(stored_files - current_paths)
+    # Capture referrers before removing stale nodes and their incoming edges.
+    # This is especially important for Erlang headers: their parser edges are
+    # textual until reconciliation, and ``remove_files_permanently`` removes
+    # the very evidence needed to discover consumers afterward.
+    if stale_files and dependent_files is not None:
+        dependent_files.update(
+            _transitive_stale_dependents(
+                store, stale_files, repo_root=repo_root
+            )
+        )
     if stale_files:
         store.remove_files_permanently(stale_files)
     return stale_files
@@ -1661,10 +1716,20 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     file_paths = store.get_file_marker_paths()
     if not file_paths:
         return
-    prefix = normalize_file_path(repo_root)
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    prefix = normalize_file_path(root)
     prefix = prefix if prefix.endswith("/") else prefix + "/"
-    if any(normalize_file_path(path).startswith(prefix) for path in file_paths):
-        return
+    for path in file_paths:
+        normalized = normalize_file_path(path)
+        if normalized.startswith(prefix):
+            return
+        # Legacy databases may store repository-relative File markers.  They
+        # have no independent origin to compare, so interpret them in the
+        # explicitly requested checkout; reject traversal rows instead of
+        # treating them as a foreign absolute path.
+        if not Path(normalized).is_absolute() and ":/" not in normalized:
+            if ".." not in PurePosixPath(normalized).parts:
+                return
     sample = normalize_file_path(sorted(file_paths)[0])
     raise RuntimeError(
         f"the graph holds {len(file_paths)} file(s) such as {sample!r}, none of "
@@ -1708,13 +1773,14 @@ def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
             if e.kind in ("CALLS", "IMPORTS_FROM", "INHERITS", "IMPLEMENTS"):
                 dependents.add(e.file_path)
 
-    # Erlang preprocessor includes are stored as the include spelling (for
-    # example ``sample.hrl``), while the graph stores the included file under
-    # its repository path.  Resolve an unqualified include only when its
-    # basename is unique in the current graph; this keeps ambiguous include
-    # trees unresolved instead of invalidating unrelated consumers.
+    # Older graphs may still contain the textual spelling emitted by the
+    # Erlang parser (for example ``sample.hrl``) instead of the canonical
+    # header path.  Recover those incoming include edges only when the
+    # basename identifies one header in the graph.  A duplicate basename is
+    # deliberately left unresolved: selecting one sibling application's
+    # header would schedule unrelated files and can corrupt later resolution.
     target_name = Path(file_path).name
-    if target_name.lower().endswith(".hrl"):
+    if target_name.casefold().endswith(".hrl"):
         matching_files = {
             candidate
             for candidate in store.get_all_files()
@@ -1722,16 +1788,206 @@ def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
         }
         if matching_files == {file_path}:
             rows = store._conn.execute(
-                "SELECT file_path FROM edges "
+                "SELECT file_path, extra FROM edges "
                 "WHERE kind = 'IMPORTS_FROM' AND "
                 "(lower(target_qualified) = lower(?) OR "
                 "lower(target_qualified) LIKE lower(?))",
                 (target_name, f"%/{target_name}"),
             ).fetchall()
-            dependents.update(row["file_path"] for row in rows)
+            for row in rows:
+                try:
+                    extra = json.loads(row["extra"] or "{}")
+                except (TypeError, ValueError, UnicodeError, RecursionError):
+                    extra = {}
+                import_kind = (
+                    extra.get("erlang_import_kind")
+                    if isinstance(extra, dict)
+                    else None
+                )
+                # New parser rows identify the managed include explicitly;
+                # legacy rows without metadata are accepted only when their
+                # owner is an Erlang source/header, preventing another
+                # language's textual include from entering this path.
+                if import_kind in {"pp_include", "pp_include_lib"} or (
+                    not import_kind
+                    and _is_erlang_source_path(str(row["file_path"]))
+                ):
+                    dependents.add(row["file_path"])
 
     dependents.discard(file_path)
     return dependents
+
+
+def _single_hop_erlang_include_dependents(
+    store: GraphStore,
+    file_path: str,
+    repo_root: Path | None = None,
+) -> set[str]:
+    """Find direct consumers through managed Erlang preprocessor includes.
+
+    This intentionally ignores ordinary ``CALLS``/inheritance edges.  It is
+    used only while a stale header is still present in the graph, when an
+    include chain may need to be walked before the stale rows are removed.
+    """
+    target = normalize_file_path(file_path)
+    target_path = Path(str(file_path).replace("\\", "/"))
+    if not target_path.is_absolute() and repo_root is not None:
+        target_path = repo_root / target_path
+    try:
+        target = normalize_file_path(target_path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        pass
+    target_name = Path(target).name.casefold()
+    header_candidates = {
+        normalize_file_path(path if Path(path).is_absolute() else (
+            repo_root / path if repo_root is not None else Path(path)
+        ))
+        for path in store.get_all_files()
+        if str(path).replace("\\", "/").casefold().endswith(".hrl")
+    }
+    unique_basename = {
+        path for path in header_candidates if Path(path).name.casefold() == target_name
+    } == {target}
+
+    rows = store._conn.execute(
+        "SELECT file_path, target_qualified, extra FROM edges "
+        "WHERE kind = 'IMPORTS_FROM' AND "
+        # SQLite may reorder predicates, so a standalone json_valid() guard
+        # does not protect json_extract() from malformed legacy rows.  Keep
+        # the extraction inside CASE to make the fail-closed boundary
+        # independent of the query planner.
+        "CASE WHEN typeof(extra) = 'text' AND json_valid(extra) = 1 THEN "
+        "json_extract(extra, '$.erlang_import_kind') ELSE NULL END IN "
+        "('pp_include', 'pp_include_lib')"
+    ).fetchall()
+    dependents: set[str] = set()
+    for row in rows:
+        raw_extra = row["extra"]
+        try:
+            decoded = json.loads(raw_extra or "{}")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            decoded = {}
+        raw_target = (
+            decoded.get("erlang_raw_target")
+            if isinstance(decoded, dict)
+            else None
+        )
+        spellings = [str(row["target_qualified"])]
+        if isinstance(raw_target, str) and raw_target:
+            spellings.append(raw_target)
+        matched = False
+        for spelling in spellings:
+            candidate = str(spelling).replace("\\", "/")
+            candidate_path = Path(candidate)
+            if not candidate_path.is_absolute() and repo_root is not None:
+                candidate_path = repo_root / candidate_path
+            try:
+                normalized = normalize_file_path(candidate_path.resolve(strict=False))
+            except (OSError, RuntimeError):
+                normalized = normalize_file_path(candidate)
+            if normalized == target:
+                matched = True
+                break
+        if not matched and unique_basename:
+            matched = any(Path(spelling.replace("\\", "/")).name.casefold() == target_name
+                          for spelling in spellings)
+        if matched:
+            dependents.add(str(row["file_path"]))
+    dependents.discard(file_path)
+    return dependents
+
+
+def _transitive_stale_dependents(
+    store: GraphStore,
+    stale_files: Iterable[str],
+    *,
+    repo_root: Path | None = None,
+) -> set[str]:
+    """Return the bounded reverse dependency closure of stale files.
+
+    Stale rows must be inspected before they are removed.  In an Erlang
+    include chain such as ``consumer -> middle.hrl -> base.hrl``, deleting
+    ``base.hrl`` removes the middle header's incoming edge as part of the
+    node cleanup; a one-hop lookup therefore cannot discover ``consumer``.
+    Traverse through stale intermediate files while retaining only live
+    consumers for reparsing.  The traversal is deterministic and shares the
+    same global cap as :func:`find_dependents` so a pathological include fan
+    out cannot make an incremental update unbounded.
+    """
+    stale_spellings = [str(path) for path in stale_files]
+    # This closure exists for nested Erlang preprocessor includes.  Ordinary
+    # stale files retain the established one-hop dependency behavior; walking
+    # CALLS/INHERITS transitively here would unexpectedly enlarge unrelated
+    # Python/Java incremental updates.
+    stale_spellings = [
+        path for path in stale_spellings
+        if path.replace("\\", "/").casefold().endswith(".hrl")
+    ]
+    def _normalized(path: str) -> str:
+        candidate = Path(path.replace("\\", "/"))
+        if not candidate.is_absolute() and repo_root is not None:
+            candidate = repo_root / candidate
+        try:
+            return normalize_file_path(candidate.resolve(strict=False))
+        except (OSError, RuntimeError):
+            return normalize_file_path(candidate)
+
+    stale = {_normalized(path) for path in stale_spellings}
+    if not stale:
+        return set()
+
+    # Keep both the exact graph spelling and its normalized spelling in the
+    # visited set.  The former preserves compatibility with mixed legacy
+    # stores; the latter prevents a separator-only alias from being expanded
+    # repeatedly.
+    visited: set[str] = set()
+    frontier: set[str] = set()
+    for spelling in stale_spellings:
+        normalized = _normalized(spelling)
+        visited.add(spelling)
+        visited.add(normalized)
+        frontier.add(spelling)
+
+    live_dependents: set[str] = set()
+    while frontier and len(live_dependents) < _MAX_DEPENDENT_FILES:
+        next_frontier: set[str] = set()
+        for file_path in sorted(frontier):
+            for dependent in sorted(
+                _single_hop_erlang_include_dependents(
+                    store, file_path, repo_root
+                )
+            ):
+                dependent_spelling = str(dependent)
+                dependent_normalized = _normalized(dependent_spelling)
+                if (
+                    dependent_spelling in visited
+                    or dependent_normalized in visited
+                ):
+                    continue
+                visited.add(dependent_spelling)
+                visited.add(dependent_normalized)
+                # Only headers can have further preprocessor include
+                # consumers.  Keeping source files out of the frontier makes
+                # the closure bounded even in large call graphs.
+                if dependent_spelling.replace("\\", "/").casefold().endswith(".hrl"):
+                    next_frontier.add(dependent_spelling)
+                # Stale intermediates are still traversed, but will be absent
+                # from the parse set after reconciliation.  Their dependents
+                # must remain eligible for reparsing.
+                if dependent_normalized not in stale:
+                    live_dependents.add(dependent_spelling)
+                    if len(live_dependents) >= _MAX_DEPENDENT_FILES:
+                        break
+            if len(live_dependents) >= _MAX_DEPENDENT_FILES:
+                break
+        frontier = next_frontier
+
+    if len(live_dependents) >= _MAX_DEPENDENT_FILES:
+        logger.warning(
+            "Stale dependent expansion capped at %d files",
+            _MAX_DEPENDENT_FILES,
+        )
+    return live_dependents
 
 
 class DependentList(list):
@@ -1930,6 +2186,7 @@ def full_build(
     store.commit()
 
     python_stats = _run_python_resolver(store)
+    erlang_header_stats = _run_erlang_header_resolver(store, repo_root)
     rescript_stats = _run_rescript_resolver(store)
     spring_stats = _run_spring_resolver(store)
     spring_event_stats = _run_spring_event_resolver(store)
@@ -1944,6 +2201,7 @@ def full_build(
         "total_edges": total_edges,
         "errors": errors,
         "python_resolution": python_stats,
+        "erlang_header_resolution": erlang_header_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "event_resolution": spring_event_stats,
@@ -2020,7 +2278,26 @@ def incremental_update(
         changed_files = get_changed_files(repo_root, base)
         changed_files = _append_untracked_erlang_layout_files(repo_root, changed_files)
         changed_files = _append_mismatched_erlang_hashes(repo_root, store, changed_files)
-    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
+
+    # Canonicalize existing Erlang include edges before stale-file cleanup and
+    # dependency discovery. Header changes are compared against the previous
+    # graph, so this ordering lets us retain consumers even when a deleted
+    # header's incoming edge would otherwise be removed with its node.
+    erlang_header_pre_stats = (
+        _run_erlang_header_resolver(store, repo_root)
+        if store.has_nodes_for_language("erlang")
+        else None
+    )
+    stale_dependents: set[str] = set()
+    stale_files = (
+        _reconcile_stale_files(
+            repo_root,
+            store,
+            dependent_files=stale_dependents,
+        )
+        if reconcile_stale
+        else []
+    )
 
     layout_changed = any(_is_erlang_layout_path(path) for path in changed_files)
     erlang_changed = any(
@@ -2043,6 +2320,7 @@ def incremental_update(
             "errors": [],
             "graph_changed": False,
             "relation_layout_changed": False,
+            "erlang_header_resolution": erlang_header_pre_stats,
         }
         erlang_result = _run_erlang_lifecycle(
             repo_root,
@@ -2057,6 +2335,17 @@ def incremental_update(
 
     # Find dependent files (files that import from changed files)
     dependent_files: set[str] = set()
+    for dependent in stale_dependents:
+        if not _path_belongs_to_root(dependent, repo_root):
+            logger.warning(
+                "Ignoring stale dependent outside repository root: %s",
+                dependent,
+            )
+            continue
+        try:
+            dependent_files.add(str(Path(dependent).relative_to(repo_root)))
+        except ValueError:
+            dependent_files.add(dependent)
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
         deps = find_dependents(store, full_path)
@@ -2080,6 +2369,10 @@ def incremental_update(
     errors = []
     erlang_errors: set[str] = set()
     missing_paths: set[str] = set()
+    # Watch events normally address canonical absolute rows.  Keep the
+    # legacy relative spellings that are still present in a shared store so a
+    # deletion removes both representations of the same checkout file.
+    stored_file_paths = set(store.get_all_files())
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
@@ -2089,8 +2382,14 @@ def incremental_update(
             continue
         abs_path = repo_root / rel_path
         if not abs_path.is_file():
-            if normalize_file_path(abs_path) not in stale_files:
-                missing_paths.add(normalize_file_path(abs_path))
+            absolute_marker = normalize_file_path(abs_path)
+            if absolute_marker not in stale_files:
+                missing_paths.add(absolute_marker)
+                relative_marker = normalize_file_path(
+                    abs_path.relative_to(repo_root)
+                )
+                if relative_marker in stored_file_paths:
+                    missing_paths.add(relative_marker)
             continue
         try:
             raw = abs_path.read_bytes()
@@ -2192,6 +2491,16 @@ def incremental_update(
     )
     python_stats = _run_python_resolver(store) if python_changed else None
 
+    # Header/record endpoints are cheap to reconcile and must be canonical
+    # before the next incremental cycle's dependent-file lookup.  Run this on
+    # every update that still contains Erlang nodes so legacy/raw graphs also
+    # converge when no Erlang source itself changed.
+    erlang_header_stats = (
+        _run_erlang_header_resolver(store, repo_root)
+        if store.has_nodes_for_language("erlang")
+        else None
+    )
+
     rescript_changed = any(
         rp.endswith((".res", ".resi")) for rp in all_files
     )
@@ -2225,6 +2534,7 @@ def incremental_update(
         "stale_files_removed": len(stale_files),
         "errors": errors,
         "python_resolution": python_stats,
+        "erlang_header_resolution": erlang_header_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "event_resolution": spring_event_stats,
@@ -2341,6 +2651,17 @@ _WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
 _WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
 _WATCH_STOP_TIMEOUT = 10.0
 _WATCH_TICK_SECONDS = 1.0
+_REAL_WATCH_SLEEP = time.sleep
+
+
+def _watch_sleep(seconds: float) -> None:
+    """Sleep between watch reconciliation ticks.
+
+    Keep the watcher clock independent from process-wide ``time.sleep``
+    monkeypatches.  Test drivers patch this narrow seam, while subprocess and
+    parser timeout polling continue to use the real sleeper.
+    """
+    _REAL_WATCH_SLEEP(seconds)
 
 
 def _watch_child_dirs(
@@ -2468,11 +2789,13 @@ def _run_time_boxed(
 
     thread = threading.Thread(target=_call, name="crg-watch-teardown", daemon=True)
     thread.start()
-    thread.join(timeout)
+    thread.join(max(0.0, timeout))
     if thread.is_alive():
         logger.warning(
             "%s did not finish in %.0fs; leaving it to process exit", description, timeout
         )
+        return False
+    return True
 
 
 def _watch_health_path(repo_root: Path) -> Path | None:
@@ -2541,6 +2864,11 @@ class _WatchSupervisor:
         self._handler: Any = None
         self._watches: dict[str, _WatchEntry] = {}
         self._shallow: set[str] = set()
+        # The repository root has no watched parent to discover a disappearance
+        # or replacement. Remember that it needs restoration while absent; the
+        # planner is rerun on reappearance so ignore and budget policy follows
+        # the replacement tree.
+        self._root_pending = False
         self._live_threads: dict[int, threading.Thread] = {}
         self._repaired_roots: set[str] = set()
         self._degraded = False
@@ -2590,6 +2918,8 @@ class _WatchSupervisor:
             logger.warning("Could not watch %s: %s", key, exc)
             return
         self._watches[key] = _WatchEntry(handle, _watch_identity(key))
+        if key == str(self._repo_root):
+            self._root_pending = False
         if recursive:
             self._shallow.discard(key)
         else:
@@ -2611,6 +2941,33 @@ class _WatchSupervisor:
         """
         adopted: list[str] = []
         vanished: list[str] = []
+
+        # A recursive fallback root has no shallow parent, so the normal child
+        # scan below can never observe that the root inode was replaced. Check
+        # the root itself first and rebuild the planner's current plan when
+        # needed. This also handles a root that disappears for a few ticks.
+        repository_root = str(self._repo_root)
+        root_entry = self._watches.get(repository_root)
+        if root_entry is not None:
+            root_present = self._is_watchable_directory(repository_root)
+            current_identity = _watch_identity(repository_root) if root_present else None
+            if not root_present or current_identity != root_entry.identity:
+                logger.info(
+                    "Watch root %s was gone or replaced; releasing and re-adopting it",
+                    repository_root,
+                )
+                self._release_watch_tree(repository_root)
+                self._root_pending = True
+                vanished.append(repository_root)
+        if (
+            self._root_pending
+            and repository_root not in self._watches
+            and self._is_watchable_directory(repository_root)
+        ):
+            if self._schedule_root_plan():
+                self._root_pending = False
+                adopted.append(repository_root)
+
         for parent in sorted(self._shallow):
             present = {
                 name for name, is_dir in _child_directories(Path(parent)) if is_dir
@@ -2647,6 +3004,53 @@ class _WatchSupervisor:
         prefix = parent.rstrip(os.sep) + os.sep
         return [path for path in self._watches if path.startswith(prefix)]
 
+    def _release_watch_tree(self, path: str) -> None:
+        """Release *path* and all nested watches, deepest paths first."""
+        descendants = sorted(
+            self._descendants_of(path),
+            key=lambda candidate: candidate.count(os.sep),
+            reverse=True,
+        )
+        for descendant in descendants:
+            self._release_directory(descendant)
+        self._release_directory(path)
+
+    def _is_watchable_directory(self, path: str) -> bool:
+        """Return whether *path* is a real directory we can schedule."""
+        try:
+            candidate = Path(path)
+            return candidate.is_dir() and not candidate.is_symlink()
+        except OSError:
+            return False
+
+    def _schedule_root_plan(self) -> bool:
+        """Restore the root watch and its current planned children."""
+        if not self._is_watchable_directory(str(self._repo_root)):
+            return False
+        plan = _plan_watch_paths(
+            self._repo_root,
+            self._ignore_patterns,
+            max_schedules=self._max_schedules,
+        )
+        # The planner always puts the repository root first. Schedule it before
+        # descendants so a partial observer failure cannot leave child watches
+        # active while the root remains pending.
+        root_plan = next(
+            ((path, recursive) for path, recursive in plan if path == self._repo_root),
+            None,
+        )
+        if root_plan is None:
+            return False
+        root, root_recursive = root_plan
+        self._schedule(root, recursive=root_recursive)
+        if str(self._repo_root) not in self._watches:
+            return False
+        for path, path_recursive in plan:
+            if path == self._repo_root:
+                continue
+            self._schedule(path, recursive=path_recursive)
+        return str(self._repo_root) in self._watches
+
     def _adopt_directory(self, candidate: str) -> bool:
         """Watch a directory that appeared under a non-recursive watch.
 
@@ -2657,6 +3061,8 @@ class _WatchSupervisor:
         try:
             relative = Path(candidate).relative_to(self._repo_root).as_posix()
         except ValueError:
+            return False
+        if not self._is_watchable_directory(candidate):
             return False
         if _should_ignore(relative, self._ignore_patterns):
             logger.debug("Not watching ignored directory %s", relative)
@@ -2787,7 +3193,23 @@ class _WatchSupervisor:
             if thread.is_alive():
                 still_present[key] = thread
                 continue
-            if key not in self._live_threads:
+            # A watchdog emitter can be inserted into ``observer.emitters``
+            # immediately after ``Thread.start`` but before the thread gets a
+            # scheduling slice.  In that small window the first liveness
+            # sample observes ``is_alive() == False`` and the old
+            # ``_live_threads``-only check forgot the thread forever.  Use the
+            # thread's started marker as the lower bound for observation: an
+            # unstarted thread remains explicitly ignored, while a thread that
+            # was started and already exited is a real failure even if the
+            # first sample raced its startup.
+            started_marker = getattr(thread, "_started", None)
+            thread_started = thread.ident is not None
+            if started_marker is not None:
+                try:
+                    thread_started = thread_started or bool(started_marker.is_set())
+                except AttributeError:
+                    pass
+            if key not in self._live_threads and not thread_started:
                 continue
             if root is None:
                 dead.append(thread.name)
@@ -2912,6 +3334,11 @@ def _create_watch_handler(
             self._state_lock = threading.Lock()
             self._work_lock = threading.Lock()
             self._initializing = initializing
+            # An initialization abort is distinct from an ordinary shutdown:
+            # events captured before the initial graph is ready must be
+            # discarded, while events queued after a successful initialization
+            # still need to be drained during a clean stop.
+            self._initialization_aborted = False
             self._pending_events: list[FileSystemEvent] = []
 
         def _relative_path(self, path: str) -> str | None:
@@ -2920,13 +3347,19 @@ def _create_watch_handler(
                 relative = candidate.relative_to(lexical_root)
             except ValueError:
                 return None
-            existing = candidate
-            while not existing.exists() and existing != lexical_root:
-                existing = existing.parent
-            try:
-                existing.resolve().relative_to(resolved_root)
-            except ValueError:
-                return None
+            # The exact repository root remains an in-scope event even while
+            # it is absent. This lets a root deletion remove stored descendants
+            # before a later tick re-adopts a replacement directory; all other
+            # missing paths still require an existing in-root ancestor to guard
+            # against events from a moved-out or symlinked tree.
+            if candidate != lexical_root:
+                existing = candidate
+                while not existing.exists() and existing != lexical_root:
+                    existing = existing.parent
+                try:
+                    existing.resolve().relative_to(resolved_root)
+                except ValueError:
+                    return None
             if any(
                 component.is_symlink()
                 for component in [
@@ -2940,13 +3373,82 @@ def _create_watch_handler(
             return str(relative)
 
         def _stored_descendants(self, relative_directory: str) -> set[str]:
-            # Stored file paths use POSIX separators (#774).
-            directory = normalize_file_path(repo_root / relative_directory) + "/"
-            return {
-                str(Path(file_path).relative_to(repo_root))
-                for file_path in store.get_all_files()
-                if file_path.startswith(directory)
-            }
+            """Return stored descendants as paths relative to the watch root.
+
+            Current graph rows use absolute paths, while older stores may use
+            repository-relative paths.  Directory delete/move events are
+            delivered as relative paths, so compare path components after
+            normalizing both representations instead of relying on an
+            absolute string prefix.  A relative legacy row is intentionally
+            interpreted in this explicitly selected checkout, matching the
+            reconciliation contract; absolute rows from another checkout are
+            ignored.
+            """
+            raw_directory = normalize_file_path(relative_directory).rstrip("/")
+            if raw_directory in {"", "."}:
+                directory_parts: tuple[str, ...] = ()
+            else:
+                directory_path = Path(raw_directory)
+                if directory_path.is_absolute() or re.match(r"^[A-Za-z]:/", raw_directory):
+                    directory_parts = ()
+                    matched_root = False
+                    for root in (lexical_root, resolved_root):
+                        try:
+                            directory_parts = PurePosixPath(
+                                directory_path.relative_to(root).as_posix()
+                            ).parts
+                            matched_root = True
+                            break
+                        except (ValueError, OSError, RuntimeError):
+                            continue
+                    if not matched_root:
+                        # ``Path`` on POSIX treats a Windows-qualified path as
+                        # relative.  Compare that representation textually so
+                        # a foreign checkout cannot be mistaken for a legacy
+                        # relative directory.
+                        for root in (lexical_root, resolved_root):
+                            root_text = normalize_file_path(root).rstrip("/")
+                            if raw_directory.casefold().startswith(
+                                root_text.casefold() + "/"
+                            ):
+                                directory_parts = PurePosixPath(
+                                    raw_directory[len(root_text) + 1 :]
+                                ).parts
+                                matched_root = True
+                                break
+                    if not matched_root:
+                        return set()
+                else:
+                    directory_parts = PurePosixPath(raw_directory).parts
+            if ".." in directory_parts:
+                return set()
+
+            descendants: set[str] = set()
+            for stored_path in store.get_all_files():
+                normalized = normalize_file_path(stored_path)
+                if not normalized or re.match(r"^[A-Za-z]:[^/]", normalized):
+                    continue
+                candidate = Path(normalized)
+                relative: PurePosixPath | None = None
+                if candidate.is_absolute():
+                    for root in (lexical_root, resolved_root):
+                        try:
+                            relative = PurePosixPath(
+                                candidate.relative_to(root).as_posix()
+                            )
+                            break
+                        except (ValueError, OSError, RuntimeError):
+                            continue
+                else:
+                    relative = PurePosixPath(normalized)
+                if relative is None or ".." in relative.parts:
+                    continue
+                if (
+                    len(relative.parts) > len(directory_parts)
+                    and relative.parts[: len(directory_parts)] == directory_parts
+                ):
+                    descendants.add(relative.as_posix())
+            return descendants
 
         def _parseable_file(self, relative_path: str) -> bool:
             absolute_path = repo_root / relative_path
@@ -3010,6 +3512,8 @@ def _create_watch_handler(
             self.last_event_at = time.time()
             self.events_seen += len(events)
             with self._state_lock:
+                if self._initialization_aborted:
+                    return
                 if self._initializing:
                     self._pending_events.extend(events)
                     return
@@ -3037,8 +3541,18 @@ def _create_watch_handler(
                         on_files_updated,
                         result,
                     )
+                # KeyboardInterrupt/SystemExit belong to the caller's
+                # lifecycle boundary.  Capturing them as an asynchronous
+                # update failure turns a normal Ctrl+C during parser startup
+                # into ``watch update failed`` and hides the intended stop.
+                # This runs on the debouncer thread.  Letting a BaseException
+                # escape would silently kill that thread (and leave the watch
+                # looking healthy), so record every failure and surface it at
+                # the synchronous watch boundary via ``raise_if_failed``.
                 except BaseException as exc:
-                    self.failure = exc
+                    with self._state_lock:
+                        if self.failure is None:
+                            self.failure = exc
 
         def finish_initialization(self) -> None:
             """Enable live processing and drain events captured during startup."""
@@ -3046,6 +3560,9 @@ def _create_watch_handler(
                 return
             while True:
                 with self._state_lock:
+                    if self._initialization_aborted:
+                        self._pending_events.clear()
+                        return
                     if not self._pending_events:
                         self._initializing = False
                         return
@@ -3055,33 +3572,298 @@ def _create_watch_handler(
 
         def abort_initialization(self) -> None:
             with self._state_lock:
+                if self._initializing:
+                    self._initialization_aborted = True
                 self._initializing = False
                 self._pending_events.clear()
 
         def raise_if_failed(self) -> None:
-            if self.failure is not None:
-                raise RuntimeError("watch update failed") from self.failure
+            with self._state_lock:
+                failure = self.failure
+            if failure is not None:
+                raise RuntimeError("watch update failed") from failure
+
+        def record_lifecycle_failure(self, description: str, timeout: float) -> None:
+            """Make a bounded teardown failure visible at the watch boundary."""
+            failure = TimeoutError(
+                f"watch teardown timed out during {description} "
+                f"after {max(0.0, timeout):.3f}s"
+            )
+            with self._state_lock:
+                if self.failure is None:
+                    self.failure = failure
+
+        @property
+        def initialization_aborted(self) -> bool:
+            with self._state_lock:
+                return self._initialization_aborted
 
     processor = WatchBatchProcessor()
-    debouncer = EventDebouncer(_DEBOUNCE_SECONDS, processor.process)
 
     class GraphUpdateHandler(FileSystemEventHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self._lifecycle_condition = threading.Condition()
+            self._processing_local = threading.local()
+            self._stopping = False
+            self._started = False
+            self._finalizing = False
+            self._finalized = False
+            self._finalizer_ident: int | None = None
+            self._inflight = 0
+            self._dispatching = 0
+            self._dispatching_local = threading.local()
+
+        def _enter_batch(self, *, during_shutdown: bool = False) -> bool:
+            """Reserve one processor batch without holding a user callback lock."""
+            with self._lifecycle_condition:
+                if self._stopping and not during_shutdown:
+                    return False
+                self._inflight += 1
+                return True
+
+        def _leave_batch(self) -> None:
+            with self._lifecycle_condition:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._lifecycle_condition.notify_all()
+
+        def _wait_for_dispatches(self, deadline: float) -> bool:
+            # A synchronous EventDebouncer test double may invoke the callback
+            # from ``dispatch`` itself.  In that case one dispatch belongs to
+            # this thread and must not be counted as work to wait for.
+            own_dispatches = getattr(self._dispatching_local, "depth", 0)
+            with self._lifecycle_condition:
+                while self._dispatching > own_dispatches:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._lifecycle_condition.wait(timeout=remaining)
+            return True
+
+        def _process_batch(
+            self,
+            events: list[FileSystemEvent],
+            *,
+            during_shutdown: bool = False,
+        ) -> None:
+            if not self._enter_batch(during_shutdown=during_shutdown):
+                return
+            try:
+                processor.process(events)
+            finally:
+                self._leave_batch()
+
+        def _run_batch(
+            self,
+            events: list[FileSystemEvent],
+            *,
+            during_shutdown: bool = False,
+        ) -> None:
+            previous = getattr(self._processing_local, "active", False)
+            self._processing_local.active = True
+            try:
+                self._process_batch(events, during_shutdown=during_shutdown)
+            finally:
+                self._processing_local.active = previous
+
         def dispatch(self, event: FileSystemEvent) -> None:
             if event.event_type not in {"created", "modified", "deleted", "moved"}:
                 return
             if event.is_directory and event.event_type == "modified":
                 return
-            debouncer.handle_event(event)
+            # Once teardown starts, an observer callback racing with the
+            # shutdown path must not append work after the final drain.  The
+            # lifecycle lock covers the check and enqueue as one operation.
+            # Reserve the enqueue under the lifecycle lock, then release it
+            # before taking EventDebouncer's condition.  EventDebouncer runs
+            # its callback while holding that condition; keeping a strict
+            # lock order here avoids a callback/dispatch deadlock.
+            with self._lifecycle_condition:
+                if self._stopping:
+                    return
+                self._dispatching += 1
+                self._dispatching_local.depth = (
+                    getattr(self._dispatching_local, "depth", 0) + 1
+                )
+            try:
+                debouncer.handle_event(event)
+            finally:
+                with self._lifecycle_condition:
+                    self._dispatching -= 1
+                    # Notify on every decrement: a re-entrant finalizer may
+                    # deliberately ignore its own dispatch depth and wait
+                    # for other dispatchers to leave.
+                    self._lifecycle_condition.notify_all()
+                self._dispatching_local.depth -= 1
 
         def start(self) -> None:
-            debouncer.start()
+            with self._lifecycle_condition:
+                if self._stopping or self._started:
+                    return
+                debouncer.start()
+                self._started = True
+
+        def begin_shutdown(self) -> None:
+            """Stop accepting observer callbacks before teardown begins."""
+            with self._lifecycle_condition:
+                self._stopping = True
+            # Clear startup work before finalization can call
+            # ``finish_initialization``.  Once initialization has completed,
+            # this is a no-op and live debounced events remain drainable.
+            processor.abort_initialization()
+
+        def _wait_for_batches(self, deadline: float) -> bool:
+            """Wait until callbacks that won the shutdown race are finished."""
+            with self._lifecycle_condition:
+                while self._inflight:
+                    # A callback is allowed to call ``stop``.  It cannot wait
+                    # for itself, so leave finalization to the outer teardown
+                    # path in that re-entrant case.
+                    if getattr(self._processing_local, "active", False):
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._lifecycle_condition.wait(timeout=remaining)
+            return True
+
+        def _drain_debouncer(self) -> list[FileSystemEvent]:
+            """Take queued events without relying on watchdog thread timing.
+
+            ``EventDebouncer`` does not expose a public flush API.  Its queue
+            and condition are stable across the supported watchdog releases,
+            so access them only when they have the expected concrete types;
+            test doubles and future implementations safely become a no-op.
+            """
+            condition = getattr(debouncer, "_cond", None)
+            if not isinstance(condition, threading.Condition):
+                return []
+            with condition:
+                queued = getattr(debouncer, "_events", None)
+                if not isinstance(queued, list) or not queued:
+                    return []
+                events = list(queued)
+                queued.clear()
+                return events
+
+        def _finalize_stop(self, *, wait_for_other: bool = True) -> None:
+            """Stop the debouncer and drain accepted work exactly once.
+
+            The thread that owns a debounced batch may reach this method after
+            another thread has already started finalization. That thread must
+            return instead of waiting for the owner: the owner is waiting in
+            ``debouncer.join()`` for this callback to return.
+            """
+            if getattr(self._processing_local, "active", False):
+                # A callback may request stop re-entrantly.  The releasable
+                # debouncer observes this flag after the callback returns;
+                # joining or draining here would race the callback's store.
+                debouncer.stop()
+                return
+            deadline = time.monotonic() + max(0.0, _WATCH_STOP_TIMEOUT)
+            with self._lifecycle_condition:
+                if self._finalized:
+                    return
+                if self._finalizing:
+                    # Re-entry from the finalizer's own callback (including an
+                    # initial post-process callback) must return; waiting here
+                    # would make the finalizer wait on itself forever.
+                    if self._finalizer_ident == threading.get_ident():
+                        return
+                    if not wait_for_other:
+                        return
+                    while not self._finalized:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            processor.record_lifecycle_failure(
+                                "another teardown finalizer", _WATCH_STOP_TIMEOUT
+                            )
+                            return
+                        self._lifecycle_condition.wait(timeout=remaining)
+                    return
+                self._finalizing = True
+                self._finalizer_ident = threading.get_ident()
+            # Stopping the debouncer first prevents its run loop from moving
+            # another batch out of the private queue while we drain it.  A
+            # batch already handed to the callback is tracked by _inflight.
+            try:
+                debouncer.stop()
+                if self._started and threading.current_thread() is not debouncer:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if not _run_time_boxed(
+                        lambda: debouncer.join(timeout=remaining),
+                        "debouncer join",
+                        timeout=remaining,
+                    ):
+                        processor.record_lifecycle_failure(
+                            "debouncer join", _WATCH_STOP_TIMEOUT
+                        )
+                dispatches_finished = self._wait_for_dispatches(deadline)
+                if not dispatches_finished:
+                    processor.record_lifecycle_failure(
+                        "watch event dispatch", _WATCH_STOP_TIMEOUT
+                    )
+                batches_finished = self._wait_for_batches(deadline)
+                if not batches_finished:
+                    processor.record_lifecycle_failure(
+                        "watch update callback", _WATCH_STOP_TIMEOUT
+                    )
+                # The queue and pending startup list can lead back to the same
+                # user callback.  Once either accepted-work wait times out,
+                # draining them here would reintroduce the unbounded wait that
+                # teardown is intended to avoid.
+                if not dispatches_finished or not batches_finished:
+                    return
+                # Events delivered while the initial build was running live in
+                # a separate pending list.  On an aborted startup they must be
+                # discarded along with the debouncer queue; a clean shutdown
+                # drains them before the queue so no accepted event is lost.
+                if not processor.initialization_aborted:
+                    processor.finish_initialization()
+                events = self._drain_debouncer()
+                if events and not processor.initialization_aborted:
+                    self._run_batch(events, during_shutdown=True)
+            finally:
+                with self._lifecycle_condition:
+                    self._finalized = True
+                    self._finalizing = False
+                    self._finalizer_ident = None
+                    self._lifecycle_condition.notify_all()
+
+        def flush(self) -> None:
+            """Request shutdown and drain accepted work exactly once."""
+            self.begin_shutdown()
+            if getattr(self._processing_local, "active", False):
+                # The enclosing process/process_debounced call finalizes after
+                # it releases the processor's work lock.  Returning here is
+                # essential for callback re-entry: waiting for that same batch
+                # would deadlock and an unowned background finalizer could race
+                # a caller closing the GraphStore.
+                return
+            self._finalize_stop()
 
         def stop(self) -> None:
-            debouncer.stop()
-            debouncer.join()
+            self.flush()
 
         def process(self, events: list[FileSystemEvent]) -> None:
-            processor.process(events)
+            # Synthetic repair batches enter through the same acceptance gate
+            # as observer callbacks, but the potentially slow parser and user
+            # callback run outside the lifecycle lock.
+            self._run_batch(events)
+            if self._stopping and not self._finalized:
+                self._finalize_stop(wait_for_other=False)
+
+        def process_debounced(self, events: list[FileSystemEvent]) -> None:
+            # EventDebouncer has already accepted these events before stop;
+            # allow the batch to complete during shutdown.
+            self._run_batch(events, during_shutdown=True)
+            # ``stop()`` may be called by the user callback itself.  In that
+            # re-entrant case ``flush`` cannot join or drain from the
+            # debouncer thread, so the callback thread must hand off to the
+            # non-reentrant finalization path after its batch has returned.
+            if self._stopping and not self._finalized:
+                self._finalize_stop(wait_for_other=False)
 
         def finish_initialization(self) -> None:
             processor.finish_initialization()
@@ -3100,7 +3882,46 @@ def _create_watch_handler(
         def events_seen(self) -> int:
             return processor.events_seen
 
-    return GraphUpdateHandler()
+    handler = GraphUpdateHandler()
+
+    def _debounced_callback(events: list[FileSystemEvent]) -> None:
+        handler.process_debounced(events)
+
+    # watchdog's implementation invokes the callback while holding its
+    # condition.  That makes a callback-triggered stop vulnerable to a lost
+    # wake-up and self-join.  Keep the same queue/debounce contract while
+    # releasing the condition before invoking user/parser work.
+    if isinstance(EventDebouncer, type):
+        class _ReleasableEventDebouncer(EventDebouncer):
+            def run(self) -> None:
+                while self.should_keep_running():
+                    with self._cond:
+                        if not self.should_keep_running():
+                            return
+                        if not self._events:
+                            self._cond.wait()
+                        if not self.should_keep_running():
+                            return
+                        if self.debounce_interval_seconds:
+                            while self.should_keep_running():
+                                if not self._cond.wait(
+                                    timeout=self.debounce_interval_seconds
+                                ):
+                                    break
+                        if not self.should_keep_running():
+                            return
+                        events = self._events
+                        self._events = []
+                    self.events_callback(events)
+
+        debouncer = _ReleasableEventDebouncer(
+            _DEBOUNCE_SECONDS, _debounced_callback
+        )
+    else:
+        # Test doubles and future watchdog shims may expose a factory rather
+        # than a class; preserve their injection surface.
+        debouncer = EventDebouncer(_DEBOUNCE_SECONDS, _debounced_callback)
+    return handler
 
 
 def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
@@ -3115,10 +3936,14 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
     from watchdog.events import DirCreatedEvent, DirDeletedEvent
 
     adopted, vanished = supervisor.sync_watches()
-    for path in adopted:
-        handler.dispatch(DirCreatedEvent(path))
     for path in vanished:
         handler.dispatch(DirDeletedEvent(path))
+    # A path can be both vanished and adopted in one tick when its inode was
+    # replaced.  Queue the deletion first so synchronous debouncer shims (and
+    # a zero-delay test configuration) cannot index the new tree and then
+    # immediately remove it again from the old deletion snapshot.
+    for path in adopted:
+        handler.dispatch(DirCreatedEvent(path))
 
 
 def _install_sigterm_interrupt() -> Callable[[], None]:
@@ -3193,11 +4018,6 @@ def watch(
         _load_ignore_patterns(repo_root),
         health_path=_watch_health_path(repo_root),
     )
-    # The first build of a large repository takes minutes.  Without a
-    # heartbeat up front, ``crg-daemon status`` calls that healthy watcher
-    # stalled for the whole build.
-    supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
-
     # Subscribe before reconciling the graph.  A repository can change while
     # the initial update is running; the handler holds those events in a
     # pending batch and drains it after the initial state is known.
@@ -3212,10 +4032,13 @@ def watch(
     )
     restore_sigterm = _install_sigterm_interrupt()
     initialization_complete = False
+    completed_cleanly = False
+    observer_started = False
     try:
         supervisor.schedule_initial(handler)
         handler.start()
         observer.start()
+        observer_started = True
         supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
 
         initial = incremental_update(
@@ -3236,14 +4059,12 @@ def watch(
         supervisor.report_health(observer_alive=True, phase="watching", force=True)
 
         logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
-        import time as _time
-
         while True:
             if stop_event is not None:
                 if stop_event.wait(_WATCH_TICK_SECONDS):
                     break
             else:
-                _time.sleep(_WATCH_TICK_SECONDS)
+                _watch_sleep(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
             _sync_watch_tree(supervisor, handler)
             dead, repaired = supervisor.check_liveness()
@@ -3283,6 +4104,7 @@ def watch(
                 events_seen=handler.events_seen,
             )
         supervisor.clear_health()
+        completed_cleanly = True
     except KeyboardInterrupt:
         supervisor.clear_health()
         handler.abort_initialization()
@@ -3295,10 +4117,48 @@ def watch(
         handler.abort_initialization()
         raise
     finally:
+        # Prevent callbacks racing observer shutdown from adding work after
+        # the final drain.  ``handler.stop`` repeats the guard and is
+        # idempotent for callers that own teardown themselves.
+        handler.begin_shutdown()
         restore_sigterm()
+        # ``Observer.start`` can fail after starting one or more emitters but
+        # before its own dispatcher thread is marked started.  Always signal
+        # stop, then either join a started dispatcher or explicitly release
+        # unstarted/partially-started emitters.  Calling ``join`` on an
+        # unstarted Thread raises and would mask the startup exception.
         _run_time_boxed(observer.stop, "observer stop")
-        observer.join(timeout=_WATCH_STOP_TIMEOUT)
+        observer_thread_started = observer_started
+        if isinstance(observer, threading.Thread):
+            marker = getattr(observer, "_started", None)
+            if isinstance(marker, threading.Event):
+                observer_thread_started = observer_thread_started or marker.is_set()
+        if observer_thread_started:
+            # A backend can wedge while joining (and test doubles are free to
+            # ignore the timeout argument), so keep teardown bounded just like
+            # unscheduling.  Joining only after a successful start avoids the
+            # ``cannot join thread before it is started`` error masking a
+            # startup failure.
+            _run_time_boxed(
+                lambda: observer.join(timeout=_WATCH_STOP_TIMEOUT),
+                "observer join",
+                timeout=_WATCH_STOP_TIMEOUT,
+            )
+        else:
+            # BaseObserver.stop only sets its stop flag; its on_thread_stop
+            # cleanup runs from the dispatcher thread, which never started in
+            # this branch.  Unschedule all emitters directly so a partial
+            # Observer.start failure cannot leak backend resources.
+            unschedule_all = getattr(observer, "unschedule_all", None)
+            if callable(unschedule_all):
+                _run_time_boxed(unschedule_all, "observer unschedule_all")
         handler.stop()
+        if completed_cleanly:
+            # A debounced batch can finish during teardown after the last
+            # health tick.  Surface its failure when there is no higher-level
+            # exception already being propagated; Ctrl+C/runtime failures keep
+            # their original exception and are intentionally not replaced.
+            handler.raise_if_failed()
     logger.info("Watch stopped.")
 
 

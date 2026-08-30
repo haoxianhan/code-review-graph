@@ -141,6 +141,52 @@ def test_uppercase_erlang_header_change_reparses_include_dependents(
         store.close()
 
 
+def test_deleted_erlang_header_reparses_consumers_and_matches_clean_rebuild(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Deleting a header keeps incremental and clean graph states identical."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    (repo / "include").mkdir(parents=True)
+    (repo / "src").mkdir()
+    header = repo / "include" / "sample.hrl"
+    source = repo / "src" / "sample.erl"
+    header.write_text("-record(sample, {value}).\n", encoding="utf-8")
+    source.write_text(
+        "-module(sample).\n"
+        '-include("sample.hrl").\n'
+        "run() -> #sample{value = 1}.\n",
+        encoding="utf-8",
+    )
+
+    incremental_store = GraphStore(tmp_path / "incremental.db")
+    try:
+        assert full_build(repo, incremental_store)["errors"] == []
+        header.unlink()
+
+        updated = incremental_update(
+            repo,
+            incremental_store,
+            changed_files=["include/sample.hrl"],
+        )
+        assert updated["stale_files_removed"] == 1
+        assert updated["files_updated"] == 2
+        assert "src/sample.erl" in updated["dependent_files"]
+        assert not incremental_store.get_nodes_by_file(str(header))
+        assert incremental_store.get_nodes_by_file(str(source))
+
+        clean_store = GraphStore(tmp_path / "clean.db")
+        try:
+            assert full_build(repo, clean_store)["errors"] == []
+            assert graph_fingerprint(incremental_store, repo) == graph_fingerprint(
+                clean_store, repo
+            )
+        finally:
+            clean_store.close()
+    finally:
+        incremental_store.close()
+
+
 def test_large_erlang_ast_parse_failure_is_visible_and_keeps_identity_pending(
     tmp_path: Path, monkeypatch
 ) -> None:
