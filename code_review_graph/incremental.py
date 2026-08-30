@@ -82,7 +82,7 @@ _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
 # module/export metadata.  Keep this marker independent from the optional
 # ELP/xref/Dialyzer bridge: a toolchain outage must not make a sound Generic
 # graph look unmigrated forever.
-ERLANG_IDENTITY_VERSION = "5"
+ERLANG_IDENTITY_VERSION = "6"
 _ERLANG_IDENTITY_METADATA_KEY = "erlang_identity_version"
 _ERLANG_IDENTITY_METADATA_PREFIX = f"{_ERLANG_IDENTITY_METADATA_KEY}:"
 _ERLANG_IDENTITY_DIGEST_LENGTH = 32

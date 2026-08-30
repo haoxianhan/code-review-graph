@@ -3078,6 +3078,19 @@ class CodeParser:
             return None
         return name, len(args.named_children)
 
+    @staticmethod
+    def _erlang_clause_fingerprint(clause) -> str:
+        """Return a stable content identity for one Erlang function clause.
+
+        Source-order ordinals are useful for display but change whenever a
+        clause is inserted before an existing one. Hashing normalized clause
+        text keeps an unchanged clause identity stable across such edits while
+        remaining independent of line numbers.
+        """
+        raw = clause.text.decode("utf-8", errors="replace")
+        normalized = re.sub(r"\s+", " ", raw).strip()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
     @classmethod
     def _erlang_call_target(cls, call) -> Optional[tuple[str, int, bool]]:
         """Return ``(raw target, arity, dynamic)`` for a call expression.
@@ -3526,11 +3539,28 @@ class CodeParser:
                 file_path=file_path, line=line_start,
             ))
             # Keep the callable identity merged at Function level while also
-            # exposing each source clause as a stable child.  Clause ordinals
-            # are source-order based and deliberately one-based so adding a
-            # later clause does not rename existing identities.
-            for clause_index, (_fun_decl, clause) in enumerate(clauses, start=1):
-                clause_identity = f"{identity}#clause-{clause_index}"
+            # exposing each source clause as a stable child. The index is
+            # presentation metadata only; the qualified identity is based on
+            # clause content so inserting a distinct earlier clause does not
+            # rename existing nodes.
+            clause_fingerprints = [
+                self._erlang_clause_fingerprint(clause)
+                for _fun_decl, clause in clauses
+            ]
+            fingerprint_totals: dict[str, int] = {}
+            for fingerprint in clause_fingerprints:
+                fingerprint_totals[fingerprint] = (
+                    fingerprint_totals.get(fingerprint, 0) + 1
+                )
+            fingerprint_occurrences: dict[str, int] = {}
+            for clause_index, ((_fun_decl, clause), clause_fingerprint) in enumerate(
+                zip(clauses, clause_fingerprints), start=1
+            ):
+                occurrence = fingerprint_occurrences.get(clause_fingerprint, 0) + 1
+                fingerprint_occurrences[clause_fingerprint] = occurrence
+                clause_identity = f"{identity}#clause-v2-{clause_fingerprint}"
+                if fingerprint_totals[clause_fingerprint] > 1:
+                    clause_identity += f"-occ-{occurrence}"
                 clause_qualified = self._qualify(
                     clause_identity, file_path, parent,
                 )
@@ -3550,6 +3580,8 @@ class CodeParser:
                         "function_identity": identity,
                         "clause_index": clause_index,
                         "clause_count": len(clauses),
+                        "clause_fingerprint": clause_fingerprint,
+                        "clause_occurrence": occurrence,
                         "exported": export_all or identity in exported_functions,
                         "guarded": any(
                             child.type == "guard"
@@ -3566,6 +3598,7 @@ class CodeParser:
                     extra={
                         "erlang_reference_kind": "clause",
                         "clause_index": clause_index,
+                        "clause_fingerprint": clause_fingerprint,
                     },
                 ))
                 for call in self._erlang_walk(clause):

@@ -55,30 +55,58 @@ helper(N) -> N.
     assert function.extra["clause_count"] == 2
     assert function.extra["arity"] == 1
     clauses = [node for node in nodes if node.kind == "Clause"]
-    assert [node.identity_name for node in clauses] == [
-        "value/1#clause-1",
-        "value/1#clause-2",
-        "helper/1#clause-1",
-    ]
+    assert len({node.identity_name for node in clauses}) == 3
+    assert all("#clause-v2-" in node.identity_name for node in clauses)
     assert [node.extra["clause_index"] for node in clauses] == [1, 2, 1]
     assert all(node.extra["function_identity"] in {"value/1", "helper/1"} for node in clauses)
     clause_edges = [
         edge for edge in edges
-        if edge.kind == "CONTAINS" and "#clause-" in edge.target
+        if edge.kind == "CONTAINS" and "#clause-v2-" in edge.target
     ]
+    assert len(clause_edges) == 3
     assert {
-        (edge.source.rsplit("::", 1)[-1], edge.target.rsplit("::", 1)[-1])
+        edge.source.rsplit("::", 1)[-1].split("#", 1)[0]
         for edge in clause_edges
-    } == {
-        ("sample.value/1", "sample.value/1#clause-1"),
-        ("sample.value/1", "sample.value/1#clause-2"),
-        ("sample.helper/1", "sample.helper/1#clause-1"),
-    }
+    } == {"sample.value/1", "sample.helper/1"}
     assert any(
         edge.kind == "CONTAINS"
         and edge.target == "src/sample.erl::sample.value/1"
         for edge in edges
     )
+
+
+def test_erlang_clause_identity_survives_inserted_prior_clause():
+    before, _ = _parse(
+        "src/sample.erl",
+        "-module(sample).\n"
+        "value(0) -> zero;\n"
+        "value(N) -> N.\n",
+    )
+    after, _ = _parse(
+        "src/sample.erl",
+        "-module(sample).\n"
+        "value(-1) -> negative;\n"
+        "value(0) -> zero;\n"
+        "value(N) -> N.\n",
+    )
+
+    def qualified(node):
+        return f"{node.file_path}::{node.parent_name}.{node.identity_name}"
+
+    before_by_fingerprint = {
+        node.extra["clause_fingerprint"]: qualified(node)
+        for node in before
+        if node.kind == "Clause"
+    }
+    after_by_fingerprint = {
+        node.extra["clause_fingerprint"]: qualified(node)
+        for node in after
+        if node.kind == "Clause"
+    }
+
+    assert set(before_by_fingerprint) <= set(after_by_fingerprint)
+    for fingerprint, qualified_name in before_by_fingerprint.items():
+        assert after_by_fingerprint[fingerprint] == qualified_name
 
 
 def test_erlang_quoted_atoms_are_normalized_in_symbol_names():
