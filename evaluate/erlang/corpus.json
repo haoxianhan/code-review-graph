@@ -3,17 +3,147 @@
   "kind": "erlang_evaluation_corpus",
   "manifest": "server_flexible.manifest.json",
   "cases": [
-    {"id": "local-callers", "category": "local_callers", "description": "Local function call candidate in a production module.", "query": {"kind": "callers_of", "target": {"file": "apps/server_redis/src/redis_worker.erl", "symbol": "redis_worker"}}, "expected": {"positive": [{"relation": "CALLS", "target": {"file": "apps/server_redis/src/redis_worker.erl", "symbol": "redis_worker"}, "reason": "same-module syntactic call candidate"}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "remote-callers", "category": "remote_callers", "description": "Remote module call candidate across application boundaries.", "query": {"kind": "callers_of", "target": {"symbol": "gen_server:call/2"}}, "expected": {"positive": [{"relation": "CALLS", "target": "gen_server:call/2", "reason": "remote call syntax"}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "shared-header-records", "category": "shared_header_records", "description": "Shared record declarations and include consumers.", "query": {"kind": "references", "target": {"file": "apps/server_cfg_data/include/trigger.hrl", "symbol": "trigger"}}, "expected": {"positive": [{"relation": "REFERENCES", "target": {"file": "apps/server_cfg_data/include/trigger.hrl", "symbol": "trigger"}}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "behaviour-callbacks", "category": "behaviour_callbacks", "description": "Behaviour implementation and callback relationship.", "query": {"kind": "implementers_of", "target": {"symbol": "gen_server"}}, "expected": {"positive": [{"relation": "IMPLEMENTS", "target": "gen_server", "reason": "OTP behaviour contract"}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "supervisor-mfa", "category": "supervisor_mfa", "description": "Static supervisor child-start MFA anchor.", "query": {"kind": "mfa", "target": {"symbol": "start_link/0", "arity": 0}}, "expected": {"positive": [{"relation": "SUPERVISES", "target": {"symbol": "start_link/0", "arity": 0}}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "common-test", "category": "common_test", "description": "Common Test suite anchor.", "query": {"kind": "tests_for", "target": {"file": "apps/server_ark/test/server_ark_config_SUITE.erl"}}, "expected": {"positive": [{"relation": "TESTED_BY", "target": {"file": "apps/server_ark/test/server_ark_config_SUITE.erl"}}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "eunit", "category": "eunit", "description": "EUnit include and test-module anchor.", "query": {"kind": "tests_for", "target": {"file": "apps/server_redis/src/test/eredis_map_tests.erl"}}, "expected": {"positive": [{"relation": "TESTED_BY", "target": {"file": "apps/server_redis/src/test/eredis_map_tests.erl"}}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "generated-data", "category": "generated_data", "description": "Generated config header is tracked as a data artifact.", "query": {"kind": "references", "target": {"file": "apps/server_cfg_data/include/config/cfg_item.hrl"}}, "expected": {"positive": [{"relation": "GENERATED_FROM", "target": {"file": "apps/server_cfg_data/include/config/cfg_item.hrl"}}], "negative": [], "unresolved": []}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "dynamic-unresolved", "category": "dynamic_unresolved", "description": "Dynamic apply/MFA behavior remains intentionally unresolved.", "query": {"kind": "callers_of", "target": {"symbol": "dynamic_module:function/arity"}}, "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "CALLS", "target": "dynamic_module:function/arity", "reason": "dynamic module/function cannot be resolved statically"}]}, "review": {"status": "intentional_unresolved", "reviewer": "corpus-freeze"}},
-    {"id": "fallback-unavailable", "category": "fallback_unavailable", "description": "Missing semantic tool must preserve Generic fallback behavior.", "query": {"kind": "diagnostics", "target": {"symbol": "elp"}}, "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "TOOL_UNAVAILABLE", "target": "elp", "reason": "tool is not installed in frozen environment"}]}, "required_diagnostics": ["semantic_tools_not_available_at_freeze"], "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}},
-    {"id": "stale-cache", "category": "stale_cache", "description": "Cache state must be keyed to the fixed revision before reuse.", "query": {"kind": "cache", "target": {"symbol": "bc8a4424ffd70006ba482f15aa7c61199af34b71"}}, "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "CACHE_REJECTED", "target": "bc8a4424ffd70006ba482f15aa7c61199af34b71", "reason": "stale or unkeyed cache is not authoritative"}]}, "review": {"status": "manual_anchor", "reviewer": "corpus-freeze"}}
+    {
+      "id": "local-callers",
+      "category": "local_callers",
+      "description": "Local callers of server_ark_memory:get_container_memory_limit/0.",
+      "query": {"kind": "callers_of", "target": "server_ark_memory:get_container_memory_limit/0"},
+      "expected": {"positive": [
+        {"relation": "CALLS", "source": "apps/server_ark/src/server_ark_memory.erl::server_ark_memory.detect_total_memory/0", "target": "apps/server_ark/src/server_ark_memory.erl::server_ark_memory.get_container_memory_limit/0"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 1}
+    },
+    {
+      "id": "remote-callers",
+      "category": "remote_callers",
+      "description": "Cross-module callers of capacity_planning:is_enable/0.",
+      "query": {"kind": "callers_of", "target": "capacity_planning:is_enable/0"},
+      "expected": {"positive": [
+        {"relation": "CALLS", "source": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.info/0", "target": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.is_enable/0"},
+        {"relation": "CALLS", "source": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.occupy_resource/1", "target": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.is_enable/0"},
+        {"relation": "CALLS", "source": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.release_resource/1", "target": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.is_enable/0"},
+        {"relation": "CALLS", "source": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_config_load/1", "target": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.is_enable/0"},
+        {"relation": "CALLS", "source": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_server_ark_reload_config/1", "target": "apps/server_ark/src/capacity_planning/capacity_planning.erl::capacity_planning.is_enable/0"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 5}
+    },
+    {
+      "id": "shared-header-records",
+      "category": "shared_header_records",
+      "description": "Consumers of the shared #trigger{} record declaration.",
+      "query": {"kind": "references", "target": {"file": "apps/server_cfg_data/include/trigger.hrl", "symbol": "trigger"}},
+      "expected": {"positive": [
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/duplicate/lib_duplicate_nightmare.erl::lib_duplicate_nightmare.listen_level_event/1", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/progress/lib_progress.erl::lib_progress.register_progress/4", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/role/lib_role_trigger.erl::lib_role_trigger.add_trigger_details/1", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/role/lib_role_trigger.erl::lib_role_trigger.add_trigger_details/1", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/role/lib_role_trigger.erl::lib_role_trigger.call_trigger/2", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/src/mod/role/lib_role_trigger.erl::lib_role_trigger.del_trigger/1", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"},
+        {"relation": "REFERENCES", "source": "apps/server_game/test/mod_level_play_SUITE.erl::mod_level_play_SUITE.t_req_finish_level_play/1", "target": "apps/server_cfg_data/include/trigger.hrl::#trigger{}"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 7}
+    },
+    {
+      "id": "behaviour-callbacks",
+      "category": "behaviour_callbacks",
+      "description": "A module explicitly implementing the ct_hooks behaviour.",
+      "query": {"kind": "implementers_of", "target": {"symbol": "ct_hooks"}},
+      "expected": {"positive": [{"relation": "IMPLEMENTS", "source": "apps/server_game/test/cth_surefire_new.erl::cth_surefire_new", "target": "ct_hooks"}], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 1}
+    },
+    {
+      "id": "supervisor-mfa",
+      "category": "supervisor_mfa",
+      "description": "Static supervisor child-start MFA caller evidence.",
+      "query": {"kind": "callers_of", "target": "erlperf_sup:start_link/0"},
+      "expected": {"positive": [
+        {"relation": "CALLS", "source": "_checkouts/erlperf/src/erlperf_app.erl::erlperf_app.start/2", "target": "_checkouts/erlperf/src/erlperf_sup.erl::erlperf_sup.start_link/0"},
+        {"relation": "CALLS", "source": "_checkouts/erlperf/test/erlperf_monitor_SUITE.erl::erlperf_monitor_SUITE.subscribe/1", "target": "_checkouts/erlperf/src/erlperf_sup.erl::erlperf_sup.start_link/0"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 2}
+    },
+    {
+      "id": "common-test",
+      "category": "common_test",
+      "description": "Common Test coverage for one production function.",
+      "query": {"kind": "tests_for", "target": {"file": "apps/server_ark/src/server_ark_config.erl", "symbol": "get_config", "arity": 2}},
+      "expected": {"positive": [
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_config_load/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_config_reload/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_config_reload/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_config_reload/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_limit_calculation/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_occupy_limit_exceeded/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_capacity_release_and_reuse/1"},
+        {"relation": "TESTED_BY", "source": "apps/server_ark/src/server_ark_config.erl::server_ark_config.get_config/2", "target": "apps/server_ark/test/server_ark_config_SUITE.erl::server_ark_config_SUITE.t_throttle_config_load/1"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 8}
+    },
+    {
+      "id": "eunit",
+      "category": "eunit",
+      "description": "EUnit coverage for the eredis_map:set/3 production function.",
+      "query": {"kind": "tests_for", "target": {"file": "apps/server_redis/src/eredis/eredis_map.erl", "symbol": "set", "arity": 3}},
+      "expected": {"positive": [
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.exists_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.get_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.incr_by_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.set_nx_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.set_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.set_test_/0"},
+        {"relation": "TESTED_BY", "source": "apps/server_redis/src/eredis/eredis_map.erl::eredis_map.set/3", "target": "apps/server_redis/src/test/eredis_map_tests.erl::eredis_map_tests.set_test_/0"}
+      ], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 7}
+    },
+    {
+      "id": "generated-data",
+      "category": "generated_data",
+      "description": "Generated config header record is indexed with its generated-data revision.",
+      "query": {"kind": "references", "target": {"file": "apps/server_cfg_data/include/npc_chaos.hrl", "symbol": "chaos_road_point"}},
+      "expected": {"positive": [{"relation": "REFERENCES", "source": "apps/server_game/src/mod/chaos_npc/lib_road_chaos_npc.erl::lib_road_chaos_npc.get_road_point_meta_by_id/1", "target": "apps/server_cfg_data/include/npc_chaos.hrl::#chaos_road_point{}"}], "negative": [], "unresolved": []},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "generated_data_revision": "35021", "observed_edges": 1}
+    },
+    {
+      "id": "dynamic-unresolved",
+      "category": "dynamic_unresolved",
+      "description": "An unresolved repository call remains explicit when no local definition exists.",
+      "query": {"kind": "callers_of", "target": "cfg_account_bag:find/1"},
+      "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "CALLS", "target": "cfg_account_bag:find/1", "reason": "repository has no statically identified local definition"}]},
+      "review": {"status": "intentional_unresolved", "reviewer": "corpus-freeze", "observed_edges": 1}
+    },
+    {
+      "id": "fallback-unavailable",
+      "category": "fallback_unavailable",
+      "description": "Missing semantic tool must preserve Generic fallback behavior.",
+      "query": {"kind": "diagnostics", "target": {"symbol": "elp"}},
+      "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "TOOL_UNAVAILABLE", "target": "elp", "reason": "tool is not installed in frozen environment"}]},
+      "required_diagnostics": ["elp_unavailable"],
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze"}
+    },
+    {
+      "id": "stale-cache",
+      "category": "stale_cache",
+      "description": "Cache state must be keyed to the fixed revision before reuse.",
+      "query": {"kind": "cache", "target": {"symbol": "bc8a4424ffd70006ba482f15aa7c61199af34b71"}},
+      "expected": {"positive": [], "negative": [], "unresolved": [
+        {"relation": "CACHE_REJECTED", "source": "cache", "target": "bc8a4424ffd70006ba482f15aa7c61199af34b71"},
+        {"relation": "CACHE_REJECTED", "source": "cache", "target": "bc8a4424ffd70006ba482f15aa7c61199af34b71"}
+      ]},
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze", "observed_edges": 2}
+    }
+  ],
+  "impact": [
+    {
+      "changed_files": ["apps/server_ark/src/server_ark_config.erl"],
+      "critical_dependents": [
+        "apps/server_ark/src/capacity_planning/capacity_planning.erl",
+        "apps/server_ark/src/server_ark_memory.erl",
+        "apps/server_ark/src/throttle/throttle.erl",
+        "apps/server_ark/test/server_ark_config_SUITE.erl"
+      ],
+      "max_depth": 1,
+      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze"}
+    }
   ],
   "metrics": {"status": "not_run", "precision": null, "recall_at_10": null, "impact": null, "latency": null, "diagnostics": {"required": true}}
 }

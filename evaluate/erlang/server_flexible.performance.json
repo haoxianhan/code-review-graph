@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "kind": "erlang_performance_report",
+  "target": {
+    "name": "server_flexible",
+    "revision": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
+    "generated_data_revision": "35021",
+    "manifest": "server_flexible.manifest.json"
+  },
+  "measurement": {
+    "machine": "vm-dev",
+    "kernel": "6.18.45",
+    "cpu_count": 8,
+    "memory": "23 GiB",
+    "profile_db": "/tmp/crg-profile.db",
+    "parse_policy": "serial (CRG_SERIAL_PARSE=1)",
+    "warmup": "one completed full build before recorded samples",
+    "cache_policy": "fresh graph for full build; revision-keyed cache rejected when unkeyed",
+    "target_files": 1099,
+    "erlang_files": 975,
+    "nodes": 47694,
+    "edges": 131175
+  },
+  "samples": {
+    "full_build": {"status": "measured", "seconds": [55.398869], "p50_seconds": 55.398869, "p95_seconds": 55.398869},
+    "incremental_update": {"status": "measured", "seconds": [49.206366], "p50_seconds": 49.206366, "p95_seconds": 49.206366},
+    "restore_update": {"status": "measured", "seconds": [48.900230], "p50_seconds": 48.900230, "p95_seconds": 48.900230},
+    "layout_only": {"status": "not_run", "seconds": [], "reason": "No isolated layout-only lifecycle operation exists in the current evaluator."},
+    "no_op_update": {"status": "measured", "seconds": [24.334089], "p50_seconds": 24.334089, "p95_seconds": 24.334089},
+    "resolve_bare_call_targets": {"status": "measured", "seconds": [22.8], "p50_seconds": 22.8, "p95_seconds": 22.8},
+    "standalone_postprocess": {"status": "measured", "seconds": [56.4], "p50_seconds": 56.4, "p95_seconds": 56.4}
+  },
+  "budgets_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000},
+  "gates": {
+    "full_build_p95": {"observed_ms": 55398.869, "budget_ms": 30000, "pass": false},
+    "targeted_query_p95": {"observed_ms": 299.096, "budget_ms": 2000, "pass": true},
+    "layout_only": {"pass": false, "reason": "not_run"},
+    "lifecycle_repeatability": {"pass": false, "reason": "full evaluator exceeded 20 minutes and was stopped after a closed-database warning"}
+  },
+  "verdict": "auxiliary_review_context_only",
+  "limitations": [
+    "ELP, erlang_ls, and elp-ls are unavailable in the frozen environment.",
+    "Runtime OTP 27 differs from the manifest configured OTP 25.",
+    "Adapter runtime sandbox policy is descriptive and not enforced by the evaluator.",
+    "The full-build p95 budget is not met, and layout-only/repeatability gates are not green."
+  ]
+}

@@ -9,17 +9,9 @@
   "revision": {
     "requested": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
     "observed": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
-    "working_tree_clean": false,
-    "baseline_status": "non_clean",
-    "dirty_paths": [
-      "apps/server_mongodb",
-      "server_ai/indexer/docs.json",
-      "server_ai/indexer/manifest.txt",
-      "docker-operations-hardening-plan.md",
-      "docs/architecture/docker-images.md",
-      "server_ai/docs/specs/20260828-server-ai-behavior-evals.md",
-      "unify-rebar3-plan.md"
-    ]
+    "working_tree_clean": true,
+    "baseline_status": "clean",
+    "dirty_paths": []
   },
   "dependencies": {
     "lockfiles": [
@@ -32,8 +24,8 @@
       {
         "path": "apps/server_mongodb",
         "gitlink_revision": "74a3a7cf2cf10ca105e464ad8644bf3986d25795",
-        "checkout_revision": "56681fdb3a9c8ddc36b7c13232fc1d8e407f513d",
-        "working_tree_clean": false
+        "checkout_revision": "74a3a7cf2cf10ca105e464ad8644bf3986d25795",
+        "working_tree_clean": true
       },
       {
         "path": "apps/server_grpc",
@@ -78,11 +70,11 @@
     "configuration": {
       "files": ["rebar.config", "rebar.config.script", "erlang_ls.config", ".elp_lint.toml"],
       "execute_during_discovery": false,
-      "observed": {"rebar_config_script_present": false, "erlang_ls_config_present": true, "elp_lint_config_present": true}
+      "observed": {"rebar_config_script_present": true, "erlang_ls_config_present": true, "elp_lint_config_present": false}
     }
   },
   "evaluation": {
-    "status": "scaffolded",
+    "status": "measured_auxiliary",
     "adoption": "auxiliary_review_context_only",
     "fixed_revision_required": true,
     "lifecycle_checks": ["full_build", "incremental_update", "watch", "forget", "standalone_postprocess"],
@@ -102,8 +94,7 @@
   },
   "analysis": {"cache_paths": [".code-review-graph", "_build/default", "_build/test", "server_ai/indexer/modules.json", "server_ai/indexer/records.json"]},
   "diagnostics": [
-    {"code": "target_checkout_dirty_at_freeze", "severity": "warning", "message": "The requested revision was observed with local target changes; this is not a clean adoption baseline."},
     {"code": "semantic_tools_not_available_at_freeze", "severity": "warning", "message": "ELP and erlang_ls were unavailable; Generic syntax evidence remains the compatibility floor."},
-    {"code": "lifecycle_metrics_not_run", "severity": "warning", "message": "Lifecycle and precision/recall gates are not established by this artifact scaffold."}
+    {"code": "lifecycle_metrics_auxiliary_only", "severity": "warning", "message": "Lifecycle measurements are recorded in server_flexible.performance.json; adoption remains auxiliary until every gate is green."}
   ]
 }
