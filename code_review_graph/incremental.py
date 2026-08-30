@@ -3977,6 +3977,7 @@ def watch(
     stop_event: threading.Event | None = None,
     *,
     erlang_config: Any = _ERLANG_CONFIG_UNSET,
+    ready_event: threading.Event | None = None,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
@@ -3996,6 +3997,9 @@ def watch(
             (FTS, flows, communities) after watch updates.
         stop_event: Optional event that ends the loop cleanly, for callers
             that run ``watch`` on a thread they need to shut down.
+        ready_event: Optional event set after initial reconciliation and
+            post-processing have completed, immediately before live watching
+            begins.  This is useful for bounded lifecycle smoke tests.
 
     Raises:
         RuntimeError: if a watch update fails, or if the filesystem observer
@@ -4057,6 +4061,8 @@ def watch(
         handler.raise_if_failed()
         initialization_complete = True
         supervisor.report_health(observer_alive=True, phase="watching", force=True)
+        if ready_event is not None:
+            ready_event.set()
 
         logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
         while True:

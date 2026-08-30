@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -32,7 +33,7 @@ from typing import Any
 from ..erlang_integration import ErlangIntegrationConfig
 from ..forget import forget_files
 from ..graph import GraphEdge, GraphNode, GraphStore
-from ..incremental import full_build, incremental_update
+from ..incremental import full_build, incremental_update, watch
 from ..parser import normalize_file_path
 from ..postprocessing import run_post_processing
 from .erlang import (
@@ -3589,6 +3590,199 @@ def _fresh_forget_fingerprint(
             baseline_store.close()
 
 
+def _checkout_snapshot(root: Path) -> str:
+    """Hash checkout files while excluding mutable analysis state.
+
+    The adoption target is an external input.  A snapshot around the isolated
+    watch smoke makes an accidental target write observable without relying on
+    Git status (which does not report content restored before the check).
+    """
+    root = _canonical_path(root)
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        return digest.hexdigest()
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name not in {".git", ".code-review-graph"}
+            and not (current_path / name).is_symlink()
+        )
+        for name in sorted(filenames):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            digest.update(relative.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            if path.is_symlink():
+                digest.update(b"symlink\0")
+                digest.update(os.readlink(path).encode("utf-8", "surrogateescape"))
+                digest.update(b"\0")
+                continue
+            try:
+                with path.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except OSError as exc:
+                raise RuntimeError(f"could not snapshot target file {relative}") from exc
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _run_isolated_watch_smoke(
+    root: Path,
+    temp_root: Path,
+    *,
+    timeout: float,
+    erlang_config: Any = None,
+) -> dict[str, Any]:
+    """Run one real watcher cycle against a disposable checkout mirror.
+
+    The target is never passed to :func:`watch` because that function writes a
+    transient health marker under its repository root.  The mirror has its own
+    graph store and is removed by the caller's temporary-directory lifecycle.
+    """
+    bounded_timeout = min(max(float(timeout), 0.1), 30.0)
+    with tempfile.TemporaryDirectory(prefix="crg-watch-smoke-", dir=str(temp_root)) as context:
+        context_root = Path(context)
+        mirror_root = context_root / "repo"
+        shutil.copytree(
+            root,
+            mirror_root,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".code-review-graph"),
+        )
+        source_files = sorted(
+            path
+            for path in mirror_root.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and path.suffix in {".erl", ".hrl"}
+        )
+        if not source_files:
+            raise RuntimeError("watch smoke requires an Erlang source file")
+
+        store = GraphStore(context_root / "graph.db")
+        stop_event = threading.Event()
+        ready_event = threading.Event()
+        update_event = threading.Event()
+        callback_count = 0
+        callback_lock = threading.Lock()
+        failures: list[BaseException] = []
+        thread: threading.Thread | None = None
+        try:
+            build_result = _lifecycle_call(
+                full_build,
+                mirror_root,
+                store,
+                erlang_config=erlang_config,
+            )
+            build_payload = _checked_lifecycle_result(
+                build_result,
+                "full_build",
+                reject_errors=False,
+            )
+            errors = build_payload.get("errors")
+            if isinstance(errors, list) and errors:
+                raise RuntimeError(f"watch smoke mirror build reported {len(errors)} error(s)")
+            post_result = _invoke_with_optional_config(
+                run_post_processing,
+                store,
+                repo_root=mirror_root,
+            )
+            _checked_lifecycle_result(post_result, "standalone_postprocess")
+            reference_fingerprint = _portable_graph_fingerprint(store, mirror_root)
+
+            def on_files_updated(updated_store: GraphStore) -> dict[str, Any]:
+                nonlocal callback_count
+                with callback_lock:
+                    callback_count += 1
+                result = run_post_processing(updated_store, repo_root=mirror_root)
+                if isinstance(result, Mapping) and result.get("warnings"):
+                    raise RuntimeError("watch smoke postprocess returned warnings")
+                update_event.set()
+                return result if isinstance(result, dict) else {}
+
+            def run_watcher() -> None:
+                try:
+                    watch(
+                        mirror_root,
+                        store,
+                        on_files_updated=on_files_updated,
+                        stop_event=stop_event,
+                        erlang_config=(
+                            ErlangIntegrationConfig(enabled=False)
+                            if erlang_config is None
+                            else erlang_config
+                        ),
+                        ready_event=ready_event,
+                    )
+                except BaseException as exc:  # surfaced at this bounded boundary
+                    failures.append(exc)
+                    ready_event.set()
+                    update_event.set()
+
+            thread = threading.Thread(
+                target=run_watcher,
+                name="crg-adoption-watch-smoke",
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + bounded_timeout
+            ready = ready_event.wait(max(0.0, deadline - time.monotonic()))
+            if failures:
+                raise RuntimeError("watch smoke failed during startup") from failures[0]
+            if not ready:
+                raise TimeoutError("watch smoke did not reach its live phase before timeout")
+
+            source = source_files[0]
+            raw_source = source.read_bytes()
+            first_newline = raw_source.find(b"\n")
+            if first_newline < 0:
+                triggered_source = raw_source + b" "
+            else:
+                triggered_source = (
+                    raw_source[:first_newline] + b" " + raw_source[first_newline:]
+                )
+            source.write_bytes(triggered_source)
+            updated = update_event.wait(max(0.0, deadline - time.monotonic()))
+            if updated:
+                update_event.clear()
+                source.write_bytes(raw_source)
+                restored = update_event.wait(max(0.0, deadline - time.monotonic()))
+            else:
+                restored = False
+            stop_event.set()
+            thread.join(max(0.0, min(bounded_timeout, deadline - time.monotonic())))
+            if thread.is_alive():
+                raise TimeoutError("watch smoke did not stop before timeout")
+            if failures:
+                raise RuntimeError(
+                    "watch smoke failed while processing the trigger"
+                ) from failures[0]
+            if not updated or not restored or callback_count < 2:
+                raise TimeoutError(
+                    "watch smoke did not observe both update and restore notifications"
+                )
+            observed_fingerprint = _portable_graph_fingerprint(store, mirror_root)
+            return {
+                "events": callback_count,
+                "updates": callback_count,
+                "graph_changed": observed_fingerprint != reference_fingerprint,
+                "notifications": callback_count,
+                "reference_fingerprint": reference_fingerprint,
+                "observed_fingerprint": observed_fingerprint,
+            }
+        finally:
+            stop_event.set()
+            if thread is not None and thread.is_alive():
+                thread.join(bounded_timeout)
+            store.close()
+
+
 def _run_lifecycle(
     root: Path,
     temp_root: Path,
@@ -3596,6 +3790,7 @@ def _run_lifecycle(
     graph_runner: Callable[..., Any] | None = None,
     lifecycle_runner: Callable[..., Any] | None = None,
     watch_smoke: bool = False,
+    watch_timeout: float = 5.0,
     erlang_config: Any = None,
 ) -> tuple[GraphStore, dict[str, Any], dict[str, Sequence[float]], list[dict[str, Any]]]:
     """Build a temporary graph and exercise bounded non-watch lifecycle paths."""
@@ -3849,7 +4044,72 @@ def _run_lifecycle(
         # A real observer writes a health marker under the repository root;
         # therefore it is never started by the default read-only evaluator.
         # A caller-supplied lifecycle runner may provide an isolated smoke test.
-        if lifecycle_runner is not None and watch_smoke:
+        if watch_smoke and lifecycle_runner is None:
+            started = time.perf_counter()
+            target_snapshot = _checkout_snapshot(root)
+            try:
+                watch_payload = _run_isolated_watch_smoke(
+                    root,
+                    temp_root,
+                    timeout=watch_timeout,
+                    erlang_config=erlang_config,
+                )
+                if _checkout_snapshot(root) != target_snapshot:
+                    raise RuntimeError("isolated watch smoke changed the target checkout")
+                watch_payload = _checked_lifecycle_result(watch_payload, "watch")
+                watch_after = _valid_fingerprint(watch_payload.get("observed_fingerprint"))
+                if watch_after is None:
+                    raise ValueError("isolated watch smoke did not return an observed fingerprint")
+                watch_reference = _valid_fingerprint(watch_payload.get("reference_fingerprint"))
+                if watch_reference is None:
+                    watch_reference = _valid_fingerprint(
+                        watch_payload.get("full_build_reference_fingerprint")
+                    )
+                watch_reference_match = (
+                    watch_reference is not None and watch_after == watch_reference
+                )
+                watch_activity, watch_counts = _watch_activity_evidence(watch_payload)
+                watch_duration = time.perf_counter() - started
+                lifecycle["watch"] = {
+                    "status": "executed",
+                    "duration_seconds": watch_duration,
+                    "result": watch_payload,
+                    "parity": watch_activity and watch_reference_match,
+                    "activity_evidence": watch_activity,
+                    "reference_match": watch_reference_match,
+                    "reference_fingerprint": watch_reference,
+                    "observed_fingerprint": watch_after,
+                }
+                timings["watch"] = [watch_duration]
+            except Exception as exc:
+                target_changed = False
+                try:
+                    target_changed = _checkout_snapshot(root) != target_snapshot
+                except Exception:
+                    # The original watch failure remains the primary error;
+                    # an unreadable target is still fail-closed below.
+                    pass
+                diagnostic_code = "target_write_detected" if target_changed else "watch_failed"
+                diagnostic_message = (
+                    "Isolated watch smoke changed the target checkout."
+                    if target_changed
+                    else "Isolated watch smoke failed."
+                )
+                diagnostics.append(
+                    _diagnostic(
+                        diagnostic_code,
+                        "error",
+                        diagnostic_message,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                lifecycle["watch"] = {
+                    "status": "error",
+                    "duration_seconds": time.perf_counter() - started,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "parity": False,
+                }
+        elif lifecycle_runner is not None and watch_smoke:
             started = time.perf_counter()
             try:
                 watch_result = _invoke_with_optional_config(
@@ -6551,6 +6811,7 @@ def run_adoption_evaluation(
                     graph_runner=graph_runner,
                     lifecycle_runner=lifecycle_runner,
                     watch_smoke=watch_smoke,
+                    watch_timeout=timeout,
                     erlang_config=erlang_config,
                 )
                 diagnostics.extend(lifecycle_diagnostics)

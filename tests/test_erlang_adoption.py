@@ -21,6 +21,7 @@ from code_review_graph.eval.erlang_adoption import (
     _relation_matches,
     _repository_gates,
     _run_case,
+    _run_isolated_watch_smoke,
     _run_lifecycle,
     _semantic_execution_state,
     _top_level_diagnostics_gate,
@@ -549,6 +550,47 @@ def test_lifecycle_watch_requires_activity_evidence(tmp_path: Path):
         assert lifecycle["standalone_postprocess"]["parity"] is False
     finally:
         store.close()
+
+
+def test_default_watch_smoke_uses_mirror_and_cleans_up(tmp_path: Path, monkeypatch):
+    """The opt-in default smoke never writes the evaluated checkout."""
+    repo, manifest, corpus = _fixture(tmp_path)
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    before = (repo / "src" / "worker.erl").read_bytes()
+
+    result = run_adoption_evaluation(
+        manifest,
+        corpus,
+        probe_root=tmp_path,
+        watch_smoke=True,
+        timeout=5.0,
+    )
+
+    assert result["lifecycle"]["watch"]["status"] == "executed"
+    assert result["lifecycle"]["watch"]["activity_evidence"] is True
+    assert result["lifecycle"]["watch"]["parity"] is True
+    assert result["lifecycle"]["watch"]["result"]["events"] > 0
+    assert (repo / "src" / "worker.erl").read_bytes() == before
+    assert not (repo / ".code-review-graph").exists()
+    assert not list(tmp_path.glob("crg-watch-smoke-*"))
+
+
+def test_isolated_watch_smoke_timeout_is_bounded_and_cleans_up(tmp_path: Path, monkeypatch):
+    """A watcher that never reaches readiness cannot satisfy the smoke gate."""
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "worker.erl").write_text(
+        "-module(worker).\n-export([run/0]).\nrun() -> ok.\n",
+        encoding="utf-8",
+    )
+
+    def stalled_watch(*_args, **_kwargs):
+        _kwargs["stop_event"].wait(1.0)
+
+    monkeypatch.setattr("code_review_graph.eval.erlang_adoption.watch", stalled_watch)
+    with pytest.raises(TimeoutError, match="live phase"):
+        _run_isolated_watch_smoke(root, tmp_path, timeout=0.1)
+    assert not list(tmp_path.glob("crg-watch-smoke-*"))
 
 
 @pytest.mark.parametrize("field", ["events", "updates", "notifications"])
