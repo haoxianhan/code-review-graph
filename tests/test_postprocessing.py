@@ -1,5 +1,6 @@
 """Tests for the shared post-processing pipeline."""
 
+import hashlib
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -7,8 +8,9 @@ from unittest.mock import MagicMock, patch
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, incremental_update
-from code_review_graph.parser import EdgeInfo, NodeInfo
+from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
 from code_review_graph.postprocessing import run_post_processing
+from code_review_graph.tools import build as build_tools
 
 
 def _get_signature(store, qualified_name):
@@ -485,7 +487,10 @@ class TestWatchCallbackIntegration:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._watch_sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=callback)
 
@@ -534,7 +539,10 @@ class TestWatchCallbackIntegration:
 
             with (
                 patch("watchdog.observers.Observer", return_value=observer),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._watch_sleep",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
 
@@ -642,3 +650,76 @@ class TestResolveBareEndpointsStep:
         assert "bare_edges_resolved" not in result
         assert any("Call-target resolution" in w for w in result["warnings"])
         assert "communities_detected" in result
+
+
+def test_standalone_build_postprocess_reconciles_erlang_headers_when_identity_is_current(
+    tmp_path, monkeypatch
+):
+    """The standalone build entry point must not skip header reconciliation."""
+    repo = tmp_path / "repo"
+    include = repo / "include"
+    src = repo / "src"
+    graph_dir = repo / ".code-review-graph"
+    include.mkdir(parents=True)
+    src.mkdir()
+    graph_dir.mkdir()
+    header = include / "shared.hrl"
+    source = src / "worker.erl"
+    header.write_text("-record(shared, {value}).\n", encoding="utf-8")
+    source.write_text(
+        "-module(worker).\n"
+        "-include(\"shared.hrl\").\n"
+        "run() -> #shared{}.\n",
+        encoding="utf-8",
+    )
+
+    store = GraphStore(graph_dir / "graph.db")
+    try:
+        parser = CodeParser(repo)
+        for path in (header, source):
+            raw = path.read_bytes()
+            nodes, edges = parser.parse_bytes(path, raw)
+            store.store_file_nodes_edges(
+                str(path), nodes, edges,
+                hashlib.sha256(raw).hexdigest(),
+            )
+        # Simulate a graph imported from a pre-resolver build while keeping the
+        # identity check on the current path so this exercises the missing
+        # standalone branch rather than a rebuild.
+        store._conn.execute(
+            "UPDATE edges SET target_qualified = ? "
+            "WHERE kind = 'IMPORTS_FROM'",
+            ("shared.hrl",),
+        )
+        store._conn.execute(
+            "UPDATE edges SET target_qualified = ? "
+            "WHERE kind = 'REFERENCES' AND extra LIKE '%record%'",
+            ("shared",),
+        )
+        store.commit()
+    finally:
+        store.close()
+
+    monkeypatch.setattr(build_tools, "_ensure_erlang_identity_current", lambda *a, **k: None)
+    monkeypatch.setattr(build_tools, "_run_erlang_lifecycle", lambda *a, **k: None)
+
+    result = build_tools.run_postprocess(
+        flows=False,
+        communities=False,
+        fts=False,
+        repo_root=str(repo),
+        erlang_config={"enabled": False},
+    )
+
+    assert result["erlang_header_resolution"]["imports_resolved"] == 1
+    assert result["erlang_header_resolution"]["records_resolved"] == 1
+    with GraphStore(graph_dir / "graph.db") as checked:
+        import_edge = checked._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind = 'IMPORTS_FROM'"
+        ).fetchone()
+        record_edge = checked._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind = 'REFERENCES' "
+            "AND extra LIKE '%record%'"
+        ).fetchone()
+        assert import_edge["target_qualified"] == header.as_posix()
+        assert record_edge["target_qualified"].endswith("::#shared{}")

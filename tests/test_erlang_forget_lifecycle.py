@@ -390,11 +390,21 @@ def test_forget_ignores_non_erlang_mfa_alias_collisions(
         summary = forget_files(store, repo, [str(foreign)])
 
         assert str(repo / "src" / "caller.erl") not in summary["reparsed"]
-        assert store._conn.execute(
+        edge = store._conn.execute(
             "SELECT target_qualified FROM edges WHERE kind = 'CALLS' "
             "AND file_path = ?",
             (str(repo / "src" / "caller.erl"),),
-        ).fetchone()["target_qualified"] == "worker:run/0"
+        ).fetchone()
+        assert edge is not None
+        # The forget boundary always runs post-processing. With the Erlang
+        # worker still indexed, its unique remote MFA is canonically resolved;
+        # the foreign Python node must not become that endpoint.
+        assert edge["target_qualified"] == (
+            f"{repo / 'src' / 'worker.erl'}::worker.run/0"
+        )
+        assert edge["target_qualified"] != (
+            f"{foreign}::worker.run/0"
+        )
     finally:
         store.close()
 

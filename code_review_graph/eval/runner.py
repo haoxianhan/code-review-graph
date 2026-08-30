@@ -329,7 +329,12 @@ def run_eval(
             # those, so call it directly here. Without this, FTS5 stays empty
             # and downstream benchmarks (token_efficiency, search_quality)
             # silently produce useless results. See: search.rebuild_fts_index.
-            pp_result = run_post_processing(store)
+            # The evaluator's temporary graph database is opened at
+            # ``db_path`` while the indexed checkout is ``repo_path``.  Pass
+            # the explicit repository root so scoped Erlang include/record
+            # resolution does not infer the database directory as the source
+            # tree boundary.
+            pp_result = run_post_processing(store, repo_root=repo_path)
             for warning in pp_result.get("warnings", []):
                 logger.warning("  postprocessing: %s", warning)
 

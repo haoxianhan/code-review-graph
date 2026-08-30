@@ -427,7 +427,10 @@ def forget_files(
     #    store_communities clear their tables first, so flows and communities
     #    are fully recomputed; signatures and FTS are rebuilt; and any edge
     #    left bare by the re-parse is re-resolved.
-    run_post_processing(store)
+    # A caller may keep the graph database outside the checkout (shared stores
+    # and evaluator fixtures do this routinely), so never let the Erlang
+    # resolver infer its scope from the database parent.
+    run_post_processing(store, repo_root=Path(repo_root))
 
     # 7. Drop embedding vectors that now reference a deleted node.
     purged = _purge_orphan_embeddings(store)

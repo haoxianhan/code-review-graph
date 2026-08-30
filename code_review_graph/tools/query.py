@@ -55,6 +55,7 @@ _QUERY_PATTERNS = {
 _JAVA_FQN_PART = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 _MAX_FQN_CANDIDATES = 100
 _MAX_QUERY_RESULTS = 10_000
+_ERLANG_TEST_MAX_DEPTH = 3
 
 
 def _display_query_target(target: Any) -> str:
@@ -408,13 +409,17 @@ def query_graph(
                         else store.find_erlang_mfa(
                             *erlang_mfa,
                             limit=min(max(response_limit + 1, 2), _MAX_QUERY_RESULTS),
+                            repo_root=root,
                         )
                     )
                     if len(erlang_candidates) == 1:
                         node = erlang_candidates[0]
                         target = node.qualified_name
                     elif len(erlang_candidates) > 1:
-                        candidate_count = store.count_erlang_mfa(*erlang_mfa)
+                        candidate_count = store.count_erlang_mfa(
+                            *erlang_mfa,
+                            repo_root=root,
+                        )
                         ranked = _rank_disambiguation_candidates(erlang_candidates, target)
                         visible = ranked[:response_limit]
                         return {
@@ -670,7 +675,17 @@ def query_graph(
             # Keep the normal sanitized node response while adding the
             # direct/indirect marker returned by the bounded store lookup.
             seen: set[str] = set()
-            for match in store.get_transitive_tests(qn):
+            # Erlang Common Test/EUnit suites often reach production through
+            # one or more helper modules.  ``GraphStore`` uses a conservative
+            # reverse walk for Erlang; give that walk a small explicit bound
+            # while preserving the historical one-hop default for other
+            # languages.
+            test_depth = (
+                _ERLANG_TEST_MAX_DEPTH
+                if node is not None and (node.language or "").casefold() == "erlang"
+                else 1
+            )
+            for match in store.get_transitive_tests(qn, max_depth=test_depth):
                 test_qn = match.get("qualified_name")
                 if not isinstance(test_qn, str) or test_qn in seen:
                     continue

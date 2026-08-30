@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 from .graph import GraphStore
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 def run_post_processing(
     store: GraphStore,
     *,
+    repo_root: str | Path | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> dict[str, Any]:
@@ -49,7 +51,7 @@ def run_post_processing(
     result: dict[str, Any] = {}
     warnings: list[str] = []
 
-    _resolve_bare_endpoints(store, result, warnings)
+    _resolve_bare_endpoints(store, result, warnings, repo_root=repo_root)
     _compute_signatures(store, result, warnings)
     _rebuild_fts_index(store, result, warnings)
     _trace_flows(store, result, warnings)
@@ -74,11 +76,30 @@ def _resolve_bare_endpoints(
     store: GraphStore,
     result: dict[str, Any],
     warnings: list[str],
+    *,
+    repo_root: str | Path | None = None,
 ) -> None:
-    """Resolve bare and C++ scoped call targets before derived graph steps."""
+    """Resolve language endpoints before derived graph steps."""
+    # Erlang include/record endpoints must be canonical before generic call
+    # resolution and impact/FTS derivation.  The pass is deliberately
+    # best-effort so a malformed optional project config cannot discard the
+    # primary graph.
     try:
-        resolved = store.resolve_bare_call_targets()
-        resolved += store.resolve_bare_tested_by_sources()
+        from .erlang_header_resolver import resolve_erlang_header_records
+
+        result["erlang_header_resolution"] = resolve_erlang_header_records(
+            store, repo_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - post-processing is non-fatal
+        logger.warning("Erlang header/record resolution failed: %s", exc)
+        warnings.append(
+            "Erlang header/record resolution failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    try:
+        resolved = store.resolve_bare_call_targets(repo_root=repo_root)
+        resolved += store.resolve_bare_tested_by_sources(repo_root=repo_root)
         result["bare_edges_resolved"] = resolved
         result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()

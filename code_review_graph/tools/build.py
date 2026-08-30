@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from ..incremental import (
@@ -95,6 +96,7 @@ def _run_postprocess(
     changed_files: list[str] | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
@@ -121,10 +123,27 @@ def _run_postprocess(
         )
         return warnings
 
+    # Resolve Erlang preprocessor headers/records before generic endpoint and
+    # derived graph processing.  This is intentionally part of the minimal
+    # level as review queries rely on canonical include/record targets.
+    try:
+        from ..erlang_header_resolver import resolve_erlang_header_records
+
+        build_result["erlang_header_resolution"] = resolve_erlang_header_records(
+            store,
+            repo_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - resolver is best effort
+        logger.warning("Erlang header/record resolution failed: %s", exc)
+        warnings.append(
+            "Erlang header/record resolution failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     # Resolve bare and C++ scoped call targets before derived graph steps.
     try:
-        resolved = store.resolve_bare_call_targets()
-        resolved += store.resolve_bare_tested_by_sources()
+        resolved = store.resolve_bare_call_targets(repo_root=repo_root)
+        resolved += store.resolve_bare_tested_by_sources(repo_root=repo_root)
         build_result["bare_edges_resolved"] = resolved
         build_result["cpp_scoped_edges_resolved"] = (
             store.resolve_cpp_scoped_call_targets()
@@ -629,6 +648,7 @@ def build_or_update_graph(
             changed_files=changed,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            repo_root=root,
         )
         if warnings:
             build_result["warnings"] = warnings
@@ -729,9 +749,26 @@ def run_postprocess(
             if erlang_result is not None:
                 result["erlang_integration"] = erlang_result
 
+            # Keep the standalone path equivalent to full/incremental builds
+            # when the identity marker is already current.  Header and record
+            # edges may still be raw after an older graph import or a partial
+            # update; canonicalize them before resolving generic endpoints.
+            try:
+                from ..erlang_header_resolver import resolve_erlang_header_records
+
+                result["erlang_header_resolution"] = (
+                    resolve_erlang_header_records(store, _root)
+                )
+            except Exception as exc:  # noqa: BLE001 - optional resolver
+                logger.warning("Erlang header/record resolution failed: %s", exc)
+                warnings.append(
+                    "Erlang header/record resolution failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
         try:
-            resolved = store.resolve_bare_call_targets()
-            resolved += store.resolve_bare_tested_by_sources()
+            resolved = store.resolve_bare_call_targets(repo_root=_root)
+            resolved += store.resolve_bare_tested_by_sources(repo_root=_root)
             result["bare_edges_resolved"] = resolved
             result["cpp_scoped_edges_resolved"] = (
                 store.resolve_cpp_scoped_call_targets()
