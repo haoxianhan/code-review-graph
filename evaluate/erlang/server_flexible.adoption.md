@@ -53,4 +53,4 @@ Reproduction inputs:
 - `server_flexible.manifest.json`
 - `corpus.json`
 - `server_flexible.performance.json`
-- `CRG_SERIAL_PARSE=1 .venv/bin/python -m code_review_graph.eval.erlang_adoption ...`
+- `CRG_SERIAL_PARSE=1 .venv/bin/python -m code_review_graph.eval.erlang_adoption --manifest evaluate/erlang/server_flexible.manifest.json --corpus evaluate/erlang/corpus.json --target /tmp/crg-server-flexible-pinned-1788067717 --probe-root . --output-dir /tmp/crg-adoption-report-core`
