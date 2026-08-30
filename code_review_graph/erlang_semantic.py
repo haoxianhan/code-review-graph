@@ -95,6 +95,12 @@ _LOCATION_RE = re.compile(
     r"(?P<message>.*)$",
     re.IGNORECASE,
 )
+_DIALYZER_WARNING_KIND_RE = re.compile(
+    r"(?:\[(?P<bracket>[A-Za-z][A-Za-z0-9_]*)\]"
+    r"|\((?P<paren>[A-Za-z][A-Za-z0-9_]*)\)"
+    r"|(?P<prefix>warn_[A-Za-z0-9_]+))",
+    re.IGNORECASE,
+)
 _XREF_UNDEFINED_RE = re.compile(
     r"(?:undefined\s+(?:call|function)|call\s+to\s+undefined\s+function)\s*"
     r"(?P<target>[A-Za-z0-9_@'?-]+(?::[A-Za-z0-9_@'?-]+)?/\d+)",
@@ -140,6 +146,19 @@ def _bounded_text(value: Any, limit: int = _MAX_DIAGNOSTIC_TEXT) -> str:
     text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
     text = text.strip()
     return text[:limit]
+
+
+def _dialyzer_warning_kind(raw_line: str, message: str) -> str:
+    """Extract a tool warning tag when the selected Dialyzer format exposes it."""
+    for value in (raw_line, message):
+        match = _DIALYZER_WARNING_KIND_RE.search(value)
+        if match:
+            return str(
+                match.group("bracket")
+                or match.group("paren")
+                or match.group("prefix")
+            ).casefold()
+    return "unknown"
 
 
 def _normalise_targets(targets: str | Sequence[str] | None) -> tuple[str, ...]:
@@ -2634,16 +2653,20 @@ class DialyzerAdapter(_BaseAdapter):
                 match = _LOCATION_RE.match(line)
                 if match:
                     severity = (match.group("severity") or "warning").casefold()
+                    message = match.group("message").strip()
                     diagnostics.append(
                         Diagnostic(
                             code="dialyzer_warning",
-                            message=match.group("message").strip(),
+                            message=message,
                             severity=severity,
                             file_path=match.group("file"),
                             line=int(match.group("line")),
                             column=int(match.group("column")) if match.group("column") else None,
                             raw=line,
                             provenance=provenance,
+                            metadata={
+                                "warning_kind": _dialyzer_warning_kind(line, message),
+                            },
                         )
                     )
                 elif line.lower().startswith(("warning:", "error:")):
@@ -2654,6 +2677,9 @@ class DialyzerAdapter(_BaseAdapter):
                             severity="error" if line.lower().startswith("error:") else "warning",
                             raw=line,
                             provenance=provenance,
+                            metadata={
+                                "warning_kind": _dialyzer_warning_kind(line, line),
+                            },
                         )
                     )
         if status not in {STATUS_OK, STATUS_FAILED}:

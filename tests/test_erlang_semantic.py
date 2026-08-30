@@ -199,6 +199,24 @@ def test_dialyzer_ingests_location_and_kind(tmp_path: Path):
     assert diagnostic.file_path == "src/a.erl"
     assert diagnostic.line == 4
     assert diagnostic.column == 7
+    assert diagnostic.metadata["warning_kind"] == "unknown"
+
+
+def test_dialyzer_preserves_structured_warning_kind(tmp_path: Path):
+    adapter = DialyzerAdapter(
+        _toolchain(tmp_path),
+        runner=_runner(
+            CommandResult(
+                0,
+                "src/a.erl:4:7: Warning: [warn_return_no_exit] no local return\n",
+            )
+        ),
+    )
+
+    result = adapter.collect(tmp_path)
+
+    assert result.status == STATUS_OK
+    assert result.diagnostics[0].metadata["warning_kind"] == "warn_return_no_exit"
 
 
 def test_reconciler_merges_duplicates_and_marks_conflicts():
