@@ -7,7 +7,7 @@
       "id": "local-callers",
       "category": "local_callers",
       "description": "Local callers of server_ark_memory:get_container_memory_limit/0.",
-      "query": {"kind": "callers_of", "target": "server_ark_memory:get_container_memory_limit/0"},
+      "query": {"kind": "callers_of", "target": {"file": "apps/server_ark/src/server_ark_memory.erl", "symbol": "get_container_memory_limit", "arity": 0}},
       "expected": {"positive": [
         {"relation": "CALLS", "source": "apps/server_ark/src/server_ark_memory.erl::server_ark_memory.detect_total_memory/0", "target": "apps/server_ark/src/server_ark_memory.erl::server_ark_memory.get_container_memory_limit/0"}
       ], "negative": [], "unresolved": []},
