@@ -27,6 +27,7 @@ ADAPTER_MANIFEST_KIND = "erlang_adapter_manifest"
 ERLANG_ADAPTERS = ("generic", "elp", "xref", "dialyzer")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+TOOL_VERSION_RE = re.compile(r"(?<![0-9])v?([0-9]+(?:\.[0-9]+){1,3})(?![0-9])")
 GENERATED_REV_RE = re.compile(r"DATA_REV=(?P<value>[^\n\r]+)")
 GENERATED_TIME_RE = re.compile(r'DATA_COMMIT_TIME="(?P<value>[^"]+)"')
 GENERATED_AUTHOR_RE = re.compile(r'DATA_AUTHOR="(?P<value>[^"]*)"')
@@ -57,7 +58,6 @@ CASE_CATEGORIES = {
     "eunit",
     "generated_data",
     "dynamic_unresolved",
-    "fallback_unavailable",
     "stale_cache",
 }
 DIAGNOSTIC_SEVERITIES = {"info", "warning", "error"}
@@ -67,6 +67,8 @@ TOOL_STATUSES = {
     "not_checked",
     "unavailable",
 }
+
+REQUIRED_TOOL_NAMES = ("erl", "rebar3", "dialyzer", "elp")
 
 MODULE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = MODULE_ROOT / "evaluate" / "erlang" / "server_flexible.manifest.json"
@@ -1386,8 +1388,8 @@ def _discover_executable(
         diagnostics.append(
             _diagnostic(
                 f"{name}_unavailable",
-                "warning",
-                f"{name} is not available on PATH; Generic indexing remains usable.",
+                "error",
+                f"Required Erlang tool {name} is not available on PATH.",
                 command=tool["command"],
             )
         )
@@ -1397,20 +1399,46 @@ def _discover_executable(
     tool["probe"] = probe
     output = (probe.get("stdout", "") or "").strip() or (probe.get("stderr", "") or "").strip()
     tool["version_output"] = output
-    tool["version"] = output.splitlines()[0] if output else None
+    tool["version"] = _normalise_tool_version(name, output, path)
     if probe.get("returncode") != 0:
         tool["status"] = "not_checked"
         diagnostics.append(
             _diagnostic(
                 f"{name}_probe_failed",
-                "warning",
-                f"{name} was found but its bounded version probe failed.",
+                "error",
+                f"Required Erlang tool {name} failed its bounded version probe.",
                 command=tool["command"],
                 returncode=probe.get("returncode"),
                 stderr=probe.get("stderr", ""),
             )
         )
     return tool, diagnostics
+
+
+def _normalise_tool_version(name: str, output: str, path: str | None) -> str | None:
+    """Extract a comparable version token from each tool's human output."""
+    normalized_name = name.casefold()
+    if normalized_name == "elp":
+        match = re.search(r"\belp\s+([^\s]+)", output, re.IGNORECASE)
+        return match.group(1) if match else None
+    if normalized_name == "rebar3":
+        match = re.search(r"\brebar\s+([^\s]+)", output, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    if normalized_name == "dialyzer":
+        match = re.search(r"\bversion\s+v?([^\s]+)", output, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    if path:
+        try:
+            resolved = str(Path(path).resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            resolved = path
+        match = re.search(r"(?:erlang|rebar3)-([0-9]+(?:\.[0-9]+){1,3})", resolved)
+        if match:
+            return match.group(1)
+    match = TOOL_VERSION_RE.search(output)
+    return match.group(1) if match else None
 
 
 def _read_text(path: Path) -> str | None:
@@ -1646,9 +1674,7 @@ def _discover_toolchain(
         ],
         "rebar3": ["version"],
         "dialyzer": ["--version"],
-        "elp": ["--version"],
-        "erlang_ls": ["--version"],
-        "elp-ls": ["--version"],
+        "elp": ["version"],
     }
     for name, args in probes.items():
         tool, tool_diagnostics = _discover_executable(
@@ -1670,7 +1696,7 @@ def _discover_toolchain(
         diagnostics.append(
             _diagnostic(
                 "xref_unavailable",
-                "warning",
+                "error",
                 "rebar3 is unavailable, so the configured xref task cannot be invoked.",
                 command=["rebar3", "xref"],
             )
@@ -1743,7 +1769,7 @@ def _discover_toolchain(
             diagnostics.append(
                 _diagnostic(
                     "otp_config_runtime_mismatch",
-                    "warning",
+                    "error",
                     "erlang_ls.config points at a different OTP release than the runtime probe.",
                     configured_otp_path=configured_otp_path,
                     runtime_otp_release=runtime_otp,
@@ -1758,18 +1784,30 @@ def _discover_toolchain(
             current = tools[name]
             expected_status = expected_item.get("status")
             current_status = current.get("status")
-            if expected_status == "unavailable" and current_status not in {
-                "unavailable",
-                "not_checked",
-            }:
+            required = name in REQUIRED_TOOL_NAMES or expected_status in {
+                "available",
+                "available_via_rebar3",
+            }
+            if required and current_status not in {"available", "available_via_rebar3"}:
                 diagnostics.append(
                     _diagnostic(
-                        "tool_availability_changed",
-                        "warning",
-                        f"{name} is available now but was unavailable when the manifest "
-                        "was observed.",
-                        expected=expected_status,
+                        "required_tool_unavailable",
+                        "error",
+                        f"Required Erlang tool {name} is unavailable or failed its version probe.",
+                        expected=expected_status or "available",
                         observed=current_status,
+                    )
+                )
+            expected_version = expected_item.get("version")
+            observed_version = current.get("version")
+            if expected_version and observed_version and str(expected_version) != str(observed_version):
+                diagnostics.append(
+                    _diagnostic(
+                        "required_tool_version_mismatch" if required else "tool_version_changed",
+                        "error" if required else "warning",
+                        f"{name} version does not match the pinned toolchain baseline.",
+                        expected=expected_version,
+                        observed=observed_version,
                     )
                 )
             expected_path = expected_item.get("path")
@@ -1777,7 +1815,7 @@ def _discover_toolchain(
                 diagnostics.append(
                     _diagnostic(
                         "tool_path_changed",
-                        "warning",
+                        "error" if required else "warning",
                         f"{name} resolves to a different executable path.",
                         expected=expected_path,
                         observed=current.get("path"),

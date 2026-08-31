@@ -7,9 +7,9 @@
     "scope": "repository_root"
   },
   "activation": {
-    "mode": "explicit_opt_in",
-    "required": false,
-    "fallback": "generic_graph"
+    "mode": "always",
+    "required": true,
+    "fallback": "none"
   },
   "contract": {
     "role": "targeted semantic enrichment",
@@ -39,32 +39,32 @@
     "return_code": 124
   },
   "failure": {
-    "default_status": "degraded",
-    "fallback": "generic_graph",
+    "default_status": "failed",
+    "fallback": "none",
     "events": {
       "missing_tool": {
-        "status": "unavailable",
+        "status": "failed",
         "diagnostic_codes": ["elp_unavailable"],
-        "action": "continue_with_generic",
-        "fallback": "generic_graph"
+        "action": "block_preflight",
+        "fallback": "none"
       },
       "nonzero_exit": {
         "status": "failed",
         "diagnostic_codes": ["elp_failed"],
         "action": "retain_previous_evidence",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "timeout": {
         "status": "timeout",
         "diagnostic_codes": ["elp_timeout"],
         "action": "retain_previous_evidence",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "malformed_output": {
         "status": "malformed",
         "diagnostic_codes": ["elp_malformed_output", "elp_no_evidence"],
         "action": "discard_adapter_evidence",
-        "fallback": "generic_graph"
+        "fallback": "none"
       }
     }
   },
@@ -76,7 +76,7 @@
       "status": "malformed",
       "diagnostic_codes": ["elp_malformed_output"],
       "action": "discard_adapter_evidence",
-      "fallback": "generic_graph"
+        "fallback": "none"
     }
   },
   "provenance": {

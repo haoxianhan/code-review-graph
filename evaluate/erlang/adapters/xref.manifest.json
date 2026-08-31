@@ -7,9 +7,9 @@
     "scope": "repository_root"
   },
   "activation": {
-    "mode": "explicit_opt_in",
-    "required": false,
-    "fallback": "generic_graph"
+    "mode": "always",
+    "required": true,
+    "fallback": "none"
   },
   "contract": {
     "role": "module-level dependency and undefined-call evidence",
@@ -39,32 +39,32 @@
     "return_code": 124
   },
   "failure": {
-    "default_status": "degraded",
-    "fallback": "generic_graph",
+    "default_status": "failed",
+    "fallback": "none",
     "events": {
       "missing_tool": {
-        "status": "unavailable",
+        "status": "failed",
         "diagnostic_codes": ["xref_unavailable"],
-        "action": "omit_xref_evidence",
-        "fallback": "generic_graph"
+        "action": "block_preflight",
+        "fallback": "none"
       },
       "nonzero_exit": {
         "status": "failed",
         "diagnostic_codes": ["xref_failed"],
         "action": "omit_xref_evidence_and_keep_diagnostics",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "timeout": {
         "status": "timeout",
         "diagnostic_codes": ["xref_timeout"],
         "action": "omit_xref_evidence",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "malformed_output": {
         "status": "malformed",
         "diagnostic_codes": ["xref_malformed_output", "xref_no_evidence"],
         "action": "discard_xref_evidence",
-        "fallback": "generic_graph"
+        "fallback": "none"
       }
     }
   },
@@ -76,7 +76,7 @@
       "status": "malformed",
       "diagnostic_codes": ["xref_malformed_output", "xref_no_evidence"],
       "action": "discard_xref_evidence",
-      "fallback": "generic_graph"
+        "fallback": "none"
     }
   },
   "provenance": {

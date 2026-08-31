@@ -2,307 +2,304 @@
 
 ## Decision
 
-Build Erlang support from the current `main` branch. The previous native Erlang
-frontend was intentionally abandoned; `backup/native-erlang-20260829` is a
-historical snapshot only and is not part of the implementation, compatibility,
-or rollback path.
+Build Erlang support from the current `main` branch for the real
+`server_flexible` repository. The previous native Erlang frontend was
+intentionally abandoned; `backup/native-erlang-20260829` is a historical
+snapshot only and is not an implementation, compatibility, or rollback path.
 
-The first implementation is a hybrid adapter for the real `server_flexible`
-repository:
+The supported implementation is a project-scoped hybrid pipeline:
 
 ```text
-Generic Tree-sitter baseline
-    -> repository-wide files, modules, functions, tests, and coarse navigation
+Generic Tree-sitter syntax index
+    -> repository-wide files, modules, functions, tests, headers, and coarse layout
 
-ELP targeted enrichment
-    -> semantic evidence for changed functions and explicit review targets
+ELP CLI targeted semantic queries
+    -> changed functions and explicit callers/tests/impact targets
 
 rebar3 xref
-    -> module-level callers, dependencies, and undefined-call diagnostics
+    -> project module callers, dependencies, and undefined-call evidence
 
-Dialyzer
-    -> typed cross-module diagnostics and review evidence
+Dialyzer + a matching PLT
+    -> typed cross-module diagnostics
 ```
 
-The product target is the project repository, not Erlang as an abstract
-language benchmark. Erlang support is initially navigation and auxiliary review
-context. It can become a primary source for blocking review decisions only
-after the adoption gates in this document pass on real `server_flexible` cases.
+The product target is the project repository (`server_flexible`), not Erlang as
+an abstract language benchmark. The Generic index is an internal structural
+stage. It is not a fallback Erlang support mode and must not make a project
+appear healthy when the required semantic toolchain is absent or mismatched.
 
 ## Goal
 
-Provide useful, provenance-aware Erlang context through the existing CRG build,
-incremental update, watch, CLI, and MCP review-context paths. The first target
-workflows are:
+Provide deterministic, provenance-aware Erlang context through the existing CRG
+build, incremental update, watch, CLI, and MCP review-context paths for
+`server_flexible`. The first supported workflows are:
 
-- changed functions and their evidence-backed callers;
+- changed functions and evidence-backed callers;
 - changed modules and module-level dependents;
 - changed headers, records, and types and their consumers;
 - behaviour callbacks and implementing modules;
 - Common Test and EUnit coverage related to changed code;
-- impact results that remain useful when semantic tooling is unavailable.
+- impact results with explicit unresolved dynamic behaviour.
 
-The implementation must preserve the existing CRG contract: a Generic index is
-always useful on its own, semantic enrichment is additive, and an unresolved
-endpoint is preferable to a guessed endpoint.
+Every Erlang project operation must first validate the complete required
+toolchain. A missing executable, incompatible version, invalid project
+configuration, stale cache, or PLT mismatch is an observable preflight error
+and stops the Erlang operation. There is no Generic-only success result for a
+configured `server_flexible` operation.
+
+## Required toolchain baseline
+
+The current machine is the baseline and must be recorded in the checked-in
+manifest:
+
+| Component | Requirement |
+| --- | --- |
+| Erlang/OTP | exact `27.3.4.16` runtime; record ERTS (`15.2.7.12` on the baseline machine) and executable path |
+| `rebar3` | available project command; baseline `3.27.0` |
+| `rebar3 xref` | required task, invoked from the pinned project checkout |
+| ELP CLI | required executable and version; invocation must be recorded |
+| Dialyzer | version `5.3.1.1` on the baseline machine |
+| Dialyzer PLT | required, readable, and keyed to OTP, tool versions, dependencies, source revision, configuration, and generated-data revision |
+| Git | required to identify the checked-out project revision and dependency state |
+
+`erlang_ls` and `elp-ls` are not dependencies of this design. They are legacy
+probes or alternative language-server candidates and must not be installed,
+probed, or used as adoption gates.
 
 ## Scope
 
-### Generic baseline
+### Structural stage
 
-Add Erlang to the current Generic Tree-sitter path from the current `main`
-baseline. The baseline owns:
+Use the existing Generic Tree-sitter parser to discover `.erl`, `.hrl`, and
+`.app.src` files and create stable file, module, function, clause, test,
+record, type, and containment nodes. It may retain syntax-backed call,
+include, behaviour, and ownership candidates, but candidates remain unresolved
+until an approved semantic evidence source identifies the target.
 
-- `.erl`, `.hrl`, and `.app.src` discovery and language identity;
-- stable file, module, function, clause, test, record, and type nodes where
-  syntax is sufficient;
-- source spans, text search, containment, and coarse navigation;
-- local syntactic call candidates and repository-local ownership checks;
-- incremental file inventory and hash-based change detection.
+The structural stage must not execute `rebar.config.script`, parse transforms,
+plugins, project code, or network operations. It is a prerequisite for the
+semantic adapters, not an independent Erlang support mode.
 
-Generic parsing must work without ELP, xref, Dialyzer, a project build, or
-execution of project code. Syntax-only candidates must remain visibly
-unresolved until a supported evidence source resolves them.
+### Required semantic adapters
 
-### Semantic adapters
+- **ELP CLI:** targeted `enrichment`, `callers_of`, `tests_for`, `impact`, and
+  `references` queries. Promote function-level relations only when module,
+  function, and arity are explicit.
+- **xref:** consume project-level module callers/dependencies and undefined
+  calls. Keep xref facts at module granularity; never fabricate function-level
+  `CALLS` edges from a module fact.
+- **Dialyzer:** consume typed diagnostics with source location, warning kind,
+  PLT identity, and toolchain identity. Dialyzer does not replace caller,
+  dependency, or test relationships.
 
-Add independent adapters behind one review-context integration boundary:
-
-- **ELP**: query only changed functions, explicit `callers_of`/`tests_for`/
-  impact targets, and unresolved candidates selected by the review pipeline.
-- **xref**: consume project-level module caller/dependency and undefined-call
-  evidence. Do not turn module-level xref facts into function-level `CALLS`
-  edges.
-- **Dialyzer**: consume typed diagnostics and retain their original source
-  location, warning kind, and toolchain identity. Dialyzer does not replace
-  caller, dependency, or test relationships.
-
-Adapters are optional. A missing, mismatched, failed, or timed-out adapter must
-produce an observable diagnostic and leave the Generic graph intact.
-
-### Review-context integration
-
-Use the existing CRG graph, impact, change-detection, and review-context APIs.
-Do not introduce an Erlang-only public query surface in the first delivery.
-Relation evidence is attached to the existing node/edge model and carries
-provenance in the existing metadata fields or the agreed adapter evidence
-record. The first delivery does not persist the entire ELP workspace graph.
+All three adapters are required for the configured `server_flexible` profile.
+Their manifests must declare `activation.required: true` and must not name a
+`generic_graph` fallback.
 
 ### Repository boundary
 
 Analyze `server_flexible` as an external consumer repository. CRG must not
 modify its source, generated outputs, release process, or build configuration.
-The evaluated repository state is identified by a manifest containing its Git
-revision, dependency/checkout state, toolchain identity, and generated-data
-revision when generated sources are included.
+The manifest records the target revision, lockfiles, submodule checkouts,
+generated-data revision, toolchain identity, configuration digest, and PLT
+identity.
 
 ## Non-goals
 
-- Building an Erlang compiler, preprocessor, macro-expansion engine, or runtime
-  evaluator.
-- Treating generic syntax traversal as authoritative semantic resolution.
+- Restoring or maintaining the abandoned native frontend.
+- Treating syntax traversal as authoritative semantic resolution.
 - Inferring arbitrary dynamic `M:F/A`, fun variables, message flow, or process
   topology without explicit evidence.
-- Executing `rebar.config.script`, parse transforms, plugins, or project code
-  during Generic indexing.
-- Making the abandoned native frontend a compatibility layer or fallback.
-- Converting all ELP state into a persistent CRG graph in the first delivery.
-- Changing `server_flexible` or publishing an upstream pull request as part of
-  this implementation.
+- Executing project configuration scripts or code during structural indexing.
+- Building an Erlang compiler, preprocessor, macro-expansion engine, or runtime
+  evaluator.
+- Persisting the complete ELP workspace graph in the first delivery.
+- Changing `server_flexible` or publishing an upstream pull request.
+- Supporting `erlang_ls` or `elp-ls` as alternate required implementations.
 
 ## Relation and evidence contract
 
-The implementation uses the existing CRG relation model. The ownership below
-is the contract for promotion into review context:
-
 | Evidence | Owner | Promotion rule |
 | --- | --- | --- |
-| File/module/function/test/record/type nodes and containment | Generic | Syntax-backed nodes are always available. |
-| Local call candidates | Generic | Keep unresolved unless a target is proven. |
-| Function-level `CALLS` | ELP or another explicit resolver | Promote only when the target module/function/arity is identified. |
-| Module dependencies and module callers | xref plus Generic layout | Keep at module granularity; never fabricate function endpoints. |
-| Includes, record/type consumers | Generic candidates, ELP confirmation when available | Preserve unresolved candidates as evidence, not resolved edges. |
-| Behaviours and callback implementations | Generic attributes, ELP confirmation when available | Require the callback/implementation identity to be explicit. |
-| Common Test and EUnit coverage | Generic test discovery, ELP confirmation when available | Do not emit `TESTED_BY` for name-only coincidence. |
-| Type and cross-module diagnostics | Dialyzer | Preserve raw diagnostic identity and source location. |
+| File/module/function/test/record/type nodes and containment | Generic | Syntax-backed nodes are created during the structural stage. |
+| Local call/include/behaviour candidates | Generic | Keep unresolved until explicit semantic evidence resolves them. |
+| Function-level `CALLS`, `REFERENCES`, `TESTED_BY`, `IMPLEMENTS` | ELP | Require an identified target and matching source revision. |
+| Module dependencies, module callers, undefined calls | xref | Keep module facts at module granularity and retain raw diagnostics. |
+| Type and cross-module diagnostics | Dialyzer | Require a current matching PLT and preserve location/warning identity. |
 
-Every promoted relation or diagnostic records, at minimum, its evidence source,
-tool/version when applicable, analyzed source revision, generated-data revision
-when applicable, query kind, and status. Reconciliation must be deterministic:
-duplicate evidence is merged, conflicting evidence remains visible with its
-provenance, and stale evidence is removed when its revision no longer matches.
+Every promoted relation or diagnostic records evidence source, tool and version,
+OTP version, repository, source revision, generated-data revision when
+applicable, configuration digest, query kind/targets, analysis key, command,
+duration, cache state, and status. Reconciliation is deterministic: duplicate
+evidence is merged, conflicting evidence remains visible with provenance, and
+stale evidence is rejected.
 
 ## Toolchain and execution contract
 
-The implementation must discover and record the project toolchain before using
-semantic adapters:
+Before any semantic command runs, preflight must:
 
-- OTP version and executable path;
-- ELP executable, version, and invocation mode when available;
-- project-local `rebar3` path and version;
-- xref and Dialyzer command lines, environment, dependency roots, and PLT
-  identity;
-- analyzed Git revision and generated-data revision.
+1. resolve the required executables without evaluating project code;
+2. verify exact OTP `27.3.4.16`, the recorded `rebar3` and Dialyzer versions,
+   and the ELP CLI version/invocation;
+3. verify `rebar.config`, lockfiles, submodules, generated-data revision, and
+   repository cleanliness against the manifest;
+4. build or locate a PLT and verify its identity against the complete analysis
+   key; and
+5. validate adapter manifests and the controlled execution boundary.
 
-The concrete ELP protocol, subprocess sandbox, timeout values, cache layout, and
-concurrency mechanism are implementation-stage decisions. They are not
-preconditions for this plan, but each must be documented in the toolchain and
-adapter manifests before that adapter is enabled. Those manifests are part of
-the adapter's reviewable deliverable.
+Failure at any step returns a blocking diagnostic and no semantic result. The
+preflight must never silently substitute another OTP installation, language
+server, PLT, or structural-only result.
 
-Project commands that can evaluate configuration scripts, plugins, parse
-transforms, generate files, access the network, or write outside the analysis
-workspace must run in the controlled execution boundary defined by the adapter
-manifest. Generic-only operation must never depend on that boundary.
+Commands that may evaluate configuration scripts, plugins, parse transforms,
+generate files, access the network, or write outside the analysis workspace
+run only in the adapter's controlled execution boundary. The boundary uses
+argv execution, a restricted environment, explicit read/write roots, bounded
+timeouts, and atomic cache writes. Generic parsing itself remains side-effect
+free.
 
-## Fallback and consistency
+## Consistency and cache
 
 The request path is deterministic:
 
-1. Collect Generic nodes and syntax evidence.
-2. Load only enrichment evidence whose repository, source, generated-data,
-   configuration, toolchain, and query keys match.
-3. Execute missing targeted adapter work under bounded failure handling.
-4. Reconcile duplicate and conflicting evidence.
-5. Calculate impact and assemble review context with diagnostics.
+1. run required toolchain preflight;
+2. collect the structural graph and syntax evidence;
+3. load only enrichment evidence whose repository, revision, generated data,
+   configuration, toolchain, PLT, and query keys match;
+4. execute missing targeted adapter work under bounded failure handling;
+5. reconcile duplicate/conflicting evidence; and
+6. calculate impact and assemble review context.
 
-Fallback behavior is explicit:
-
-1. Generic succeeds and ELP is missing: return Generic navigation plus
-   `elp_unavailable`.
-2. An ELP query fails or times out: keep prior valid evidence, mark that query
-   unavailable, and continue the request.
-3. xref is unavailable or its output is unusable: omit xref-derived module
-   evidence and retain Generic/ELP results.
-4. Dialyzer is unavailable or its PLT is stale: omit its diagnostics and retain
-   the graph; never treat a stale PLT as current evidence.
-5. Evidence from another source or generated-data revision is discarded or
-   recomputed; it is never silently mixed with current evidence.
-
-No fallback may promote a lower-confidence candidate into a resolved edge.
-Disabling one adapter removes only its derived evidence and leaves Generic nodes,
-text search, and coarse navigation available.
+An adapter failure, timeout, malformed output, stale cache, or PLT mismatch is
+blocking for the configured Erlang operation. Prior evidence may be retained
+for diagnostics, but it must not be presented as current review context. A
+cache key must include repository, source revision, generated-data revision,
+configuration digest, OTP/tool versions, query kind/targets, and PLT identity.
 
 ## Implementation phases
 
-Each phase is independently mergeable and leaves the repository usable.
+Each phase is independently mergeable and leaves non-Erlang CRG workflows
+usable. A phase is complete only when its required-tool preflight and focused
+tests pass.
 
-### Phase 1: Generic Erlang baseline
+### Phase 1: Structural Erlang stage
 
-1. Add built-in Erlang file detection and the selected Tree-sitter grammar
-   integration to the current parser registry.
-2. Define stable Erlang identities for modules, functions, clauses, tests,
-   records, and types, including multi-clause functions.
+1. Register Erlang file detection and the selected Tree-sitter grammar.
+2. Define stable identities for modules, functions, clauses, tests, records,
+   and types, including multi-clause functions.
 3. Add syntax-backed containment, include, behaviour, and local call evidence
-   without claiming cross-file semantic resolution.
-4. Integrate the baseline with full build, incremental update, watch, forget,
-   and standalone postprocess paths.
-5. Add Generic-only fixtures and regression tests for missing optional tools.
+   without claiming semantic resolution.
+4. Integrate the stage with full build, incremental update, watch, forget, and
+   standalone postprocess paths.
+5. Add fixtures proving that structural parsing cannot bypass required
+   toolchain preflight for configured Erlang projects.
 
-**Deliverable:** `server_flexible` can be indexed and queried for Erlang
-navigation and coarse impact with no ELP, xref, Dialyzer, or project build.
+**Deliverable:** the structural stage is deterministic and side-effect free;
+an Erlang project operation still fails clearly when required tools are absent.
 
-### Phase 2: Evidence adapters
+### Phase 2: Required adapters
 
-1. Implement the ELP adapter using targeted queries and the adapter manifest.
-2. Implement xref module evidence and preserve raw command diagnostics.
-3. Implement Dialyzer diagnostic ingestion with PLT/toolchain validation.
+1. Implement ELP targeted queries and its strict adapter manifest.
+2. Implement xref module evidence and raw command diagnostics.
+3. Implement Dialyzer diagnostic ingestion and PLT identity validation.
 4. Implement one idempotent evidence reconciler shared by build, update, watch,
    forget, and standalone postprocess.
-5. Add revision-keyed enrichment caching and explicit stale-cache handling.
-6. Add focused tests for unavailable tools, mismatches, timeouts, malformed
-   output, duplicate evidence, and conflicting evidence.
+5. Implement revision/toolchain/PLT-keyed cache rejection.
+6. Add tests for missing tools, version mismatches, invalid configuration,
+   malformed output, timeouts, duplicate/conflicting evidence, stale caches,
+   and strict non-fallback behaviour.
 
-**Deliverable:** the same review-context interface returns Generic results and
-adds valid adapter evidence when the configured tools are available.
+**Deliverable:** the normal review-context interface returns semantic results
+only after all required adapters pass preflight.
 
 ### Phase 3: Review workflows and lifecycle parity
 
-1. Feed resolved function/module/header/type/behaviour/test evidence into
-   `get_review_context`, `get_impact_radius`, `detect_changes`, and the existing
-   callers/tests queries.
-2. Verify that initial build, incremental update, watch notification, forget,
-   and standalone postprocess converge to the same graph and evidence state,
-   modulo ordering and explicitly reported diagnostics.
-3. Verify that watch initialization cannot miss a pending update while the
-   initial Generic build or enrichment is running.
+1. Feed ELP/xref/Dialyzer evidence into the existing review-context, impact,
+   change-detection, callers, and tests-for queries.
+2. Verify initial build, incremental update, watch, forget, and standalone
+   postprocess converge to one graph/evidence contract.
+3. Verify watch initialization cannot miss pending updates while structural or
+   semantic work is running.
 4. Bound result size and query work for large `server_flexible` changes.
+5. Verify every lifecycle path returns the same blocking preflight diagnostics
+   for the same invalid toolchain.
 
-**Deliverable:** Erlang review context is available through the normal CRG
-workflows and degrades predictably when semantic tooling is unavailable.
+**Deliverable:** project review workflows are deterministic and fail closed on
+toolchain problems.
 
 ### Phase 4: Real-project corpus and adoption gate
 
-1. Freeze a small corpus from clean, fixed `server_flexible` revisions using
-   the repository/toolchain/generated-data manifest.
-2. Cover local and remote callers, shared headers/records, behaviours,
-   supervisor/service static MFA, Common Test, EUnit, generated data, missing
-   tools, and stale caches.
-3. Record manually reviewed positive and negative expected relationships,
-   intentionally unresolved dynamic behaviour, evidence source, and revision.
+1. Freeze clean, fixed `server_flexible` revisions with complete manifests.
+2. Cover local/remote callers, headers/records, behaviours, supervisor MFA,
+   Common Test, EUnit, generated data, dynamic unresolved calls, and stale
+   caches.
+3. Record manually reviewed positive, negative, and intentionally unresolved
+   expectations with evidence provenance.
 4. Run every case from a clean cache and after incremental update, watch,
    forget, and standalone postprocess.
 5. Publish repeatable precision, recall, impact, latency, and diagnostic
-   reports. Do not promote Erlang into primary review context until every gate
-   below is green.
+   reports. Do not promote Erlang to primary blocking-review evidence until
+   every gate below is green.
 
-**Deliverable:** a reproducible evaluation report and an explicit adoption
-decision for `server_flexible`.
+**Deliverable:** a reproducible `server_flexible` evaluation report and an
+explicit adoption decision.
 
 ## Adoption gates
 
-Promotion requires all of the following on the fixed corpus:
+Promotion requires all of the following on the fixed corpus and exact
+toolchain:
 
-- `100%` precision for every promoted relation kind, measured over all emitted
-  resolved edges of that kind;
-- caller/dependent `Recall@10` of at least `90%`, reported separately for
-  function-level and module-level relationships;
+- `100%` precision for every promoted relation kind;
+- caller/dependent `Recall@10` of at least `90%`, separately for function and
+  module relationships;
 - no unexplained false-positive `TESTED_BY` or impact edges;
-- every manually confirmed critical dependent appears in the impact result;
-- full-build and targeted-query p50/p95 latency fit the budget recorded in the
-  corpus manifest;
+- every manually confirmed critical dependent appears in impact results;
+- full-build and targeted-query p50/p95 latency fit the corpus budget;
 - full-build, incremental, watch, forget, and standalone postprocess preserve
-  the same relation and evidence contract;
-- missing tools, version mismatches, malformed output, timeouts, and stale
-  caches are observable and do not fail Generic indexing.
+  the same relation/evidence contract;
+- missing tools, version mismatches, malformed output, timeouts, stale caches,
+  and PLT mismatches are observable blocking failures;
+- no result is labeled current when its provenance or toolchain key differs.
 
 Until then, document Erlang as navigation and auxiliary review context only;
 it must not be the sole source for a blocking review decision.
 
 ## Verification
 
-The implementation records the exact command, revision, toolchain, cache state,
-and elapsed time for each check. At minimum:
+Record the exact command, revision, toolchain, PLT identity, cache state, and
+elapsed time for each check. At minimum:
 
 ```text
 CRG: full build, targeted callers/tests/impact/review-context queries
 CRG: incremental update, watch, forget, standalone postprocess
 ELP: cold-start and warm targeted query for every supported query kind
-rebar3 xref: project-pinned invocation, structured evidence, and raw diagnostics
-Dialyzer: project-pinned invocation, PLT validation, and raw diagnostics
-pytest: focused Erlang/lifecycle suites and full suite with hermetic Git config
+rebar3 xref: project-pinned invocation, structured evidence, raw diagnostics
+Dialyzer: project-pinned invocation, matching PLT validation, raw diagnostics
+pytest: focused Erlang/lifecycle suites and full hermetic suite
 ruff and mypy: repository quality gates
 ```
 
-Executed checks and unavailable checks must be reported separately. An external
-tool that was not run is not a passing result.
+Executed checks and blocked checks are reported separately. A tool that was
+not run is not a passing result.
 
 ## Rollback
 
-The Generic Erlang baseline is the compatibility floor. ELP, xref, and Dialyzer
-can be disabled independently; disabling an adapter removes only its derived
-evidence and diagnostics. No rollback step restores or depends on the abandoned
-native frontend.
+Disable the Erlang project integration at the CRG configuration boundary and
+remove its derived evidence/cache. Do not restore the abandoned native
+frontend. Non-Erlang graph functionality remains unaffected. Re-enabling
+requires the complete preflight to pass again.
 
 ## Exit criteria for implementation
 
-Before changing production review behavior, the implementation turn must have:
+Before changing production review behaviour, the implementation must have:
 
-1. A checked-in `server_flexible` repository/toolchain/generated-data manifest.
-2. A working Generic-only Erlang baseline with focused regression tests.
-3. Adapter manifests documenting invocation, failure, provenance, and cache
-   contracts for each enabled tool.
+1. A checked-in `server_flexible` repository/toolchain/generated-data/PLT
+   manifest pinned to OTP `27.3.4.16`.
+2. A deterministic structural Erlang stage and focused tests.
+3. Strict ELP, xref, and Dialyzer adapter manifests with enforced execution
+   boundaries and no Generic fallback.
 4. Initial golden cases with manually reviewed expected results.
-5. Baseline precision, Recall@10, impact, latency, and fallback measurements.
-6. A Beads issue for each adapter, lifecycle path, and adoption gate that
+5. Baseline precision, Recall@10, impact, latency, and strict-preflight
+   measurements.
+6. A Beads issue for every adapter, lifecycle path, and adoption gate that
    remains open.

@@ -9,6 +9,13 @@
   },
   "measurement": {
     "machine": "vm-dev",
+    "toolchain_baseline": {
+      "otp_version": "27.3.4.16",
+      "erts_version": "15.2.7.12",
+      "rebar3_version": "3.27.0",
+      "dialyzer_version": "5.3.1.1",
+      "elp_version": "1.1.0+build-2026-01-15"
+    },
     "kernel": "6.18.45",
     "cpu_count": 8,
     "memory": "23 GiB",
@@ -41,8 +48,8 @@
   },
   "verdict": "auxiliary_review_context_only",
   "limitations": [
-    "ELP, erlang_ls, and elp-ls are unavailable in the frozen environment.",
-    "Runtime OTP 27 differs from the manifest configured OTP 25.",
+    "Historical lifecycle samples were collected before the strict ELP requirement was installed; rerun required-adapter lifecycle checks before adoption.",
+    "server_flexible/erlang_ls.config still references the historical OTP 25 path; the required runtime baseline is OTP 27.3.4.16.",
     "Adapter runtime sandbox policy is descriptive and not enforced by the evaluator.",
     "Layout-only was not run, and complete lifecycle repeatability remains unverified."
   ]

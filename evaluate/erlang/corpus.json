@@ -112,15 +112,6 @@
       "review": {"status": "intentional_unresolved", "reviewer": "corpus-freeze", "observed_edges": 1}
     },
     {
-      "id": "fallback-unavailable",
-      "category": "fallback_unavailable",
-      "description": "Missing semantic tool must preserve Generic fallback behavior.",
-      "query": {"kind": "diagnostics", "target": {"symbol": "elp"}},
-      "expected": {"positive": [], "negative": [], "unresolved": [{"relation": "TOOL_UNAVAILABLE", "target": "elp", "reason": "tool is not installed in frozen environment"}]},
-      "required_diagnostics": ["elp_unavailable"],
-      "review": {"status": "manually_reviewed_anchor", "reviewer": "corpus-freeze"}
-    },
-    {
       "id": "stale-cache",
       "category": "stale_cache",
       "description": "Cache state must be keyed to the fixed revision before reuse.",

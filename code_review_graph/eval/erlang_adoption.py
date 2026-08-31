@@ -69,8 +69,7 @@ _SUPPORTED_QUERIES = frozenset(
 )
 _SEMANTIC_CASE_TOOLS = {
     "supervisor_mfa": frozenset({"xref", "elp"}),
-    "fallback_unavailable": frozenset({"elp", "erlang_ls", "elp-ls"}),
-    "stale_cache": frozenset({"elp", "erlang_ls", "elp-ls", "xref", "dialyzer"}),
+    "stale_cache": frozenset({"elp", "xref", "dialyzer"}),
 }
 _FUNCTION_CATEGORIES = frozenset({"local_callers", "remote_callers"})
 _MODULE_CATEGORIES = frozenset({"shared_header_records", "generated_data"})
@@ -533,7 +532,7 @@ def _tool_available(environment: Mapping[str, Any], name: str) -> bool:
 def _available_semantic_tools(environment: Mapping[str, Any]) -> set[str]:
     return {
         name
-        for name in ("elp", "erlang_ls", "elp-ls", "xref", "dialyzer")
+        for name in ("elp", "xref", "dialyzer")
         if _tool_available(environment, name)
     }
 
@@ -2912,12 +2911,6 @@ def _diagnostic_matches_tool(record: Any, tool: str) -> bool:
         return True
     if code in {f"{tool}_unavailable", f"{tool}-unavailable"}:
         return True
-    if code == "semantic_tools_not_available_at_freeze" and tool in {
-        "elp",
-        "erlang_ls",
-        "elp-ls",
-    }:
-        return True
     return tool in code and "unavailable" in code
 
 
@@ -5192,9 +5185,10 @@ def _adoption_gates(
     diagnostics_observable = bool(
         observed_codes.intersection(
             {
-                "elp_unavailable",
-                "erlang_ls_unavailable",
-                "elp-ls_unavailable",
+                "required_tool_unavailable",
+                "required_tool_version_mismatch",
+                "otp_config_runtime_mismatch",
+                "project_otp_configuration_stale",
                 "xref_unavailable",
                 "dialyzer_unavailable",
             }
@@ -6709,9 +6703,10 @@ def validate_evaluation_result(
     expected_diagnostics_observable = bool(
         observed_codes.intersection(
             {
-                "elp_unavailable",
-                "erlang_ls_unavailable",
-                "elp-ls_unavailable",
+                "required_tool_unavailable",
+                "required_tool_version_mismatch",
+                "otp_config_runtime_mismatch",
+                "project_otp_configuration_stale",
                 "xref_unavailable",
                 "dialyzer_unavailable",
             }

@@ -5,6 +5,12 @@ This report evaluates the fixed `server_flexible` revision
 `35021`. The target checkout was clean and its submodule gitlinks matched the
 manifest. The target was read-only throughout the evaluation.
 
+The current required toolchain baseline is OTP `27.3.4.16` (ERTS
+`15.2.7.12`), `rebar3` `3.27.0`, Dialyzer `5.3.1.1`, and ELP CLI
+`1.1.0+build-2026-01-15`. The historical report below predates the ELP
+installation and is retained as a measurement record; it is not evidence that
+the current strict preflight has passed.
+
 ## Corpus
 
 The checked-in corpus contains manually reviewed callers, header/record,
@@ -44,10 +50,12 @@ The performance report records the post-optimization samples and the commit
 that produced them in `server_flexible.performance.json`. Restore-to-HEAD and
 layout-only were not run in this pass.
 
-ELP, `erlang_ls`, and `elp-ls` were unavailable. Runtime OTP 27 differed from
-the manifest's configured OTP 25, and adapter runtime sandbox policy remains
-descriptive rather than enforced. The adoption verdict is therefore
-`auxiliary_review_context_only`; Erlang is not a sole blocking-review source.
+The target's `erlang_ls.config` still references the historical OTP 25 path,
+and the current checkout has a dirty `apps/server_mongodb` submodule. Adapter
+runtime sandbox policy remains descriptive rather than enforced, and the
+strict required-adapter lifecycle has not been rerun after installing ELP. The
+adoption verdict remains `auxiliary_review_context_only`; Erlang is not a sole
+blocking-review source.
 
 Reproduction inputs:
 

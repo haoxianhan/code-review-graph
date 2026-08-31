@@ -7,9 +7,9 @@
     "scope": "repository_root"
   },
   "activation": {
-    "mode": "explicit_opt_in",
-    "required": false,
-    "fallback": "generic_graph"
+    "mode": "always",
+    "required": true,
+    "fallback": "none"
   },
   "contract": {
     "role": "typed diagnostics with source locations",
@@ -39,32 +39,32 @@
     "return_code": 124
   },
   "failure": {
-    "default_status": "degraded",
-    "fallback": "generic_graph",
+    "default_status": "failed",
+    "fallback": "none",
     "events": {
       "missing_tool": {
-        "status": "unavailable",
+        "status": "failed",
         "diagnostic_codes": ["dialyzer_unavailable"],
-        "action": "omit_diagnostics",
-        "fallback": "generic_graph"
+        "action": "block_preflight",
+        "fallback": "none"
       },
       "nonzero_exit": {
         "status": "failed",
         "diagnostic_codes": ["dialyzer_failed"],
         "action": "retain_parseable_warnings_only",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "timeout": {
         "status": "timeout",
         "diagnostic_codes": ["dialyzer_timeout"],
         "action": "omit_diagnostics",
-        "fallback": "generic_graph"
+        "fallback": "none"
       },
       "malformed_output": {
         "status": "malformed",
         "diagnostic_codes": ["dialyzer_malformed_output"],
         "action": "discard_unparseable_diagnostics",
-        "fallback": "generic_graph"
+        "fallback": "none"
       }
     }
   },
@@ -76,7 +76,7 @@
       "status": "malformed",
       "diagnostic_codes": ["dialyzer_malformed_output"],
       "action": "discard_unparseable_diagnostics",
-      "fallback": "generic_graph"
+        "fallback": "none"
     }
   },
   "provenance": {

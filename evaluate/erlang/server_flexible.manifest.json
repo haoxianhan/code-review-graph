@@ -59,14 +59,12 @@
   },
   "toolchain": {
     "tools": {
-      "erl": {"command": ["erl", "-noshell"], "path": "/etc/profiles/per-user/haoxian/bin/erl", "status": "available"},
-      "rebar3": {"command": ["rebar3", "version"], "path": "/etc/profiles/per-user/haoxian/bin/rebar3", "status": "available"},
-      "dialyzer": {"command": ["dialyzer", "--version"], "path": "/etc/profiles/per-user/haoxian/bin/dialyzer", "status": "available"},
-      "elp": {"command": ["elp", "--version"], "path": null, "status": "unavailable"},
-      "erlang_ls": {"command": ["erlang_ls", "--version"], "path": null, "status": "unavailable"},
-      "elp-ls": {"command": ["elp-ls", "--version"], "path": null, "status": "unavailable"}
+      "erl": {"command": ["erl", "-noshell"], "path": "/etc/profiles/per-user/haoxian/bin/erl", "version": "27.3.4.16", "status": "available"},
+      "rebar3": {"command": ["rebar3", "version"], "path": "/etc/profiles/per-user/haoxian/bin/rebar3", "version": "3.27.0", "status": "available"},
+      "dialyzer": {"command": ["dialyzer", "--version"], "path": "/etc/profiles/per-user/haoxian/bin/dialyzer", "version": "5.3.1.1", "status": "available"},
+      "elp": {"command": ["elp", "version"], "path": "/etc/profiles/per-user/haoxian/bin/elp", "version": "1.1.0+build-2026-01-15", "status": "available"}
     },
-    "runtime": {"otp_release": "25", "erts_version": null, "configured_otp_path": "/home/haoxian/kerl/25.3.2/"},
+    "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl", "project_configured_otp_path": "/home/haoxian/kerl/25.3.2/"},
     "configuration": {
       "files": ["rebar.config", "rebar.config.script", "erlang_ls.config", ".elp_lint.toml"],
       "execute_during_discovery": false,
@@ -96,7 +94,7 @@
   },
   "analysis": {"cache_paths": [".code-review-graph", "_build/default", "_build/test", "server_ai/indexer/modules.json", "server_ai/indexer/records.json"]},
   "diagnostics": [
-    {"code": "semantic_tools_not_available_at_freeze", "severity": "warning", "message": "ELP and erlang_ls were unavailable; Generic syntax evidence remains the compatibility floor."},
+    {"code": "project_otp_configuration_stale", "severity": "error", "message": "server_flexible/erlang_ls.config still references the historical /home/haoxian/kerl/25.3.2/ installation; the required runtime is OTP 27.3.4.16 from the current system profile."},
     {"code": "lifecycle_metrics_auxiliary_only", "severity": "warning", "message": "Lifecycle measurements are recorded in server_flexible.performance.json; adoption remains auxiliary until every gate is green."}
   ]
 }
