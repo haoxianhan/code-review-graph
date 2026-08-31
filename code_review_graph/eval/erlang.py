@@ -909,6 +909,25 @@ def validate_manifest(manifest: object, source: str = "<manifest>") -> None:
         status = _string(tool.get("status"), f"{source}.toolchain.tools.{name}.status")
         if status not in TOOL_STATUSES:
             raise _error(f"{source}.toolchain.tools.{name}.status", "unsupported tool status")
+    adapter_index = document.get("adapters", document.get("adapter_manifests"))
+    if adapter_index is not None:
+        required_names = ("erl", "rebar3", "dialyzer", "elp")
+        missing_required = [name for name in required_names if name not in tools]
+        if missing_required:
+            raise _error(
+                f"{source}.toolchain.tools",
+                "missing required tools: " + ", ".join(missing_required),
+            )
+        for name in required_names:
+            item = _mapping(tools[name], f"{source}.toolchain.tools.{name}")
+            if item.get("status") in {"available", "available_via_rebar3"}:
+                _string(item.get("version"), f"{source}.toolchain.tools.{name}.version")
+                _string(item.get("path"), f"{source}.toolchain.tools.{name}.path")
+        plt = _mapping(toolchain.get("plt"), f"{source}.toolchain.plt")
+        _validate_relative_path(plt.get("path"), f"{source}.toolchain.plt.path")
+        plt_sha = _string(plt.get("sha256"), f"{source}.toolchain.plt.sha256")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", plt_sha):
+            raise _error(f"{source}.toolchain.plt.sha256", "expected SHA-256")
     configuration = _mapping(toolchain.get("configuration"), f"{source}.toolchain.configuration")
     for index, item in enumerate(
         _list(configuration.get("files", []), f"{source}.toolchain.configuration.files")
@@ -1800,7 +1819,11 @@ def _discover_toolchain(
                 )
             expected_version = expected_item.get("version")
             observed_version = current.get("version")
-            if expected_version and observed_version and str(expected_version) != str(observed_version):
+            if (
+                expected_version
+                and observed_version
+                and str(expected_version) != str(observed_version)
+            ):
                 diagnostics.append(
                     _diagnostic(
                         "required_tool_version_mismatch" if required else "tool_version_changed",
@@ -1901,6 +1924,49 @@ def _compare_lockfiles(target_root: Path, dependencies: Mapping[str, Any]) -> li
                 )
             )
     return diagnostics
+
+
+def _compare_plt(
+    target_root: Path,
+    manifest_toolchain: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Observe the declared Dialyzer PLT without creating or mutating it."""
+    declared = manifest_toolchain.get("plt")
+    if not isinstance(declared, Mapping):
+        return {"status": "unavailable", "path": None, "sha256": None}, [
+            _diagnostic(
+                "dialyzer_plt_unavailable",
+                "error",
+                "The manifest does not declare a Dialyzer PLT identity.",
+            )
+        ]
+    path = _resolve_contained_target_path(
+        target_root,
+        declared.get("path"),
+        "manifest.toolchain.plt.path",
+    )
+    expected = declared.get("sha256")
+    observed = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    details = {"path": str(path), "sha256": observed, "expected_sha256": expected}
+    if observed is None:
+        return {"status": "unavailable", **details}, [
+            _diagnostic(
+                "dialyzer_plt_unavailable",
+                "error",
+                "The declared Dialyzer PLT is missing.",
+                **details,
+            )
+        ]
+    if observed != expected:
+        return {"status": "mismatch", **details}, [
+            _diagnostic(
+                "dialyzer_plt_mismatch",
+                "error",
+                "The declared Dialyzer PLT hash does not match.",
+                **details,
+            )
+        ]
+    return {"status": "available", **details}, []
 
 
 def _cache_state(target_root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -2181,6 +2247,12 @@ def discover_environment(
         probe_root=safe_probe_root,
     )
     diagnostics.extend(tool_diagnostics)
+    plt_observed, plt_diagnostics = _compare_plt(
+        root,
+        _mapping(manifest["toolchain"], "manifest.toolchain"),
+    )
+    toolchain["plt"] = plt_observed
+    diagnostics.extend(plt_diagnostics)
     diagnostics.extend(
         _compare_manifest_revision(repository, _mapping(manifest["revision"], "manifest.revision"))
     )
