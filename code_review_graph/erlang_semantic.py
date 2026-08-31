@@ -96,6 +96,9 @@ _LOCATION_RE = re.compile(
     r"(?P<message>.*)$",
     re.IGNORECASE,
 )
+_GENERATED_DATA_REVISION_RE = re.compile(
+    r"(?:^|\n)\s*DATA_REV\s*=\s*(?P<value>[^\n\r]+)",
+)
 _DIALYZER_WARNING_KIND_RE = re.compile(
     r"(?:\[(?P<bracket>[A-Za-z][A-Za-z0-9_]*)\]"
     r"|\((?P<paren>[A-Za-z][A-Za-z0-9_]*)\)"
@@ -1639,6 +1642,17 @@ def compute_generated_data_revision(
     if paths is not None:
         resolved = [Path(path) if Path(path).is_absolute() else root / Path(path) for path in paths]
         return _hash_paths(root, resolved)
+    project_marker = root / "tools/gen_data/data_rev_info"
+    try:
+        marker_text = project_marker.read_text(encoding="utf-8")
+    except OSError:
+        marker_text = None
+    if marker_text is not None:
+        match = _GENERATED_DATA_REVISION_RE.search(marker_text)
+        if match:
+            value = match.group("value").strip()
+            if value:
+                return value
     marker_names = (
         ".code-review-graph/generated-data-revision",
         "generated-data-revision",

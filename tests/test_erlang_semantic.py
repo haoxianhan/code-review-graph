@@ -345,6 +345,17 @@ def test_generated_and_plt_revisions_are_content_based(tmp_path: Path):
     assert compute_plt_identity(plt) == expected
 
 
+def test_generated_data_revision_reads_server_flexible_marker(tmp_path: Path):
+    marker = tmp_path / "tools/gen_data/data_rev_info"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        'DATA_REV=53569\nDATA_COMMIT_TIME="2026-08-31 12:00:00"\n',
+        encoding="utf-8",
+    )
+
+    assert compute_generated_data_revision(tmp_path) == "53569"
+
+
 def replace_provenance(record: EvidenceRecord, *, source: str) -> EvidenceRecord:
     provenance = replace(record.provenance, source=source)
     return EvidenceRecord(
