@@ -82,6 +82,7 @@
     "performance_report": "server_flexible.performance.json",
     "fixed_revision_required": true,
     "lifecycle_checks": ["full_build", "incremental_update", "watch", "forget", "standalone_postprocess"],
+    "semantic_timeout_seconds": 300,
     "latency_budget_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000}
   },
   "adapters": {

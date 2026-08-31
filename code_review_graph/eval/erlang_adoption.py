@@ -521,6 +521,13 @@ def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationCon
             plt_path = str(Path(target_path) / plt_path)
     tools = tool_values.get("tools")
     versions = tools if isinstance(tools, Mapping) else {}
+    evaluation = manifest.get("evaluation")
+    evaluation_values = evaluation if isinstance(evaluation, Mapping) else {}
+    semantic_timeout = evaluation_values.get("semantic_timeout_seconds", 15.0)
+    try:
+        semantic_timeout = min(max(float(semantic_timeout), 0.1), 300.0)
+    except (TypeError, ValueError, OverflowError):
+        semantic_timeout = 15.0
 
     def version(name: str) -> str | None:
         value = versions.get(name)
@@ -539,6 +546,7 @@ def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationCon
         strict_rebar3_version=version("rebar3"),
         strict_dialyzer_version=version("dialyzer"),
         plt_path=plt_path,
+        timeout=semantic_timeout,
     )
 
 

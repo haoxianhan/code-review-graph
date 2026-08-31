@@ -18,6 +18,7 @@ from code_review_graph.eval.erlang_adoption import (
     _case_tool_reason,
     _checked_lifecycle_result,
     _lifecycle_parity_from_evidence,
+    _manifest_erlang_config,
     _relation_matches,
     _repository_gates,
     _run_case,
@@ -136,6 +137,16 @@ def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path,
     assert result["lifecycle"]["watch"]["status"] == "not_run"
     assert not (repo / ".code-review-graph").exists()
     validate_evaluation_result(result)
+
+
+def test_manifest_can_raise_bounded_semantic_timeout(tmp_path: Path):
+    manifest = load_manifest(DEFAULT_MANIFEST, load_adapters=False)
+    manifest["evaluation"] = {"semantic_timeout_seconds": 300}
+
+    config = _manifest_erlang_config(manifest)
+
+    assert config is not None
+    assert config.timeout == 300.0
 
 
 def test_clause_children_do_not_make_function_anchor_ambiguous(
