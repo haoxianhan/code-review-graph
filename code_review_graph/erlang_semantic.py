@@ -2433,7 +2433,7 @@ def _elp_lsp_query(
             raise OSError("ELP server pipes were not created")
         next_id = 1
         def request(
-            method: str, params: Mapping[str, Any], *, retries: int = 40
+            method: str, params: Mapping[str, Any], *, retries: int | None = None
         ) -> Mapping[str, Any]:
             nonlocal next_id
             request_id = next_id
@@ -2468,7 +2468,7 @@ def _elp_lsp_query(
                 if (
                     isinstance(error, Mapping)
                     and error.get("code") == -32801
-                    and attempts < retries
+                    and (retries is None or attempts < retries)
                 ):
                     attempts += 1
                     time.sleep(0.25)
