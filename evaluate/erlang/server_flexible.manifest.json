@@ -66,7 +66,7 @@
     },
     "plt": {
       "path": "_build/default/rebar3_27.3.4.16_plt",
-      "sha256": "0188c055f9063cf1d8f91fc5249d7a19a85d74ab5c6a3a125d91967fcf384a8b"
+      "sha256": "e926642461efeadc3e571a2225d2c0ac69181a259d11946d608a658783e8254a"
     },
     "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl"},
     "configuration": {
