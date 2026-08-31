@@ -126,19 +126,25 @@ def _run_postprocess(
     # Resolve Erlang preprocessor headers/records before generic endpoint and
     # derived graph processing.  This is intentionally part of the minimal
     # level as review queries rely on canonical include/record targets.
-    try:
-        from ..erlang_header_resolver import resolve_erlang_header_records
+    # ``full_build`` already runs this resolver before returning its result.
+    # Repeating the repository-wide scan in the immediately following
+    # postprocess stage only adds latency and cannot change the canonical
+    # graph unless files were modified between the two calls.  Standalone
+    # postprocess and incremental updates still enter this block normally.
+    if not (full_rebuild and "erlang_header_resolution" in build_result):
+        try:
+            from ..erlang_header_resolver import resolve_erlang_header_records
 
-        build_result["erlang_header_resolution"] = resolve_erlang_header_records(
-            store,
-            repo_root,
-        )
-    except Exception as exc:  # noqa: BLE001 - resolver is best effort
-        logger.warning("Erlang header/record resolution failed: %s", exc)
-        warnings.append(
-            "Erlang header/record resolution failed: "
-            f"{type(exc).__name__}: {exc}"
-        )
+            build_result["erlang_header_resolution"] = resolve_erlang_header_records(
+                store,
+                repo_root,
+            )
+        except Exception as exc:  # noqa: BLE001 - resolver is best effort
+            logger.warning("Erlang header/record resolution failed: %s", exc)
+            warnings.append(
+                "Erlang header/record resolution failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
     try:
@@ -158,26 +164,7 @@ def _run_postprocess(
     timing: dict[str, float] = {}
     stage_started = time.perf_counter()
     try:
-        rows = store.get_nodes_without_signature()
-        signatures: list[tuple[int, str]] = []
-        for row in rows:
-            node_id, name, kind, params, ret = (
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                row[4],
-            )
-            if kind in ("Function", "Test"):
-                sig = f"def {name}({params or ''})"
-                if ret:
-                    sig += f" -> {ret}"
-            elif kind == "Class":
-                sig = f"class {name}"
-            else:
-                sig = name
-            signatures.append((node_id, sig[:512]))
-        store.update_node_signatures(signatures)
+        store.populate_missing_signatures()
         store.commit()
         build_result["signatures_updated"] = True
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
@@ -782,26 +769,7 @@ def run_postprocess(
             )
 
         try:
-            rows = store.get_nodes_without_signature()
-            signatures: list[tuple[int, str]] = []
-            for row in rows:
-                node_id, name, kind, params, ret = (
-                    row[0],
-                    row[1],
-                    row[2],
-                    row[3],
-                    row[4],
-                )
-                if kind in ("Function", "Test"):
-                    sig = f"def {name}({params or ''})"
-                    if ret:
-                        sig += f" -> {ret}"
-                elif kind == "Class":
-                    sig = f"class {name}"
-                else:
-                    sig = name
-                signatures.append((node_id, sig[:512]))
-            store.update_node_signatures(signatures)
+            store.populate_missing_signatures()
             store.commit()
             result["signatures_updated"] = True
         except (sqlite3.OperationalError, TypeError, KeyError) as e:

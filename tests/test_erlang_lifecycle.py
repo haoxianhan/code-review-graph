@@ -148,6 +148,42 @@ def test_erlang_noop_update_skips_header_resolver(tmp_path, monkeypatch):
         store.close()
 
 
+def test_full_build_postprocess_reuses_header_resolution(tmp_path, monkeypatch):
+    """The full-build boundary must not scan Erlang headers twice."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_fixture(repo)
+    store = GraphStore(repo / "graph.db")
+    try:
+        built = full_build(repo, store)
+        assert "erlang_header_resolution" in built
+
+        calls = 0
+
+        def resolver(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return {}
+
+        monkeypatch.setattr(
+            "code_review_graph.erlang_header_resolver.resolve_erlang_header_records",
+            resolver,
+        )
+        from code_review_graph.tools.build import _run_postprocess
+
+        _run_postprocess(
+            store,
+            {**built},
+            "minimal",
+            full_rebuild=True,
+            repo_root=repo,
+        )
+        assert calls == 0
+    finally:
+        store.close()
+
+
 def test_uppercase_erlang_header_change_reparses_include_dependents(
     tmp_path: Path, monkeypatch
 ) -> None:

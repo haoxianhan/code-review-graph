@@ -140,25 +140,7 @@ def _compute_signatures(
     """Compute human-readable signatures for nodes that lack one."""
     try:
         rows = store.get_nodes_without_signature()
-        signatures: list[tuple[int, str]] = []
-        for row in rows:
-            node_id, name, kind, params, ret = (
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                row[4],
-            )
-            if kind in ("Function", "Test"):
-                sig = f"def {name}({params or ''})"
-                if ret:
-                    sig += f" -> {ret}"
-            elif kind == "Class":
-                sig = f"class {name}"
-            else:
-                sig = name
-            signatures.append((node_id, sig[:512]))
-        store.update_node_signatures(signatures)
+        store.populate_missing_signatures()
         store.commit()
         result["signatures_computed"] = len(rows)
     except (sqlite3.OperationalError, TypeError, KeyError) as e:

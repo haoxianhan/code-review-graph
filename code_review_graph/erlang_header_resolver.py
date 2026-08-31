@@ -110,11 +110,16 @@ def _inside(path: str | Path, root: Path | None) -> bool:
                 or normalized.startswith(root_normalized.rstrip("/") + "/")
             )
         )
+    # Use the standard-library realpath implementation directly.  This keeps
+    # the symlink boundary guarantee of ``Path.resolve`` while avoiding the
+    # repeated PurePath construction and component parsing that made ownership
+    # indexing dominate large full builds.
     try:
-        Path(path).expanduser().resolve(strict=False).relative_to(root.resolve())
-    except (OSError, RuntimeError, ValueError):
+        real_path = normalize_file_path(os.path.realpath(str(path)))
+        real_root = normalize_file_path(os.path.realpath(str(root)))
+    except (OSError, RuntimeError, TypeError):
         return False
-    return True
+    return real_path == real_root or real_path.startswith(real_root.rstrip("/") + "/")
 
 
 def _path_in_scope(path: str | Path, root: Path | None) -> bool:
@@ -716,15 +721,25 @@ def _set_resolution_metadata(
     extra[f"{prefix}_targets_truncated"] = len(candidates) > _MAX_CANDIDATES
 
 
-def _update_edge(conn: Any, row: Any, target: str, extra: dict[str, Any]) -> bool:
+def _update_edge(
+    conn: Any,
+    row: Any,
+    target: str,
+    extra: dict[str, Any],
+    pending: list[tuple[str, str, int]] | None = None,
+) -> bool:
     encoded = json.dumps(extra, sort_keys=True)
     old_extra = _json_extra(row["extra"])
     if row["target_qualified"] == target and old_extra == extra:
         return False
-    conn.execute(
-        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
-        (target, encoded, row["id"]),
-    )
+    values = (target, encoded, row["id"])
+    if pending is None:
+        conn.execute(
+            "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+            values,
+        )
+    else:
+        pending.append(values)
     return True
 
 
@@ -846,6 +861,7 @@ def resolve_erlang_header_records(
     imports_updated = imports_resolved = 0
     records_updated = records_resolved = 0
     ambiguous = unresolved = 0
+    pending_updates: list[tuple[str, str, int]] = []
 
     # Reconcile include endpoints first; record resolution consumes this graph.
     for row in import_rows:
@@ -911,7 +927,7 @@ def resolve_erlang_header_records(
                 ambiguous += 1
             else:
                 unresolved += 1
-        if _update_edge(conn, row, target, extra):
+        if _update_edge(conn, row, target, extra, pending_updates):
             imports_updated += 1
 
     # Compute transitive include closure once, bounded by indexed header files.
@@ -969,10 +985,15 @@ def resolve_erlang_header_records(
                 ambiguous += 1
             else:
                 unresolved += 1
-        if _update_edge(conn, row, target, extra):
+        if _update_edge(conn, row, target, extra, pending_updates):
             records_updated += 1
 
     if imports_updated or records_updated:
+        conn.execute("BEGIN")
+        conn.executemany(
+            "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+            pending_updates,
+        )
         conn.commit()
         store._invalidate_cache()
     result = {

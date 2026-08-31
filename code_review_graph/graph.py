@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 import networkx as nx
@@ -1676,18 +1676,64 @@ class GraphStore:
             "FROM edges e JOIN nodes s "
             "ON s.qualified_name = e.source_qualified "
             "WHERE e.kind = 'CALLS' AND lower(s.language) = 'erlang' "
-            "AND (e.target_qualified NOT LIKE '%::%' "
-            "OR e.extra LIKE '%\"erlang_raw_target\"%') "
+            "AND ((e.target_qualified NOT LIKE '%::%' "
+            "AND e.target_qualified LIKE '%:%/%') "
+            "OR (e.target_qualified LIKE '%::%' "
+            "AND typeof(e.extra) = 'text' AND json_valid(e.extra) = 1 "
+            "AND json_extract(e.extra, '$.erlang_raw_target') LIKE '%:%/%')) "
             "ORDER BY e.id",
         ).fetchall()
         belongs_cache: dict[str, bool] = {}
+
+        # Parser-produced Erlang paths are canonical absolute strings.  Avoid
+        # Path.resolve/relative_to for every node and edge in a large graph;
+        # the lexical boundary check below preserves the same fail-closed
+        # semantics for this already-normalized representation.
+        scoped_root = (
+            normalize_file_path(Path(repo_root).expanduser().resolve(strict=False))
+            .rstrip("/")
+            if repo_root is not None
+            and not _WINDOWS_ABSOLUTE_PATH_RE.match(normalize_file_path(repo_root))
+            else (
+                normalize_file_path(repo_root).rstrip("/")
+                if repo_root is not None
+                else None
+            )
+        )
+
+        def fast_belongs(file_path: str | Path) -> bool:
+            if scoped_root is None:
+                return True
+            value = normalize_file_path(file_path)
+            if not value or ".." in PurePosixPath(value).parts:
+                return False
+            if _WINDOWS_ABSOLUTE_PATH_RE.match(value):
+                expected = scoped_root.casefold()
+                observed = value.casefold()
+                return observed == expected or observed.startswith(expected + "/")
+            # Semantic Erlang rows are intentionally not allowed to use
+            # repository-relative legacy paths in a shared store.
+            if not value.startswith("/"):
+                return False
+            if value != scoped_root and not value.startswith(scoped_root + "/"):
+                return False
+            # Preserve the resolver's symlink boundary: a lexical path under
+            # the checkout may resolve to a foreign repository.  ``realpath``
+            # avoids constructing several Path objects per row while keeping
+            # this check cheap enough for the repository-wide index pass.
+            real_value = normalize_file_path(os.path.realpath(value))
+            real_root = normalize_file_path(os.path.realpath(scoped_root))
+            return (
+                real_value == real_root
+                or real_value.startswith(real_root.rstrip("/") + "/")
+            )
 
         def belongs(file_path: str | Path) -> bool:
             key = str(file_path)
             cached = belongs_cache.get(key)
             if cached is not None:
                 return cached
-            observed = _graph_path_belongs_to_root(file_path, repo_root)
+            observed = fast_belongs(file_path)
             belongs_cache[key] = observed
             return observed
 
@@ -1702,6 +1748,8 @@ class GraphStore:
 
         resolved = 0
         changed = False
+        pending_edge_updates: list[tuple[str, str, int]] = []
+        pending_mirror_updates: list[tuple[str, str, int]] = []
         if repo_root is None:
             repository = None
         else:
@@ -1756,9 +1804,7 @@ class GraphStore:
             "SELECT * FROM nodes WHERE language = 'erlang' "
             "AND kind IN ('Function', 'Test') ORDER BY qualified_name"
         ).fetchall():
-            if repo_root is not None and not _graph_path_belongs_to_root(
-                node_row["file_path"], repo_root,
-            ):
+            if repo_root is not None and not belongs(node_row["file_path"]):
                 continue
             raw_node_extra = node_row["extra"]
             if raw_node_extra not in (None, ""):
@@ -1832,6 +1878,31 @@ class GraphStore:
                 desired[f"{state}_targets_truncated"] = total > 20
             return desired
 
+        # Parser-generated TESTED_BY mirrors share the CALLS edge's
+        # source/file/line.  Loading them once avoids one SQLite query per
+        # remote call (large Erlang repositories can contain tens of
+        # thousands of such edges).  Keep the rows in a mutable index so a
+        # mirror updated earlier in this pass is immediately visible to a
+        # later edge at the same location.
+        mirror_index: dict[tuple[str, str, Any], list[dict[str, Any]]] = {}
+        for mirror_row in conn.execute(
+            "SELECT id, source_qualified, target_qualified, file_path, "
+            "line, extra FROM edges WHERE kind = 'TESTED_BY'"
+        ).fetchall():
+            key = (
+                str(mirror_row["target_qualified"] or ""),
+                str(mirror_row["file_path"] or ""),
+                mirror_row["line"],
+            )
+            mirror_index.setdefault(key, []).append({
+                "id": mirror_row["id"],
+                "source_qualified": mirror_row["source_qualified"],
+                "target_qualified": mirror_row["target_qualified"],
+                "file_path": mirror_row["file_path"],
+                "line": mirror_row["line"],
+                "extra": mirror_row["extra"],
+            })
+
         def _sync_mirrors(
             edge: sqlite3.Row,
             old_target: str,
@@ -1842,12 +1913,12 @@ class GraphStore:
             candidate_count: int | None = None,
         ) -> bool:
             """Keep parser-generated TESTED_BY mirrors aligned with CALLS."""
-            mirrors = conn.execute(
-                "SELECT id, source_qualified, target_qualified, file_path, "
-                "line, extra FROM edges WHERE kind = 'TESTED_BY' "
-                "AND target_qualified = ? AND file_path = ? AND line = ?",
-                (edge["source_qualified"], edge["file_path"], edge["line"]),
-            ).fetchall()
+            mirror_key = (
+                str(edge["source_qualified"] or ""),
+                str(edge["file_path"] or ""),
+                edge["line"],
+            )
+            mirrors = mirror_index.get(mirror_key, ())
             mirror_changed = False
             for mirror in mirrors:
                 if repo_root is not None and not belongs(mirror["file_path"]):
@@ -1879,14 +1950,12 @@ class GraphStore:
                     and mirror_extra == desired_extra
                 ):
                     continue
-                conn.execute(
-                    "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
-                    (
-                        desired_source,
-                        json.dumps(desired_extra, sort_keys=True),
-                        mirror["id"],
-                    ),
+                serialized_mirror_extra = json.dumps(desired_extra, sort_keys=True)
+                pending_mirror_updates.append(
+                    (desired_source, serialized_mirror_extra, mirror["id"])
                 )
+                mirror["source_qualified"] = desired_source
+                mirror["extra"] = serialized_mirror_extra
                 mirror_changed = True
             return mirror_changed
 
@@ -1941,10 +2010,8 @@ class GraphStore:
             target_changed = current_target != desired_target
             extra_changed = edge_extra != desired_extra
             if target_changed or extra_changed:
-                conn.execute(
-                    "UPDATE edges SET target_qualified = ?, extra = ? "
-                    "WHERE id = ?",
-                    (desired_target, serialized_extra, edge["id"]),
+                pending_edge_updates.append(
+                    (desired_target, serialized_extra, edge["id"])
                 )
                 changed = True
             if target_changed:
@@ -1961,6 +2028,19 @@ class GraphStore:
             changed = changed or mirror_changed
 
         if changed:
+            # GraphStore connections use autocommit mode.  Group the bulk edge
+            # projection into one transaction; otherwise each executemany row
+            # would pay a WAL sync and turn a large first reconciliation into
+            # an effectively repository-wide serialization loop.
+            conn.execute("BEGIN")
+            conn.executemany(
+                "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                pending_edge_updates,
+            )
+            conn.executemany(
+                "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+                pending_mirror_updates,
+            )
             conn.commit()
         return resolved
 
@@ -3310,6 +3390,25 @@ class GraphStore:
             ((signature, node_id) for node_id, signature in values),
         )
         return len(values)
+
+    def populate_missing_signatures(self) -> int:
+        """Populate all missing display signatures in one SQLite statement.
+
+        Signature text is a deterministic projection of existing node columns;
+        doing the projection in SQLite avoids materializing and round-tripping
+        tens of thousands of rows through Python during a full build.
+        """
+        cursor = self._conn.execute(
+            "UPDATE nodes SET signature = CASE "
+            "WHEN kind IN ('Function', 'Test') THEN substr("
+            "'def ' || name || '(' || coalesce(params, '') || ')' || "
+            "CASE WHEN return_type IS NOT NULL AND return_type != '' "
+            "THEN ' -> ' || return_type ELSE '' END, 1, 512) "
+            "WHEN kind = 'Class' THEN substr('class ' || name, 1, 512) "
+            "ELSE substr(name, 1, 512) END "
+            "WHERE signature IS NULL"
+        )
+        return max(0, int(cursor.rowcount or 0))
 
     def get_all_community_ids(self) -> dict[str, int | None]:
         """Return a mapping of *all* qualified names to their community_id.
