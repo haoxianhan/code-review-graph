@@ -2580,11 +2580,10 @@ def _elp_lsp_query(
                     break
             for item in items[:10]:
                 if query_kind in {"callers_of", "enrichment", "tests_for", "impact"}:
-                    method = (
-                        "callHierarchy/incomingCalls"
-                        if query_kind != "impact"
-                        else "callHierarchy/outgoingCalls"
-                    )
+                    # Impact is the dependent frontier, so it follows callers
+                    # (incoming calls) just like callers_of.  Outgoing calls
+                    # describe the target's dependencies and are not impact.
+                    method = "callHierarchy/incomingCalls"
                     response = request(method, {"item": item})
                     values = response.get("result", [])
                     if not isinstance(values, list):
@@ -2707,7 +2706,7 @@ class ELPAdapter(_BaseAdapter):
         super().__init__(toolchain, **kwargs)
         # A supplied runner is the established deterministic test/deployment
         # injection point.  The real default path uses the ELP LSP protocol.
-        self._use_lsp = command_builder is None and kwargs.get("runner") is None
+        self._use_lsp = command_builder is None and self.runner is _default_discovery_runner
         self.command_builder = command_builder or (
             self._default_command if self._use_lsp else self._legacy_command
         )
