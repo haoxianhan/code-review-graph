@@ -3298,6 +3298,19 @@ class GraphStore:
             (signature, node_id),
         )
 
+    def update_node_signatures(
+        self, signatures: Iterable[tuple[int, str]],
+    ) -> int:
+        """Set signatures for several nodes in one SQLite executemany call."""
+        values = list(signatures)
+        if not values:
+            return 0
+        self._conn.executemany(
+            "UPDATE nodes SET signature = ? WHERE id = ?",
+            ((signature, node_id) for node_id, signature in values),
+        )
+        return len(values)
+
     def get_all_community_ids(self) -> dict[str, int | None]:
         """Return a mapping of *all* qualified names to their community_id.
 
