@@ -3818,7 +3818,24 @@ def _run_isolated_watch_smoke(
             stop_event.set()
             if thread is not None and thread.is_alive():
                 thread.join(bounded_timeout)
-            store.close()
+            if thread is None or not thread.is_alive():
+                store.close()
+            else:
+                # A filesystem event may already be inside incremental update
+                # when the bounded smoke deadline expires.  Closing the shared
+                # SQLite connection here races that worker and turns a timeout
+                # into a misleading "closed database" warning.  Let a small
+                # daemon finalizer close it after the watcher exits; the
+                # evaluator still returns within its requested bound.
+                def close_after_watch() -> None:
+                    thread.join()
+                    store.close()
+
+                threading.Thread(
+                    target=close_after_watch,
+                    name="crg-adoption-watch-cleanup",
+                    daemon=True,
+                ).start()
 
 
 def _run_lifecycle(
@@ -3860,6 +3877,10 @@ def _run_lifecycle(
             "result": build_payload,
             "parity": not build_has_errors,
         }
+        if isinstance(build_payload.get("stage_timing"), Mapping):
+            lifecycle["full_build"]["stage_timing"] = dict(
+                build_payload["stage_timing"]
+            )
         timings["full_build"] = [duration]
         if build_has_errors:
             diagnostics.append(
@@ -3954,6 +3975,10 @@ def _run_lifecycle(
                 "baseline_fingerprint": baseline_fingerprint,
                 "observed_fingerprint": update_fingerprint,
             }
+            if isinstance(update_payload.get("stage_timing"), Mapping):
+                lifecycle["incremental_update"]["stage_timing"] = dict(
+                    update_payload["stage_timing"]
+                )
             timings["incremental_update"] = [update_duration]
         except Exception as exc:
             diagnostics.append(
@@ -4062,6 +4087,10 @@ def _run_lifecycle(
                 "reference_fingerprint": reference_fingerprint,
                 "observed_fingerprint": post_fingerprint,
             }
+            if isinstance(post_payload.get("postprocess_timing"), Mapping):
+                lifecycle["standalone_postprocess"]["stage_timing"] = dict(
+                    post_payload["postprocess_timing"]
+                )
             timings["standalone_postprocess"] = [post_duration]
         except Exception as exc:
             diagnostics.append(

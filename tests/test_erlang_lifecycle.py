@@ -64,6 +64,15 @@ def test_erlang_extensions_work_through_build_update_postprocess_and_forget(
         built = full_build(repo, store)
         assert built["files_parsed"] == 3
         assert built["errors"] == []
+        assert set(built["stage_timing"]) == {
+            "parse_s",
+            "repository_resolvers_s",
+            "erlang_integration_s",
+        }
+        assert all(
+            isinstance(value, float) and value >= 0
+            for value in built["stage_timing"].values()
+        )
         stored = {
             Path(path).relative_to(repo).as_posix()
             for path in store.get_all_files()
@@ -88,6 +97,9 @@ def test_erlang_extensions_work_through_build_update_postprocess_and_forget(
         updated = incremental_update(repo, store, changed_files=["src/sample.erl"])
         assert updated["files_updated"] == 1
         assert updated["errors"] == []
+        assert {"parse_s", "repository_resolvers_s", "erlang_integration_s"}.issubset(
+            updated["stage_timing"]
+        )
         assert store.get_nodes_by_file(str(source))
 
         header = repo / "include" / "sample.hrl"

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,21 +52,41 @@ def run_post_processing(
     result: dict[str, Any] = {}
     warnings: list[str] = []
 
-    _resolve_bare_endpoints(store, result, warnings, repo_root=repo_root)
-    _compute_signatures(store, result, warnings)
-    _rebuild_fts_index(store, result, warnings)
-    _trace_flows(store, result, warnings)
-    _detect_communities(store, result, warnings)
-    _refresh_embeddings(
-        store,
-        result,
-        warnings,
-        provider=embedding_provider,
-        model=embedding_model,
+    # Keep stage timings in the result so lifecycle evaluators can identify
+    # repository-wide work without relying on log parsing.  A stage is recorded
+    # even when its best-effort operation raises; this is useful evidence for a
+    # degraded or timed-out lifecycle run.
+    timing: dict[str, float] = {}
+
+    def run_stage(name: str, operation: Any) -> None:
+        started = time.perf_counter()
+        try:
+            operation()
+        finally:
+            timing[name] = max(0.0, round(time.perf_counter() - started, 6))
+
+    run_stage(
+        "bare_endpoints_s",
+        lambda: _resolve_bare_endpoints(store, result, warnings, repo_root=repo_root),
+    )
+    run_stage("signatures_s", lambda: _compute_signatures(store, result, warnings))
+    run_stage("fts_s", lambda: _rebuild_fts_index(store, result, warnings))
+    run_stage("flows_s", lambda: _trace_flows(store, result, warnings))
+    run_stage("communities_s", lambda: _detect_communities(store, result, warnings))
+    run_stage(
+        "embeddings_s",
+        lambda: _refresh_embeddings(
+            store,
+            result,
+            warnings,
+            provider=embedding_provider,
+            model=embedding_model,
+        ),
     )
 
     if warnings:
         result["warnings"] = warnings
+    result["postprocess_timing"] = timing
     return result
 
 

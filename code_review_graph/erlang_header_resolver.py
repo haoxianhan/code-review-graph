@@ -22,7 +22,7 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .parser import normalize_file_path
 
@@ -587,6 +587,8 @@ def _candidate_headers(
     headers: set[str],
     header_paths: dict[str, str],
     root: Path | None,
+    normalize_path: Callable[[str | Path], str] | None = None,
+    inside_path: Callable[[str | Path, Path | None], bool] | None = None,
 ) -> list[str]:
     target = raw.strip().strip("\"'").replace("\\", "/")
     if target.startswith("<") and target.endswith(">"):
@@ -626,7 +628,11 @@ def _candidate_headers(
                 directory, scope = configured
             else:  # pragma: no cover - compatibility with injected callers
                 directory, scope = configured, None  # type: ignore[assignment]
-            if scope is not None and not _inside(source_path, scope):
+            if scope is not None and not (
+                inside_path(source_path, scope)
+                if inside_path is not None
+                else _inside(source_path, scope)
+            ):
                 continue
             # Only an entry applicable to this source suppresses the
             # conventional root/include fallback below.  A sibling app may
@@ -639,7 +645,11 @@ def _candidate_headers(
             # A root-level ``include`` is a conventional explicit project
             # include root, but only when it is the source's own project root.
             root_include = root / "include"
-            if _inside(source_path, root) and root_include not in configured_dirs:
+            if (
+                inside_path(source_path, root)
+                if inside_path is not None
+                else _inside(source_path, root)
+            ) and root_include not in configured_dirs:
                 candidates.append(root_include / target)
 
     result: set[str] = set()
@@ -648,11 +658,27 @@ def _candidate_headers(
     # relation on Linux (for example ``shared.hrl`` -> ``SHARED.HRL``), so keep
     # the resolver strictly exact and leave spelling mismatches unresolved.
     for candidate in candidates:
+        candidate_text = str(candidate).replace("\\", "/")
         try:
-            normalized = _normal_graph_path(candidate, root)
-        except (OSError, RuntimeError):
-            continue
-        if root is not None and not _inside(normalized, root):
+            if _WINDOWS_ABSOLUTE_RE.match(candidate_text):
+                normalized = candidate_text
+            else:
+                candidate_path = Path(candidate_text).expanduser()
+                if not candidate_path.is_absolute() and root is not None:
+                    candidate_path = root / candidate_path
+                normalized = normalize_file_path(os.path.normpath(str(candidate_path)))
+            if normalized not in headers:
+                # Preserve existing symlink behavior without resolving every
+                # nonexistent include candidate.  A failed or foreign path
+                # remains unresolved, which is the conservative contract.
+                if _WINDOWS_ABSOLUTE_RE.match(candidate_text) or not candidate_path.exists():
+                    continue
+                normalized = (
+                    normalize_path(candidate)
+                    if normalize_path is not None
+                    else _normal_graph_path(candidate, root)
+                )
+        except (OSError, RuntimeError, ValueError):
             continue
         if normalized in headers:
             result.add(header_paths.get(normalized, normalized))
@@ -731,6 +757,37 @@ def resolve_erlang_header_records(
                 "ambiguous": 0,
                 "unresolved": 0,
             }
+    scope_cache: dict[str, bool] = {}
+    normalized_path_cache: dict[str, str] = {}
+    inside_cache: dict[tuple[str, str], bool] = {}
+
+    def in_scope(value: str | Path) -> bool:
+        key = str(value)
+        cached = scope_cache.get(key)
+        if cached is not None:
+            return cached
+        result = _path_in_scope(key, root)
+        scope_cache[key] = result
+        return result
+
+    def normalized_path(value: str | Path) -> str:
+        key = str(value)
+        cached = normalized_path_cache.get(key)
+        if cached is not None:
+            return cached
+        result = _normal_graph_path(key, root)
+        normalized_path_cache[key] = result
+        return result
+
+    def inside_path(value: str | Path, boundary: Path | None) -> bool:
+        key = (str(value), str(boundary))
+        cached = inside_cache.get(key)
+        if cached is not None:
+            return cached
+        result = _inside(value, boundary)
+        inside_cache[key] = result
+        return result
+
     all_node_rows = conn.execute(
         "SELECT * FROM nodes WHERE language = 'erlang'",
     ).fetchall()
@@ -740,13 +797,13 @@ def resolve_erlang_header_records(
     # rebind another root's textual include/record edges to local headers.
     node_rows = [
         row for row in all_node_rows
-        if _path_in_scope(str(row["file_path"]), root)
+        if in_scope(str(row["file_path"]))
     ]
     file_paths = {str(row["file_path"]) for row in node_rows}
     header_paths = {
-        _normal_graph_path(path, root): path
+        normalized_path(path): path
         for path in file_paths
-        if path.casefold().endswith(".hrl") and _path_in_scope(path, root)
+        if path.casefold().endswith(".hrl") and in_scope(path)
     }
     headers = set(header_paths)
     if not node_rows:
@@ -773,7 +830,7 @@ def resolve_erlang_header_records(
         name = str(row["name"])
         if isinstance(identity, str) and identity.startswith("#"):
             name = identity[1:].split("{", 1)[0] or name
-        declarations[(_normal_graph_path(row["file_path"], root), name)].append(
+        declarations[(normalized_path(row["file_path"]), name)].append(
             str(row["qualified_name"])
         )
 
@@ -784,7 +841,7 @@ def resolve_erlang_header_records(
     ).fetchall()
     import_rows = [
         row for row in all_import_rows
-        if _path_in_scope(str(row["file_path"]), root)
+        if in_scope(str(row["file_path"]))
     ]
     imports_updated = imports_resolved = 0
     records_updated = records_resolved = 0
@@ -808,6 +865,8 @@ def resolve_erlang_header_records(
             headers=headers,
             header_paths=header_paths,
             root=root,
+            normalize_path=normalized_path,
+            inside_path=inside_path,
         )
         if import_kind == "pp_include_lib" and _include_lib_app_is_ambiguous(
             raw, app_map
@@ -841,8 +900,8 @@ def resolve_erlang_header_records(
             ):
                 extra.pop(key, None)
             target = candidates[0]
-            include_graph[_normal_graph_path(row["file_path"], root)].add(
-                _normal_graph_path(target, root)
+            include_graph[normalized_path(row["file_path"])].add(
+                normalized_path(target)
             )
             imports_resolved += row["target_qualified"] != target
         else:
@@ -879,7 +938,7 @@ def resolve_erlang_header_records(
     ).fetchall()
     record_rows = [
         row for row in all_record_rows
-        if _path_in_scope(str(row["file_path"]), root)
+        if in_scope(str(row["file_path"]))
     ]
     for row in record_rows:
         extra = _json_extra(row["extra"])
@@ -888,7 +947,7 @@ def resolve_erlang_header_records(
         raw = _raw_target(extra, row["target_qualified"])
         extra["erlang_raw_target"] = raw
         record_name = raw.strip().strip("'\"").lstrip("#").split("{", 1)[0]
-        source_file = _normal_graph_path(row["file_path"], root)
+        source_file = normalized_path(row["file_path"])
         candidate_qns: list[str] = []
         for file_path in closure(source_file):
             candidate_qns.extend(declarations.get((file_path, record_name), ()))

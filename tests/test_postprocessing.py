@@ -176,6 +176,22 @@ class TestRunPostProcessing:
 
         assert "warnings" not in result
 
+    def test_reports_stage_timings(self):
+        result = run_post_processing(self.store)
+
+        assert set(result["postprocess_timing"]) == {
+            "bare_endpoints_s",
+            "signatures_s",
+            "fts_s",
+            "flows_s",
+            "communities_s",
+            "embeddings_s",
+        }
+        assert all(
+            isinstance(value, float) and value >= 0
+            for value in result["postprocess_timing"].values()
+        )
+
     def test_empty_store_no_crash(self):
         empty_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         empty_tmp.close()  # release the handle before GraphStore reopens it on Windows

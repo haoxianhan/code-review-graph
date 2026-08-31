@@ -2110,6 +2110,7 @@ def full_build(
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
     stale_files = _reconcile_stale_files(repo_root, store, files)
+    parse_started = time.perf_counter()
 
     total_nodes = 0
     total_edges = 0
@@ -2178,6 +2179,21 @@ def full_build(
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
 
+    stage_timing = {
+        "parse_s": max(0.0, round(time.perf_counter() - parse_started, 6)),
+    }
+    resolver_started = time.perf_counter()
+    resolver_timing: dict[str, float] = {}
+
+    def run_resolver(name: str, operation: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            resolver_timing[name] = max(
+                0.0, round(time.perf_counter() - started, 6)
+            )
+
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     if not cpp_errors:
@@ -2185,14 +2201,21 @@ def full_build(
     _store_vcs_metadata(repo_root, store)
     store.commit()
 
-    python_stats = _run_python_resolver(store)
-    erlang_header_stats = _run_erlang_header_resolver(store, repo_root)
-    rescript_stats = _run_rescript_resolver(store)
-    spring_stats = _run_spring_resolver(store)
-    spring_event_stats = _run_spring_event_resolver(store)
-    temporal_stats = _run_temporal_resolver(store)
-    hcl_stats = _run_hcl_resolver(store)
-    scoped_stats = _run_scoped_resolver(store)
+    python_stats = run_resolver("python", lambda: _run_python_resolver(store))
+    erlang_header_stats = run_resolver(
+        "erlang_header", lambda: _run_erlang_header_resolver(store, repo_root)
+    )
+    rescript_stats = run_resolver("rescript", lambda: _run_rescript_resolver(store))
+    spring_stats = run_resolver("spring", lambda: _run_spring_resolver(store))
+    spring_event_stats = run_resolver(
+        "spring_event", lambda: _run_spring_event_resolver(store)
+    )
+    temporal_stats = run_resolver("temporal", lambda: _run_temporal_resolver(store))
+    hcl_stats = run_resolver("hcl", lambda: _run_hcl_resolver(store))
+    scoped_stats = run_resolver("scoped", lambda: _run_scoped_resolver(store))
+    stage_timing["repository_resolvers_s"] = max(
+        0.0, round(time.perf_counter() - resolver_started, 6)
+    )
 
     result = {
         "files_parsed": len(files),
@@ -2208,14 +2231,20 @@ def full_build(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "stage_timing": stage_timing,
+        "resolver_timing": resolver_timing,
     }
     try:
+        erlang_started = time.perf_counter()
         erlang_result = _run_erlang_lifecycle(
             repo_root,
             store,
             config=erlang_config,
             changed_files=(),
             force=True,
+        )
+        stage_timing["erlang_integration_s"] = max(
+            0.0, round(time.perf_counter() - erlang_started, 6)
         )
     except BaseException:
         _clear_erlang_identity(store, repo_root)
@@ -2259,6 +2288,7 @@ def incremental_update(
 
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
+    stage_timing: dict[str, float] = {}
 
     if (
         store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
@@ -2283,11 +2313,16 @@ def incremental_update(
     # dependency discovery. Header changes are compared against the previous
     # graph, so this ordering lets us retain consumers even when a deleted
     # header's incoming edge would otherwise be removed with its node.
+    stage_started = time.perf_counter()
     erlang_header_pre_stats = (
         _run_erlang_header_resolver(store, repo_root)
         if store.has_nodes_for_language("erlang")
         else None
     )
+    stage_timing["header_pre_s"] = max(
+        0.0, round(time.perf_counter() - stage_started, 6)
+    )
+    stage_started = time.perf_counter()
     stale_dependents: set[str] = set()
     stale_files = (
         _reconcile_stale_files(
@@ -2297,6 +2332,9 @@ def incremental_update(
         )
         if reconcile_stale
         else []
+    )
+    stage_timing["stale_reconciliation_s"] = max(
+        0.0, round(time.perf_counter() - stage_started, 6)
     )
 
     layout_changed = any(_is_erlang_layout_path(path) for path in changed_files)
@@ -2321,7 +2359,9 @@ def incremental_update(
             "graph_changed": False,
             "relation_layout_changed": False,
             "erlang_header_resolution": erlang_header_pre_stats,
+            "stage_timing": stage_timing,
         }
+        stage_started = time.perf_counter()
         erlang_result = _run_erlang_lifecycle(
             repo_root,
             store,
@@ -2329,11 +2369,15 @@ def incremental_update(
             changed_files=changed_files,
             force=layout_changed,
         )
+        stage_timing["erlang_integration_s"] = max(
+            0.0, round(time.perf_counter() - stage_started, 6)
+        )
         if erlang_result is not None:
             result["erlang_integration"] = erlang_result
         return result
 
     # Find dependent files (files that import from changed files)
+    stage_started = time.perf_counter()
     dependent_files: set[str] = set()
     for dependent in stale_dependents:
         if not _path_belongs_to_root(dependent, repo_root):
@@ -2363,6 +2407,9 @@ def incremental_update(
 
     # Combine changed + dependent
     all_files = set(changed_files) | dependent_files
+    stage_timing["dependency_discovery_s"] = max(
+        0.0, round(time.perf_counter() - stage_started, 6)
+    )
 
     total_nodes = 0
     total_edges = 0
@@ -2375,6 +2422,7 @@ def incremental_update(
     stored_file_paths = set(store.get_all_files())
 
     # Separate deleted/unparseable files from files that need re-parsing
+    stage_started = time.perf_counter()
     to_parse: list[str] = []
     snapshots: dict[str, tuple[bytes, str]] = {}
     for rel_path in all_files:
@@ -2420,12 +2468,16 @@ def incremental_update(
         except (OSError, PermissionError):
             pass
         to_parse.append(rel_path)
+    stage_timing["change_inventory_s"] = max(
+        0.0, round(time.perf_counter() - stage_started, 6)
+    )
 
     # Persist deletions before store_file_nodes_edges() opens its own
     # explicit transaction — avoids nested transaction errors.
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
     parsed_files = 0
 
+    stage_started = time.perf_counter()
     if use_serial or len(to_parse) < 8:
         for rel_path in to_parse:
             abs_path = repo_root / rel_path
@@ -2441,6 +2493,7 @@ def incremental_update(
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
                 if _is_erlang_source_path(rel_path):
@@ -2475,6 +2528,8 @@ def incremental_update(
                 total_nodes += len(nodes)
                 total_edges += len(edges)
 
+    stage_timing["parse_s"] = max(0.0, round(time.perf_counter() - stage_started, 6))
+
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
     files_updated = parsed_files + len(stale_files) + removed_files
     if files_updated:
@@ -2485,6 +2540,7 @@ def incremental_update(
         store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
+    stage_started = time.perf_counter()
     python_changed = any(
         path.endswith(".py")
         for path in set(all_files) | set(stale_files) | missing_paths
@@ -2524,6 +2580,9 @@ def incremental_update(
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+    stage_timing["repository_resolvers_s"] = max(
+        0.0, round(time.perf_counter() - stage_started, 6)
+    )
 
     result = {
         "files_updated": files_updated,
@@ -2543,14 +2602,19 @@ def incremental_update(
         "scoped_resolution": scoped_stats,
         "graph_changed": bool(files_updated or layout_changed),
         "relation_layout_changed": layout_changed,
+        "stage_timing": stage_timing,
     }
     try:
+        stage_started = time.perf_counter()
         erlang_result = _run_erlang_lifecycle(
             repo_root,
             store,
             config=erlang_config,
             changed_files=list(changed_files),
             force=layout_changed,
+        )
+        stage_timing["erlang_integration_s"] = max(
+            0.0, round(time.perf_counter() - stage_started, 6)
         )
     except BaseException:
         if erlang_changed:
