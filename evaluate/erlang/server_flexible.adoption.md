@@ -30,20 +30,19 @@ artifacts.
 
 ## Lifecycle And Adoption
 
-The complete evaluator was run against the same clean pinned checkout twice:
-once with isolated watch smoke and once with watch disabled. The runs did not
-produce a final envelope before the 20-minute and 15-minute bounded timeouts;
-one run also emitted a `closed database` warning from the best-effort Erlang
-header resolver. Therefore full-build, incremental, forget, standalone
-postprocess, and lifecycle parity are not claimed by this report. The isolated
-watch smoke itself is covered by the committed watch smoke test and focused
-Erlang lifecycle suite.
+The post-optimization lifecycle probe used disposable copies of the same clean
+pinned checkout. Three full-build samples (including the full postprocess
+boundary) were `28.169`, `27.448`, and `26.949 s`; the interpolated p95 is
+`28.097 s`, below the `30 s` budget. Three one-file incremental samples were
+`5.689`, `5.416`, and `5.091 s`, and two no-op samples were `0.233` and
+`0.237 s`. A standalone postprocess sample was `10.403 s`. These measurements
+cover the optimized stage behavior, but a complete evaluator rerun covering
+watch, forget, and all lifecycle parity checks was not completed, so those
+adoption gates remain unverified.
 
-The performance report records three full-build samples (`51.589`, `52.667`,
-and `54.572 s`) with p95 `54,381.173 ms` against the `30,000 ms` budget. Three
-one-file incremental samples were `47.724`, `47.873`, and `47.912 s`; three
-no-op samples were `23.929`, `23.931`, and `23.961 s`. Restore-to-HEAD has one
-earlier `48.900 s` sample, and layout-only was not run.
+The performance report records the post-optimization samples and the commit
+that produced them in `server_flexible.performance.json`. Restore-to-HEAD and
+layout-only were not run in this pass.
 
 ELP, `erlang_ls`, and `elp-ls` were unavailable. Runtime OTP 27 differed from
 the manifest's configured OTP 25, and adapter runtime sandbox policy remains

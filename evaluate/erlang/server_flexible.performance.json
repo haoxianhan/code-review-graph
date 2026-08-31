@@ -15,6 +15,8 @@
     "profile_db": "/tmp/crg-profile.db",
     "parse_policy": "serial (CRG_SERIAL_PARSE=1)",
     "warmup": "one completed full build before recorded samples",
+    "implementation_commit": "99db8a4",
+    "sample_scope": "full_build values include full_build + full postprocess; incremental values are one-file updates on a disposable copy; no-op values are empty incremental updates",
     "cache_policy": "fresh graph for full build; revision-keyed cache rejected when unkeyed",
     "target_files": 1099,
     "erlang_files": 975,
@@ -22,26 +24,26 @@
     "edges": 131175
   },
   "samples": {
-    "full_build": {"status": "measured", "seconds": [51.589092, 52.667485, 54.571565], "p50_seconds": 52.667485, "p95_seconds": 54.381173},
-    "incremental_update": {"status": "measured", "seconds": [47.724173, 47.872697, 47.912475], "p50_seconds": 47.872697, "p95_seconds": 47.910486},
-    "restore_update": {"status": "measured", "seconds": [48.900230], "p50_seconds": 48.900230, "p95_seconds": 48.900230, "status_note": "single earlier restore-to-HEAD sample; repeated restore was not isolated in this run"},
+    "full_build": {"status": "measured", "seconds": [28.169474, 27.447808, 26.949014], "p50_seconds": 27.447808, "p95_seconds": 28.097307},
+    "incremental_update": {"status": "measured", "seconds": [5.689000, 5.415779, 5.091224], "p50_seconds": 5.415779, "p95_seconds": 5.661678},
+    "restore_update": {"status": "not_run", "seconds": [], "p50_seconds": null, "p95_seconds": null, "status_note": "No isolated restore-to-HEAD sample was collected after the optimization."},
     "layout_only": {"status": "not_run", "seconds": [], "reason": "No isolated layout-only lifecycle operation exists in the current evaluator."},
-    "no_op_update": {"status": "measured", "seconds": [23.929298, 23.930824, 23.961169], "p50_seconds": 23.930824, "p95_seconds": 23.958734},
-    "resolve_bare_call_targets": {"status": "measured", "seconds": [22.8], "p50_seconds": 22.8, "p95_seconds": 22.8},
-    "standalone_postprocess": {"status": "measured", "seconds": [56.4], "p50_seconds": 56.4, "p95_seconds": 56.4}
+    "no_op_update": {"status": "measured", "seconds": [0.238000, 0.232887, 0.236981], "p50_seconds": 0.236981, "p95_seconds": 0.237898},
+    "resolve_bare_call_targets": {"status": "measured", "seconds": [2.828000], "p50_seconds": 2.828000, "p95_seconds": 2.828000},
+    "standalone_postprocess": {"status": "measured", "seconds": [10.403000], "p50_seconds": 10.403000, "p95_seconds": 10.403000}
   },
   "budgets_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000},
   "gates": {
-    "full_build_p95": {"observed_ms": 54381.173, "budget_ms": 30000, "pass": false},
+    "full_build_p95": {"observed_ms": 28097.307, "budget_ms": 30000, "pass": true},
     "targeted_query_p95": {"observed_ms": 299.096, "budget_ms": 2000, "pass": true},
     "layout_only": {"pass": false, "reason": "not_run"},
-    "lifecycle_repeatability": {"pass": false, "reason": "full evaluator exceeded 20 minutes and was stopped after a closed-database warning"}
+    "lifecycle_repeatability": {"pass": false, "reason": "A complete evaluator rerun covering watch, forget, and standalone parity was not completed after the optimization."}
   },
   "verdict": "auxiliary_review_context_only",
   "limitations": [
     "ELP, erlang_ls, and elp-ls are unavailable in the frozen environment.",
     "Runtime OTP 27 differs from the manifest configured OTP 25.",
     "Adapter runtime sandbox policy is descriptive and not enforced by the evaluator.",
-    "The full-build p95 budget is not met, and layout-only/repeatability gates are not green."
+    "Layout-only was not run, and complete lifecycle repeatability remains unverified."
   ]
 }
