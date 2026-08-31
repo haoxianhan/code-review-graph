@@ -462,7 +462,7 @@ def test_result_validator_recomputes_runtime_policy_gate(tmp_path: Path):
     result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
 
     forged = copy.deepcopy(result)
-    forged["adoption"]["gates"]["runtime_policy_enforced"] = True
+    forged["adoption"]["gates"]["runtime_policy_enforced"] = False
     with pytest.raises(ValueError, match="runtime_policy_enforced"):
         validate_evaluation_result(forged)
 

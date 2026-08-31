@@ -495,7 +495,19 @@ def _run_erlang_lifecycle(
         config=effective_config,
         changed_files=paths,
     )
-    return result.to_dict() if result is not None else None
+    if result is None:
+        return None
+    payload = result.to_dict()
+    if payload.get("status") == "blocked":
+        diagnostics = payload.get("diagnostics", [])
+        codes = [
+            str(item.get("code"))
+            for item in diagnostics
+            if isinstance(item, Mapping) and item.get("code")
+        ]
+        detail = ", ".join(codes[:8]) or "required_toolchain"
+        raise RuntimeError(f"Erlang strict preflight blocked operation ({detail})")
+    return payload
 
 
 def _erlang_result_requires_derived_refresh(result: Mapping[str, Any] | None) -> bool:

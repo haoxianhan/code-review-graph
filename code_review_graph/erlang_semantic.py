@@ -357,6 +357,9 @@ class ToolchainIdentity:
     rebar3_executable: str | None = None
     rebar3_version: str | None = None
     rebar3_invocation: tuple[str, ...] = ()
+    dialyzer_executable: str | None = None
+    dialyzer_version: str | None = None
+    dialyzer_invocation: tuple[str, ...] = ()
     xref_command: tuple[str, ...] = ()
     dialyzer_command: tuple[str, ...] = ()
     dependency_roots: tuple[str, ...] = ()
@@ -388,7 +391,7 @@ class ToolchainIdentity:
             "elp": (self.elp_executable, self.elp_version),
             "rebar3": (self.rebar3_executable, self.rebar3_version),
             "xref": (self.rebar3_executable, self.rebar3_version),
-            "dialyzer": (self.rebar3_executable, self.rebar3_version),
+            "dialyzer": (self.dialyzer_executable, self.dialyzer_version),
         }
         executable, version = aliases.get(wanted, (None, None))
         if executable or version:
@@ -416,6 +419,9 @@ class ToolchainIdentity:
             "rebar3_executable": self.rebar3_executable,
             "rebar3_version": self.rebar3_version,
             "rebar3_invocation": list(self.rebar3_invocation),
+            "dialyzer_executable": self.dialyzer_executable,
+            "dialyzer_version": self.dialyzer_version,
+            "dialyzer_invocation": list(self.dialyzer_invocation),
             "xref_command": list(self.xref_command),
             "dialyzer_command": list(self.dialyzer_command),
             "dependency_roots": list(self.dependency_roots),
@@ -475,6 +481,17 @@ class ToolchainIdentity:
             ),
             rebar3_version=(str(value["rebar3_version"]) if value.get("rebar3_version") else None),
             rebar3_invocation=_canonical_command(value.get("rebar3_invocation")),
+            dialyzer_executable=(
+                str(value["dialyzer_executable"])
+                if value.get("dialyzer_executable")
+                else None
+            ),
+            dialyzer_version=(
+                str(value["dialyzer_version"])
+                if value.get("dialyzer_version")
+                else None
+            ),
+            dialyzer_invocation=_canonical_command(value.get("dialyzer_invocation")),
             xref_command=_canonical_command(value.get("xref_command")),
             dialyzer_command=_canonical_command(value.get("dialyzer_command")),
             dependency_roots=(
@@ -1651,8 +1668,17 @@ def _extract_version(output: str, *, tool: str) -> str | None:
 
 
 def _find_executable(
-    repo_root: Path, local_names: Sequence[str], path_names: Sequence[str]
+    repo_root: Path,
+    local_names: Sequence[str],
+    path_names: Sequence[str],
+    *,
+    prefer_path: bool = False,
 ) -> str | None:
+    if prefer_path:
+        for name in path_names:
+            found = shutil.which(name)
+            if found:
+                return _canonical_path(found)
     for name in local_names:
         candidate = repo_root / name
         if candidate.is_file():
@@ -1718,6 +1744,17 @@ def _discover_version(
         diagnostics.append(f"{tool}_failed: {_bounded_text(result.stderr or result.stdout)}")
         return None
     version = _extract_version(result.stdout or result.stderr, tool=tool)
+    if tool == "otp" and executable:
+        # Nix/kerl executable paths retain the distribution version even when
+        # ``erlang:system_info(otp_release)`` only reports the major release.
+        # Prefer that exact identity when available for strict profiles.
+        try:
+            resolved = str(Path(executable).resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            resolved = executable
+        path_match = re.search(r"(?:erlang|otp)-([0-9]+(?:\.[0-9]+){1,3})", resolved)
+        if path_match:
+            version = path_match.group(1)
     if version is None:
         diagnostics.append(f"{tool}_version_unknown: command returned no parseable version")
     return version
@@ -1745,7 +1782,7 @@ def discover_toolchain(
     generated_data_paths: Iterable[str | Path] | None = None,
     plt_path: str | Path | None = None,
 ) -> ToolchainIdentity:
-    """Discover optional Erlang tooling without evaluating project code."""
+    """Discover Erlang tooling without evaluating project code."""
     root = Path(repo_root).expanduser().resolve()
     command_runner = runner or _default_discovery_runner
     safe_timeout = _safe_timeout(timeout)
@@ -1756,21 +1793,36 @@ def discover_toolchain(
     command_env = dict(supplied_env)
     diagnostics: list[str] = []
 
-    otp_executable = _find_executable(root, (), ("erl",))
-    elp_executable = _find_executable(root, ("elp", "bin/elp"), ("elp",))
-    rebar3_executable = _find_executable(root, ("rebar3", "rebar3.cmd"), ("rebar3",))
+    # Never execute a repository-local wrapper for a required tool.  The
+    # project checkout is untrusted input; the pinned system profile is the
+    # only acceptable source for runtime probes and semantic commands.
+    otp_executable = _find_executable(root, (), ("erl",), prefer_path=True)
+    elp_executable = _find_executable(
+        root, ("elp", "bin/elp"), ("elp",), prefer_path=True
+    )
+    rebar3_executable = _find_executable(
+        root, ("rebar3", "rebar3.cmd"), ("rebar3",), prefer_path=True
+    )
+    dialyzer_executable = _find_executable(root, (), ("dialyzer",), prefer_path=True)
     otp_command = (
         (
             otp_executable,
             "-noshell",
             "-eval",
-            'io:format("~s", [erlang:system_info(otp_release)]), halt().',
+            'io:format("otp=~s~nerts=~s", '
+            '[erlang:system_info(otp_release), erlang:system_info(version)]), halt().',
         )
         if otp_executable
         else ()
     )
-    elp_command = (elp_executable, "--version") if elp_executable else ()
+    # ELP exposes its version through the subcommand form.  Keep this exact
+    # invocation in the identity so manifests and cache keys cannot silently
+    # mix the legacy flag probe with the supported CLI contract.
+    elp_command = (elp_executable, "version") if elp_executable else ()
     rebar3_command = (rebar3_executable, "--version") if rebar3_executable else ()
+    dialyzer_probe_command = (
+        (dialyzer_executable, "--version") if dialyzer_executable else ()
+    )
     otp_version = _discover_version(
         otp_executable,
         otp_command,
@@ -1801,6 +1853,16 @@ def discover_toolchain(
         runner=command_runner,
         diagnostics=diagnostics,
     )
+    dialyzer_version = _discover_version(
+        dialyzer_executable,
+        dialyzer_probe_command,
+        tool="dialyzer",
+        cwd=root,
+        env=command_env,
+        timeout=safe_timeout,
+        runner=command_runner,
+        diagnostics=diagnostics,
+    )
     # ELP does not consistently print the OTP release it was compiled for.
     # Preserve an explicitly supplied deployment hint in the manifest so the
     # adapter can enforce the OTP compatibility check later.
@@ -1817,7 +1879,7 @@ def discover_toolchain(
     )
     plt_identity = compute_plt_identity(plt_path) if plt_path is not None else None
     xref_command = (rebar3_executable, "xref") if rebar3_executable else ()
-    dialyzer_command = (rebar3_executable, "dialyzer") if rebar3_executable else ()
+    dialyzer_task_command = (rebar3_executable, "dialyzer") if rebar3_executable else ()
     tools = (
         ToolInfo(
             "otp",
@@ -1843,6 +1905,14 @@ def discover_toolchain(
             "cli",
             STATUS_OK if rebar3_version else STATUS_UNAVAILABLE,
         ),
+        ToolInfo(
+            "dialyzer",
+            dialyzer_executable,
+            dialyzer_version,
+            dialyzer_probe_command,
+            "cli",
+            STATUS_OK if dialyzer_version else STATUS_UNAVAILABLE,
+        ),
     )
     return ToolchainIdentity(
         repository=_canonical_path(root),
@@ -1859,8 +1929,11 @@ def discover_toolchain(
         rebar3_executable=rebar3_executable,
         rebar3_version=rebar3_version,
         rebar3_invocation=rebar3_command,
+        dialyzer_executable=dialyzer_executable,
+        dialyzer_version=dialyzer_version,
+        dialyzer_invocation=dialyzer_probe_command,
         xref_command=xref_command,
-        dialyzer_command=dialyzer_command,
+        dialyzer_command=dialyzer_task_command,
         dependency_roots=dependency_roots,
         plt_identity=plt_identity,
         environment=_redacted_environment(supplied_env),

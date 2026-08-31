@@ -423,4 +423,4 @@ def test_discovery_records_elp_otp_hint_and_timeout(monkeypatch, tmp_path: Path)
     assert ("ELP_OTP_VERSION", "27") in identity.environment
     assert all(key != "SECRET_TOKEN" for key, _ in identity.environment)
     assert any(item.startswith("otp_timeout:") for item in identity.diagnostics)
-    assert any(command[0] == "/usr/bin/elp" for command in calls)
+    assert ("/usr/bin/elp", "version") in calls

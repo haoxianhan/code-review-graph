@@ -23,7 +23,7 @@ def test_server_manifest_loads_all_adapter_policies():
     adapters = manifest["_adapter_manifests"]
 
     assert set(adapters) == set(ERLANG_ADAPTERS)
-    assert manifest["adapters"]["runtime_policy"] == "mixed"
+    assert manifest["adapters"]["runtime_policy"] == "enforced"
     for name, adapter in adapters.items():
         assert adapter["adapter"] == name
         assert adapter["invocation"]["shell"] is False
@@ -41,24 +41,18 @@ def test_adapter_manifests_capture_distinct_execution_contracts():
         assert manifest["invocation"]["mode"] == "argv"
         assert manifest["invocation"]["cwd"] == "repository_root"
         assert manifest["sandbox"]["network"] in {"deny", "controlled"}
-        assert manifest["enforcement"]["runtime_policy_enforced"] is False
-        assert manifest["enforcement"]["status"] == "described_only"
-        assert manifest["enforcement"]["diagnostic_code"]
+        assert manifest["enforcement"]["runtime_policy_enforced"] is True
+        assert manifest["enforcement"]["status"] == "enforced"
     assert "plt_identity" in manifests["dialyzer"]["cache"]["key_fields"]
 
 
-def test_policy_inspection_reports_descriptive_runtime_boundary():
+def test_policy_inspection_reports_enforced_runtime_boundary():
     result = inspect_adapter_manifests(DEFAULT_ADAPTER_MANIFEST_DIR)
 
-    assert result["status"] == "degraded"
-    assert result["runtime_policy_enforced"] is False
+    assert result["status"] == "ok"
+    assert result["runtime_policy_enforced"] is True
     assert result["manifests"] == sorted(ERLANG_ADAPTERS)
-    assert result["diagnostics"][0]["code"] == "adapter_manifest_policy_not_enforced"
-    assert set(result["diagnostics"][0]["details"]["adapters"]) == {
-        "elp",
-        "xref",
-        "dialyzer",
-    }
+    assert result["diagnostics"] == []
 
 
 def test_missing_or_invalid_policy_is_observable(tmp_path: Path):

@@ -1,11 +1,12 @@
-"""Lifecycle integration for optional Erlang semantic enrichment.
+"""Lifecycle integration for Erlang semantic enrichment.
 
 The Erlang parser is useful without any external tools.  This module is the
 small, opt-in bridge for deployments that also want ELP, ``rebar3 xref`` or
 Dialyzer evidence.  It deliberately keeps the adapter boundary separate from
 the normal parser and query code:
 
-* Generic indexing is never gated on this module.
+* Generic indexing is never gated on this module unless a caller explicitly
+  enables the strict project profile.
 * Disabled integration returns before toolchain discovery (and therefore
   never starts a subprocess).
 * Semantic snapshots are persisted with their complete analysis key.
@@ -46,6 +47,7 @@ from .erlang_semantic import (
     EvidenceRecord,
     Provenance,
     ToolchainIdentity,
+    compute_plt_identity,
     run_erlang_enrichment,
 )
 from .graph import GraphNode, GraphStore
@@ -68,6 +70,10 @@ __all__ = [
 
 
 _DEFAULT_TIMEOUT = 15.0
+_STRICT_OTP_VERSION = "27.3.4.16"
+_STRICT_ELP_VERSION = "1.1.0+build-2026-01-15"
+_STRICT_REBAR3_VERSION = "3.27.0"
+_STRICT_DIALYZER_VERSION = "5.3.1.1"
 _MAX_TARGETS = 256
 _MAX_EVIDENCE = 2_000
 _MAX_PROVENANCE_CHARS = 8_000
@@ -95,6 +101,11 @@ _ERLANG_ENV_KEYS = frozenset(
         "CRG_ERLANG_EXPECTED_OTP",
         "CRG_ERLANG_EXPECTED_OTP_VERSION",
         "CRG_ERLANG_PLT_PATH",
+        "CRG_ERLANG_STRICT",
+        "CRG_ERLANG_STRICT_OTP_VERSION",
+        "CRG_ERLANG_STRICT_ELP_VERSION",
+        "CRG_ERLANG_STRICT_REBAR3_VERSION",
+        "CRG_ERLANG_STRICT_DIALYZER_VERSION",
     }
 )
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
@@ -236,16 +247,22 @@ class ErlangIntegrationConfig:
     """
 
     enabled: bool = False
+    strict: bool = False
     queries: tuple[EnrichmentQuery, ...] = ()
     include_xref: bool = False
     include_dialyzer: bool = False
     cache_dir: str | Path | None = None
     timeout: float = _DEFAULT_TIMEOUT
     expected_otp: str | None = None
+    strict_otp_version: str | None = None
+    strict_elp_version: str | None = None
+    strict_rebar3_version: str | None = None
+    strict_dialyzer_version: str | None = None
     plt_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled))
+        object.__setattr__(self, "strict", _coerce_bool(self.strict))
         object.__setattr__(self, "queries", _normalise_queries(self.queries))
         object.__setattr__(self, "include_xref", _coerce_bool(self.include_xref))
         object.__setattr__(self, "include_dialyzer", _coerce_bool(self.include_dialyzer))
@@ -253,6 +270,15 @@ class ErlangIntegrationConfig:
         if self.expected_otp is not None:
             value = str(self.expected_otp).strip()
             object.__setattr__(self, "expected_otp", value or None)
+        for field_name in (
+            "strict_otp_version",
+            "strict_elp_version",
+            "strict_rebar3_version",
+            "strict_dialyzer_version",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, str(value).strip() or None)
 
     @classmethod
     def from_environment(cls) -> "ErlangIntegrationConfig":
@@ -264,12 +290,17 @@ class ErlangIntegrationConfig:
         )
         return cls(
             enabled=_env_bool("CRG_ERLANG_ENABLED", False),
+            strict=_env_bool("CRG_ERLANG_STRICT", False),
             queries=queries,
             include_xref=_env_bool("CRG_ERLANG_XREF", False),
             include_dialyzer=_env_bool("CRG_ERLANG_DIALYZER", False),
             cache_dir=os.environ.get("CRG_ERLANG_CACHE_DIR") or None,
             timeout=os.environ.get("CRG_ERLANG_TIMEOUT", _DEFAULT_TIMEOUT),
             expected_otp=expected_otp,
+            strict_otp_version=os.environ.get("CRG_ERLANG_STRICT_OTP_VERSION") or None,
+            strict_elp_version=os.environ.get("CRG_ERLANG_STRICT_ELP_VERSION") or None,
+            strict_rebar3_version=os.environ.get("CRG_ERLANG_STRICT_REBAR3_VERSION") or None,
+            strict_dialyzer_version=os.environ.get("CRG_ERLANG_STRICT_DIALYZER_VERSION") or None,
             plt_path=os.environ.get("CRG_ERLANG_PLT_PATH") or None,
         )
 
@@ -290,15 +321,25 @@ class ErlangIntegrationConfig:
             "xref": "include_xref",
             "dialyzer": "include_dialyzer",
             "cache": "cache_dir",
+            "strict_profile": "strict",
+            "otp_version": "strict_otp_version",
+            "elp_version": "strict_elp_version",
+            "rebar3_version": "strict_rebar3_version",
+            "dialyzer_version": "strict_dialyzer_version",
         }
         fields = {
             "enabled",
+            "strict",
             "queries",
             "include_xref",
             "include_dialyzer",
             "cache_dir",
             "timeout",
             "expected_otp",
+            "strict_otp_version",
+            "strict_elp_version",
+            "strict_rebar3_version",
+            "strict_dialyzer_version",
             "plt_path",
         }
         values: dict[str, Any] = {}
@@ -311,12 +352,17 @@ class ErlangIntegrationConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "strict": self.strict,
             "queries": [query.to_dict() for query in self.queries],
             "include_xref": self.include_xref,
             "include_dialyzer": self.include_dialyzer,
             "cache_dir": str(self.cache_dir) if self.cache_dir is not None else None,
             "timeout": self.timeout,
             "expected_otp": self.expected_otp,
+            "strict_otp_version": self.strict_otp_version,
+            "strict_elp_version": self.strict_elp_version,
+            "strict_rebar3_version": self.strict_rebar3_version,
+            "strict_dialyzer_version": self.strict_dialyzer_version,
             "plt_path": str(self.plt_path) if self.plt_path is not None else None,
         }
 
@@ -394,9 +440,10 @@ def maybe_run_erlang_integration(
 ) -> ErlangIntegrationResult | None:
     """Run the optional bridge only when a caller explicitly opts in.
 
-    Adapter failures are represented as a degraded result so a Generic build
-    remains usable.  ``KeyboardInterrupt``/``SystemExit`` are intentionally
-    allowed to reach the caller.
+    Non-strict adapter failures are represented as a degraded result so a
+    Generic build remains usable.  A strict project profile returns its
+    blocking preflight result unchanged. ``KeyboardInterrupt``/``SystemExit``
+    are intentionally allowed to reach the caller.
     """
     if not erlang_integration_requested(config, run_erlang=run_erlang):
         return None
@@ -1443,8 +1490,9 @@ def _failure_result(
     status: str = STATUS_DEGRADED,
     toolchain: ToolchainIdentity | None = None,
     counts: Mapping[str, int] | None = None,
+    diagnostics: Iterable[Diagnostic] = (),
 ) -> ErlangIntegrationResult:
-    """Return a bounded optional-path failure without touching Generic data."""
+    """Return a bounded failure without touching Generic data."""
     if toolchain is not None:
         try:
             provenance = Provenance.from_key(
@@ -1460,12 +1508,13 @@ def _failure_result(
         code=code,
         message=str(message)[:2_000],
         provenance=provenance,
-        severity="warning",
+        severity="error" if status in {"blocked", STATUS_FAILED, STATUS_MISMATCH} else "warning",
     )
+    all_diagnostics = (diagnostic, *tuple(diagnostics))
     result_counts = {
         "queries": 0,
         "evidence": 0,
-        "diagnostics": 1,
+        "diagnostics": len(all_diagnostics),
         "projected_edges": 0,
     }
     if counts:
@@ -1473,7 +1522,7 @@ def _failure_result(
     result_provenance = _base_provenance(root, status=status, toolchain=toolchain)
     return ErlangIntegrationResult(
         status=status,
-        diagnostics=(diagnostic,),
+        diagnostics=all_diagnostics,
         provenance=result_provenance,
         counts=result_counts,
         toolchain=toolchain,
@@ -1487,6 +1536,158 @@ def _repository_matches(root: Path, toolchain: ToolchainIdentity) -> bool:
         return os.path.normcase(str(observed)) == os.path.normcase(str(root))
     except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
         return False
+
+
+def _strict_preflight(
+    root: Path,
+    toolchain: ToolchainIdentity,
+    settings: ErlangIntegrationConfig,
+) -> tuple[Diagnostic, ...]:
+    """Validate the complete project toolchain before semantic execution."""
+    expected = {
+        "otp": settings.strict_otp_version or settings.expected_otp or _STRICT_OTP_VERSION,
+        "elp": settings.strict_elp_version or _STRICT_ELP_VERSION,
+        "rebar3": settings.strict_rebar3_version or _STRICT_REBAR3_VERSION,
+        "dialyzer": settings.strict_dialyzer_version or _STRICT_DIALYZER_VERSION,
+    }
+    observed = {
+        "otp": (toolchain.otp_executable, toolchain.otp_version),
+        "elp": (toolchain.elp_executable, toolchain.elp_version),
+        "rebar3": (toolchain.rebar3_executable, toolchain.rebar3_version),
+        "dialyzer": (toolchain.dialyzer_executable, toolchain.dialyzer_version),
+    }
+    diagnostics: list[Diagnostic] = []
+    if not settings.include_xref:
+        diagnostics.append(
+            _make_diagnostic(
+                toolchain,
+                tool="erlang_integration",
+                query_kind="preflight",
+                code="required_adapter_not_enabled",
+                message="The strict server_flexible profile requires the xref adapter.",
+                status=STATUS_MISMATCH,
+                metadata={"adapter": "xref"},
+            )
+        )
+    if not settings.include_dialyzer:
+        diagnostics.append(
+            _make_diagnostic(
+                toolchain,
+                tool="erlang_integration",
+                query_kind="preflight",
+                code="required_adapter_not_enabled",
+                message="The strict server_flexible profile requires the Dialyzer adapter.",
+                status=STATUS_MISMATCH,
+                metadata={"adapter": "dialyzer"},
+            )
+        )
+    for name, expected_version in expected.items():
+        executable, version = observed[name]
+        if not executable or not version:
+            diagnostics.append(
+                _make_diagnostic(
+                    toolchain,
+                    tool="erlang_integration",
+                    query_kind="preflight",
+                    code="required_tool_unavailable",
+                    message=f"Required Erlang tool {name} is unavailable or unversioned.",
+                    status=STATUS_UNAVAILABLE,
+                    metadata={"tool": name, "expected": expected_version},
+                )
+            )
+        elif str(version) != str(expected_version):
+            diagnostics.append(
+                _make_diagnostic(
+                    toolchain,
+                    tool="erlang_integration",
+                    query_kind="preflight",
+                    code="required_tool_version_mismatch",
+                    message=f"Required Erlang tool {name} does not match the pinned baseline.",
+                    status=STATUS_MISMATCH,
+                    metadata={
+                        "tool": name,
+                        "expected": expected_version,
+                        "observed": version,
+                    },
+                )
+            )
+    if not toolchain.xref_command:
+        diagnostics.append(
+            _make_diagnostic(
+                toolchain,
+                tool="erlang_integration",
+                query_kind="preflight",
+                code="xref_unavailable",
+                message="Required rebar3 xref command is not configured.",
+                status=STATUS_UNAVAILABLE,
+            )
+        )
+    if not toolchain.dialyzer_command:
+        diagnostics.append(
+            _make_diagnostic(
+                toolchain,
+                tool="erlang_integration",
+                query_kind="preflight",
+                code="dialyzer_unavailable",
+                message="Required rebar3 dialyzer command is not configured.",
+                status=STATUS_UNAVAILABLE,
+            )
+        )
+    if settings.strict:
+        if settings.plt_path is None:
+            diagnostics.append(
+                _make_diagnostic(
+                    toolchain,
+                    tool="erlang_integration",
+                    query_kind="preflight",
+                    code="dialyzer_plt_required",
+                    message="A matching Dialyzer PLT path is required for strict diagnostics.",
+                    status=STATUS_STALE,
+                )
+            )
+        else:
+            plt_identity = compute_plt_identity(settings.plt_path)
+            if plt_identity is None:
+                diagnostics.append(
+                    _make_diagnostic(
+                        toolchain,
+                        tool="erlang_integration",
+                        query_kind="preflight",
+                        code="dialyzer_plt_unavailable",
+                        message="The configured Dialyzer PLT is missing or unreadable.",
+                        status=STATUS_STALE,
+                    )
+                )
+            elif toolchain.plt_identity != plt_identity:
+                diagnostics.append(
+                    _make_diagnostic(
+                        toolchain,
+                        tool="erlang_integration",
+                        query_kind="preflight",
+                        code="dialyzer_plt_mismatch",
+                        message=(
+                            "The configured Dialyzer PLT does not match the toolchain identity."
+                        ),
+                        status=STATUS_MISMATCH,
+                        metadata={
+                            "expected": toolchain.plt_identity,
+                            "observed": plt_identity,
+                        },
+                    )
+                )
+    if toolchain.diagnostics:
+        diagnostics.append(
+            _make_diagnostic(
+                toolchain,
+                tool="erlang_integration",
+                query_kind="preflight",
+                code="toolchain_probe_failed",
+                message="Required toolchain probes returned diagnostics.",
+                status=STATUS_FAILED,
+                metadata={"diagnostics": list(toolchain.diagnostics)[:32]},
+            )
+        )
+    return tuple(diagnostics)
 
 
 def _active_tools(queries: Iterable[EnrichmentQuery]) -> frozenset[str]:
@@ -1744,6 +1945,31 @@ def run_erlang_integration(
             )
     if not _repository_matches(root, toolchain):
         return _repository_mismatch_result(root, toolchain)
+    if settings.strict:
+        preflight_diagnostics = _strict_preflight(root, toolchain, settings)
+        if preflight_diagnostics:
+            cleanup_counts, cleanup_errors, _had_state = _disable_integration(store, root)
+            return _failure_result(
+                root,
+                code="erlang_preflight_blocked",
+                message=(
+                    "Required Erlang toolchain preflight failed; semantic execution was blocked."
+                ),
+                status="blocked",
+                toolchain=toolchain,
+                counts={
+                    "preflight_failures": len(preflight_diagnostics),
+                    "queries": 0,
+                    "evidence": 0,
+                    "projected_edges": 0,
+                    "cleared_edges": cleanup_counts.get("cleared_edges", 0),
+                    "cleared_evidence": cleanup_counts.get("cleared_evidence", 0),
+                    "cleared_diagnostics": cleanup_counts.get("cleared_diagnostics", 0),
+                    "cleared_runs": cleanup_counts.get("cleared_runs", 0),
+                    "cleanup_failures": len(cleanup_errors),
+                },
+                diagnostics=preflight_diagnostics,
+            )
     previous, previous_diagnostics, snapshot_failed = _snapshot_records_status(store, root)
     if snapshot_failed:
         return _failure_result(
@@ -1774,6 +2000,30 @@ def run_erlang_integration(
             code="erlang_enrichment_failed",
             message=f"Erlang enrichment failed: {type(exc).__name__}: {exc}",
             toolchain=toolchain,
+        )
+    if settings.strict and not enrichment.ok:
+        cleanup_counts, cleanup_errors, _had_state = _disable_integration(store, root)
+        strict_diagnostics = tuple(enrichment.diagnostics)
+        return _failure_result(
+            root,
+            code="erlang_semantic_execution_blocked",
+            message=(
+                "A required Erlang semantic adapter failed; no current semantic result "
+                "is available."
+            ),
+            status="blocked",
+            toolchain=toolchain,
+            counts={
+                "queries": len(enrichment.adapter_results),
+                "evidence": 0,
+                "projected_edges": 0,
+                "cleared_edges": cleanup_counts.get("cleared_edges", 0),
+                "cleared_evidence": cleanup_counts.get("cleared_evidence", 0),
+                "cleared_diagnostics": cleanup_counts.get("cleared_diagnostics", 0),
+                "cleared_runs": cleanup_counts.get("cleared_runs", 0),
+                "cleanup_failures": len(cleanup_errors),
+            },
+            diagnostics=strict_diagnostics,
         )
     # Compute the configured adapter set before exposing the result.  The
     # enrichment reconciler intentionally retains unrequested scopes for

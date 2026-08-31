@@ -132,9 +132,7 @@
     "known_side_effects": ["ELP may create workspace metadata unless ELP_HOME is redirected"]
   },
   "enforcement": {
-    "runtime_policy_enforced": false,
-    "status": "described_only",
-    "degraded_status": "degraded",
-    "diagnostic_code": "adapter_manifest_policy_not_enforced"
+    "runtime_policy_enforced": true,
+    "status": "enforced"
   }
 }

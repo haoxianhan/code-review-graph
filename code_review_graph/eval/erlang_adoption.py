@@ -497,6 +497,51 @@ def _load_corpus_artifact(
     return load_corpus(path), path.resolve()
 
 
+def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationConfig | None:
+    """Build the strict project profile declared by the evaluation manifest."""
+    adapters = manifest.get("adapters")
+    if not isinstance(adapters, Mapping):
+        return None
+    files = adapters.get("files")
+    if not isinstance(files, Mapping) or set(map(str.casefold, files)) != {
+        "generic", "elp", "xref", "dialyzer"
+    }:
+        return None
+    toolchain = manifest.get("toolchain")
+    tool_values = toolchain if isinstance(toolchain, Mapping) else {}
+    runtime = tool_values.get("runtime")
+    runtime_values = runtime if isinstance(runtime, Mapping) else {}
+    expected_otp = runtime_values.get("otp_version") or runtime_values.get("otp_release")
+    plt = tool_values.get("plt")
+    plt_path = plt.get("path") if isinstance(plt, Mapping) else None
+    if isinstance(plt_path, str):
+        target = manifest.get("target")
+        target_path = target.get("path") if isinstance(target, Mapping) else None
+        if isinstance(target_path, str) and not Path(plt_path).is_absolute():
+            plt_path = str(Path(target_path) / plt_path)
+    tools = tool_values.get("tools")
+    versions = tools if isinstance(tools, Mapping) else {}
+
+    def version(name: str) -> str | None:
+        value = versions.get(name)
+        if isinstance(value, Mapping) and value.get("version"):
+            return str(value["version"])
+        return None
+
+    return ErlangIntegrationConfig(
+        enabled=True,
+        strict=True,
+        include_xref=True,
+        include_dialyzer=True,
+        expected_otp=str(expected_otp) if expected_otp else None,
+        strict_otp_version=str(expected_otp) if expected_otp else None,
+        strict_elp_version=version("elp"),
+        strict_rebar3_version=version("rebar3"),
+        strict_dialyzer_version=version("dialyzer"),
+        plt_path=plt_path,
+    )
+
+
 def _invoke_with_optional_config(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Call lifecycle helpers while remaining friendly to small test doubles."""
     parameters: Mapping[str, inspect.Parameter]
@@ -6852,6 +6897,11 @@ def run_adoption_evaluation(
     )
     diagnostics.extend(gate_diagnostics)
     available_tools = _available_semantic_tools(environment)
+    effective_erlang_config = (
+        erlang_config
+        if erlang_config is not None
+        else _manifest_erlang_config(manifest_doc)
+    )
     observed_diagnostic_codes = {
         str(item.get("code"))
         for item in diagnostics
@@ -6874,7 +6924,7 @@ def run_adoption_evaluation(
                     lifecycle_runner=lifecycle_runner,
                     watch_smoke=watch_smoke,
                     watch_timeout=timeout,
-                    erlang_config=erlang_config,
+                    erlang_config=effective_erlang_config,
                 )
                 diagnostics.extend(lifecycle_diagnostics)
                 build_failed = lifecycle.get("full_build", {}).get("status") in {

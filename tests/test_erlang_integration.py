@@ -587,6 +587,96 @@ def test_toolchain_for_another_repository_is_rejected_before_running_tools(
         store.close()
 
 
+def test_strict_profile_blocks_missing_required_tool_before_adapter_execution(
+    tmp_path: Path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fixture(repo)
+    store = _store_and_build(repo, monkeypatch)
+    calls: list[tuple[str, ...]] = []
+    try:
+        result = run_erlang_integration(
+            repo,
+            store,
+            config=ErlangIntegrationConfig(
+                enabled=True,
+                strict=True,
+                queries={"callers_of": "worker:run/0"},
+                include_xref=True,
+                include_dialyzer=True,
+            ),
+            toolchain=ToolchainIdentity(
+                **{
+                    **_toolchain(repo).__dict__,
+                    "elp_executable": None,
+                    "elp_version": None,
+                    "dialyzer_executable": "/opt/dialyzer",
+                    "dialyzer_version": "5.3.1.1",
+                }
+            ),
+            runner=_elp_runner({}, calls),
+        )
+        assert result.status == "blocked"
+        assert any(item.code == "required_tool_unavailable" for item in result.diagnostics)
+        assert calls == []
+    finally:
+        store.close()
+
+
+def test_strict_profile_requires_matching_plt_and_adapter_set(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fixture(repo)
+    store = _store_and_build(repo, monkeypatch)
+    plt = tmp_path / "dialyzer.plt"
+    plt.write_bytes(b"strict-plt")
+    plt_identity = compute_plt_identity(plt)
+    assert plt_identity is not None
+    toolchain = ToolchainIdentity(
+        **{
+            **_toolchain(repo).__dict__,
+            "otp_executable": "/opt/erl",
+            "otp_version": "27.3.4.16",
+            "elp_version": "1.1.0+build-2026-01-15",
+            "rebar3_version": "3.27.0",
+            "dialyzer_executable": "/opt/dialyzer",
+            "dialyzer_version": "5.3.1.1",
+            "plt_identity": plt_identity,
+        }
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command, *, cwd, env, timeout):
+        calls.append(tuple(command))
+        if tuple(command) == toolchain.xref_command:
+            return CommandResult(0, "caller -> worker\n")
+        if tuple(command) == toolchain.dialyzer_command:
+            return CommandResult(0, "")
+        return CommandResult(0, json.dumps(_evidence_payload()))
+
+    try:
+        result = run_erlang_integration(
+            repo,
+            store,
+            config=ErlangIntegrationConfig(
+                enabled=True,
+                strict=True,
+                queries={"callers_of": "worker:run/0"},
+                include_xref=True,
+                include_dialyzer=True,
+                plt_path=plt,
+            ),
+            toolchain=toolchain,
+            runner=runner,
+        )
+        assert result.status == "ok"
+        assert tuple(toolchain.xref_command) in calls
+        assert tuple(toolchain.dialyzer_command) in calls
+    finally:
+        store.close()
+
+
 def test_snapshot_and_persistence_storage_errors_are_fail_soft(
     tmp_path: Path, monkeypatch
 ):

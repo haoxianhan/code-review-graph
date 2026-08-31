@@ -151,6 +151,13 @@ Failure at any step returns a blocking diagnostic and no semantic result. The
 preflight must never silently substitute another OTP installation, language
 server, PLT, or structural-only result.
 
+The `server_flexible` runtime profile enables strict preflight explicitly
+(`ErlangIntegrationConfig(strict=True)` or `CRG_ERLANG_STRICT=1`). Its checked
+manifest supplies the exact OTP, ELP, rebar3, Dialyzer, and PLT identities. A
+generic CRG caller that has not selected this project profile may keep the
+integration disabled; it must not claim to have completed Erlang semantic
+analysis.
+
 Commands that may evaluate configuration scripts, plugins, parse transforms,
 generate files, access the network, or write outside the analysis workspace
 run only in the adapter's controlled execution boundary. The boundary uses
