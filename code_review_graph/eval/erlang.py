@@ -35,7 +35,6 @@ GENERATED_MESSAGE_RE = re.compile(r'DATA_MESSAGE="(?P<value>.*)"')
 CFG_REV_RE = re.compile(r'data_revision\s*=>\s*"(?P<value>[^"]+)"')
 CFG_VERSION_RE = re.compile(r'cfg_version\s*=>\s*"(?P<value>[^"]+)"')
 SVN_TIME_RE = re.compile(r'svn_revision\s*=>\s*<<"(?P<value>[^"]+)"')
-OTP_PATH_RE = re.compile(r"^\s*otp_path\s*:\s*[\"'](?P<value>[^\"']+)", re.MULTILINE)
 
 REQUIRED_MANIFEST_KEYS = {
     "schema_version",
@@ -1728,14 +1727,11 @@ def _discover_toolchain(
             )
         )
 
-    configured_otp_path = None
     config_path = _resolve_contained_target_path(
         target_root,
         "erlang_ls.config",
         "toolchain.erlang_ls.config",
     )
-    config_text = _read_text(config_path)
-    configured_otp_path = _match_text(OTP_PATH_RE, config_text)
     runtime_output = tools["erl"].get("version_output") or ""
     runtime_otp = None
     runtime_erts = None
@@ -1750,7 +1746,6 @@ def _discover_toolchain(
         "runtime": {
             "otp_release": runtime_otp,
             "erts_version": runtime_erts,
-            "configured_otp_path": configured_otp_path,
         },
         "configuration": {
             "files": [
@@ -1789,19 +1784,6 @@ def _discover_toolchain(
             },
         },
     }
-    if configured_otp_path and runtime_otp:
-        configured_match = re.search(r"(?:kerl/)?([0-9]+(?:\.[0-9]+)+)", configured_otp_path)
-        if configured_match and not runtime_otp.startswith(configured_match.group(1)):
-            diagnostics.append(
-                _diagnostic(
-                    "otp_config_runtime_mismatch",
-                    "error",
-                    "erlang_ls.config points at a different OTP release than the runtime probe.",
-                    configured_otp_path=configured_otp_path,
-                    runtime_otp_release=runtime_otp,
-                )
-            )
-
     expected_tools = manifest_toolchain.get("tools", {})
     if isinstance(expected_tools, Mapping):
         for name, expected_item in expected_tools.items():

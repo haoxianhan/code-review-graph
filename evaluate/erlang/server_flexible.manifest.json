@@ -68,7 +68,7 @@
       "path": "_build/default/rebar3_27.3.4.16_plt",
       "sha256": "0188c055f9063cf1d8f91fc5249d7a19a85d74ab5c6a3a125d91967fcf384a8b"
     },
-    "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl", "project_configured_otp_path": "/home/haoxian/kerl/25.3.2/"},
+    "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl"},
     "configuration": {
       "files": ["rebar.config", "rebar.config.script", "erlang_ls.config", ".elp_lint.toml"],
       "execute_during_discovery": false,
@@ -98,7 +98,6 @@
   },
   "analysis": {"cache_paths": [".code-review-graph", "_build/default", "_build/test", "server_ai/indexer/modules.json", "server_ai/indexer/records.json"]},
   "diagnostics": [
-    {"code": "project_otp_configuration_stale", "severity": "error", "message": "server_flexible/erlang_ls.config still references the historical /home/haoxian/kerl/25.3.2/ installation; the required runtime is OTP 27.3.4.16 from the current system profile."},
     {"code": "lifecycle_metrics_auxiliary_only", "severity": "warning", "message": "Lifecycle measurements are recorded in server_flexible.performance.json; adoption remains auxiliary until every gate is green."}
   ]
 }

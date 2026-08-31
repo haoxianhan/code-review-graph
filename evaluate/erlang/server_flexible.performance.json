@@ -49,7 +49,6 @@
   "verdict": "auxiliary_review_context_only",
   "limitations": [
     "Historical lifecycle samples were collected before the strict ELP requirement was installed; rerun required-adapter lifecycle checks before adoption.",
-    "server_flexible/erlang_ls.config still references the historical OTP 25 path; the required runtime baseline is OTP 27.3.4.16.",
     "Adapter runtime sandbox policy is descriptive and not enforced by the evaluator.",
     "Layout-only was not run, and complete lifecycle repeatability remains unverified."
   ]

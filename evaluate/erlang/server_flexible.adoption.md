@@ -50,10 +50,9 @@ The performance report records the post-optimization samples and the commit
 that produced them in `server_flexible.performance.json`. Restore-to-HEAD and
 layout-only were not run in this pass.
 
-The target's `erlang_ls.config` still references the historical OTP 25 path,
-and the current checkout has a dirty `apps/server_mongodb` submodule. Adapter
-runtime sandbox policy remains descriptive rather than enforced, and the
-strict required-adapter lifecycle has not been rerun after installing ELP. The
+The current checkout and submodule gitlinks are clean. Adapter runtime sandbox
+policy remains descriptive rather than enforced, and the strict
+required-adapter lifecycle has not been rerun after installing ELP. The
 adoption verdict remains `auxiliary_review_context_only`; Erlang is not a sole
 blocking-review source.
 
