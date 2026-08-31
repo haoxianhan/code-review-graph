@@ -2314,9 +2314,16 @@ def incremental_update(
     # graph, so this ordering lets us retain consumers even when a deleted
     # header's incoming edge would otherwise be removed with its node.
     stage_started = time.perf_counter()
+    # A clean no-op already has canonical header/record state from the last
+    # build.  Avoid rescanning every Erlang import/reference edge; changed or
+    # stale paths still run the pre-pass before dependency discovery.
     erlang_header_pre_stats = (
         _run_erlang_header_resolver(store, repo_root)
-        if store.has_nodes_for_language("erlang")
+        if (
+            changed_files
+            and any(_is_erlang_relevant_path(path) for path in changed_files)
+            and store.has_nodes_for_language("erlang")
+        )
         else None
     )
     stage_timing["header_pre_s"] = max(

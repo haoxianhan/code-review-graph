@@ -123,6 +123,31 @@ def test_erlang_extensions_work_through_build_update_postprocess_and_forget(
         store.close()
 
 
+def test_erlang_noop_update_skips_header_resolver(tmp_path, monkeypatch):
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_fixture(repo)
+    store = GraphStore(repo / "graph.db")
+    try:
+        full_build(repo, store)
+        calls = 0
+
+        def resolver(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return {}
+
+        monkeypatch.setattr(
+            "code_review_graph.incremental._run_erlang_header_resolver", resolver
+        )
+        result = incremental_update(repo, store, changed_files=[])
+        assert result["files_updated"] == 0
+        assert calls == 0
+    finally:
+        store.close()
+
+
 def test_uppercase_erlang_header_change_reparses_include_dependents(
     tmp_path: Path, monkeypatch
 ) -> None:
