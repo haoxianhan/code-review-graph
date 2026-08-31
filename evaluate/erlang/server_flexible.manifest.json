@@ -62,7 +62,7 @@
       "erl": {"command": ["erl", "-noshell"], "path": "/etc/profiles/per-user/haoxian/bin/erl", "version": "27.3.4.16", "status": "available"},
       "rebar3": {"command": ["rebar3", "version"], "path": "/etc/profiles/per-user/haoxian/bin/rebar3", "version": "3.27.0", "status": "available"},
       "dialyzer": {"command": ["dialyzer", "--version"], "path": "/etc/profiles/per-user/haoxian/bin/dialyzer", "version": "5.3.1.1", "status": "available"},
-      "elp": {"command": ["elp", "version"], "path": "/etc/profiles/per-user/haoxian/bin/elp", "version": "1.1.0+build-2026-01-15", "status": "available"}
+      "elp": {"command": ["elp", "version"], "path": "/home/haoxian/.nix-profile/bin/elp", "version": "1.1.0+build-2026-01-15", "status": "available"}
     },
     "plt": {
       "path": "_build/default/rebar3_27.3.4.16_plt",

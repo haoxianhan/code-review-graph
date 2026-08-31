@@ -1777,14 +1777,25 @@ def discover_toolchain(
     *,
     runner: CommandRunner | None = None,
     timeout: float = 2.0,
+    probe_root: str | Path | None = None,
     environment: Mapping[str, str] | None = None,
     source_revision: str | None = None,
     generated_data_revision: str | None = None,
     generated_data_paths: Iterable[str | Path] | None = None,
     plt_path: str | Path | None = None,
 ) -> ToolchainIdentity:
-    """Discover Erlang tooling without evaluating project code."""
+    """Discover Erlang tooling without evaluating project code.
+
+    Version probes run from a repository-independent directory.  In
+    particular, ``rebar3 --version`` must not inherit the target checkout as
+    its cwd because rebar3 can load project plugins and configuration before
+    printing its version.  Git and the actual semantic adapter tasks still
+    use ``repo_root`` explicitly.
+    """
     root = Path(repo_root).expanduser().resolve()
+    probe_cwd = Path(probe_root or Path(__file__).resolve().parent).expanduser().resolve()
+    if not probe_cwd.is_dir():
+        raise ValueError(f"Toolchain probe root is not a directory: {probe_cwd}")
     command_runner = runner or _default_discovery_runner
     safe_timeout = _safe_timeout(timeout)
     supplied_env = _controlled_environment(environment)
@@ -1828,7 +1839,7 @@ def discover_toolchain(
         otp_executable,
         otp_command,
         tool="otp",
-        cwd=root,
+        cwd=probe_cwd,
         env=command_env,
         timeout=safe_timeout,
         runner=command_runner,
@@ -1838,7 +1849,7 @@ def discover_toolchain(
         elp_executable,
         elp_command,
         tool="elp",
-        cwd=root,
+        cwd=probe_cwd,
         env=command_env,
         timeout=safe_timeout,
         runner=command_runner,
@@ -1848,7 +1859,7 @@ def discover_toolchain(
         rebar3_executable,
         rebar3_command,
         tool="rebar3",
-        cwd=root,
+        cwd=probe_cwd,
         env=command_env,
         timeout=safe_timeout,
         runner=command_runner,
@@ -1858,7 +1869,7 @@ def discover_toolchain(
         dialyzer_executable,
         dialyzer_probe_command,
         tool="dialyzer",
-        cwd=root,
+        cwd=probe_cwd,
         env=command_env,
         timeout=safe_timeout,
         runner=command_runner,

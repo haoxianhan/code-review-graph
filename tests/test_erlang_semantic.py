@@ -461,3 +461,34 @@ def test_discovery_records_elp_otp_hint_and_timeout(monkeypatch, tmp_path: Path)
     assert all(key != "SECRET_TOKEN" for key, _ in identity.environment)
     assert any(item.startswith("otp_timeout:") for item in identity.diagnostics)
     assert ("/usr/bin/elp", "version") in calls
+
+
+def test_toolchain_version_probes_do_not_use_repository_cwd(monkeypatch, tmp_path: Path):
+    executable_paths = {
+        "erl": "/usr/bin/erl",
+        "elp": "/usr/bin/elp",
+        "rebar3": "/usr/bin/rebar3",
+        "dialyzer": "/usr/bin/dialyzer",
+    }
+    monkeypatch.setattr("code_review_graph.erlang_semantic.shutil.which", executable_paths.get)
+    calls = []
+
+    def run(command, *, cwd, env, timeout):
+        calls.append((tuple(command), cwd))
+        if command[0] == "git":
+            return CommandResult(0, "revision\n")
+        if command[0] == "/usr/bin/erl":
+            return CommandResult(0, "otp=27.3.4.16\nerts=15.2.7.12")
+        if command[0] == "/usr/bin/elp":
+            return CommandResult(0, "elp 1.1.0+build-2026-01-15")
+        if command[0] == "/usr/bin/rebar3":
+            return CommandResult(0, "rebar 3.27.0")
+        if command[0] == "/usr/bin/dialyzer":
+            return CommandResult(0, "Dialyzer version v5.3.1.1")
+        return CommandResult(127)
+
+    discover_toolchain(tmp_path, runner=run)
+
+    version_probes = [(command, cwd) for command, cwd in calls if command[0] != "git"]
+    assert version_probes
+    assert all(cwd != tmp_path.resolve() for _command, cwd in version_probes)
