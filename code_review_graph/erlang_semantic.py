@@ -2604,13 +2604,28 @@ def _elp_lsp_query(
                         relation_target, _ = (
                             source_endpoint if endpoint_key == "from" else other_endpoint
                         )
+                        source_path = (
+                            other_endpoint[1]
+                            if endpoint_key == "from"
+                            else source_endpoint[1]
+                        )
+                        source_name = source.rsplit(".", 1)[-1]
+                        is_test_source = (
+                            "/test/" in source_path
+                            or Path(source_path).name.endswith(("_SUITE.erl", "_tests.erl"))
+                            or "_test" in source_name
+                        )
                         relation_values.append({
-                            "kind": "CALLS",
+                            "kind": (
+                                "TESTED_BY"
+                                if query_kind == "tests_for" and is_test_source
+                                else "CALLS"
+                            ),
                             "source": source,
                             "target": relation_target,
                             "metadata": {"lsp_method": method, "target_name": wanted_name},
                         })
-                if query_kind in {"references", "enrichment", "tests_for"}:
+                if query_kind in {"references", "enrichment"}:
                     response = request(
                         "textDocument/references",
                         {
@@ -2628,19 +2643,25 @@ def _elp_lsp_query(
                             if not path:
                                 continue
                             start = reference.get("range", {}).get("start", {})
-                            line = (
-                                int(start.get("line", 0)) + 1
-                                if isinstance(start, Mapping)
-                                else 1
+                            if not isinstance(start, Mapping):
+                                continue
+                            prepared = request(
+                                "textDocument/prepareCallHierarchy",
+                                {
+                                    "textDocument": {"uri": reference.get("uri")},
+                                    "position": start,
+                                },
                             )
+                            prepared_values = prepared.get("result")
+                            if not isinstance(prepared_values, list) or not prepared_values:
+                                continue
+                            source_endpoint = _lsp_item_endpoint(prepared_values[0], root)
+                            if source_endpoint is None:
+                                continue
                             relation_values.append(
                                 {
-                                    "kind": (
-                                        "TESTED_BY"
-                                        if query_kind == "tests_for"
-                                        else "REFERENCES"
-                                    ),
-                                    "source": f"{path}::line-{line}",
+                                    "kind": "REFERENCES",
+                                    "source": source_endpoint[0],
                                     "target": target,
                                     "metadata": {"lsp_method": "textDocument/references"},
                                 }
