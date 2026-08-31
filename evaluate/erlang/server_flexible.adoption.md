@@ -1,64 +1,84 @@
 # Erlang Adoption Evaluation: server_flexible
 
-This report evaluates the fixed `server_flexible` revision
-`bc8a4424ffd70006ba482f15aa7c61199af34b71` with generated-data revision
-`35021`. The target checkout was clean and its submodule gitlinks matched the
-manifest. The target was read-only throughout the evaluation.
+- Verdict: `blocked`
+- Pass: `false`
+- Target revision: `fd65517bb3d359d489520f1b3630493144962482`
+- Generated-data revision: `53569`
+- Clean baseline: `true`
+- Read-only target: `true`
 
-The current required toolchain baseline is OTP `27.3.4.16` (ERTS
-`15.2.7.12`), `rebar3` `3.27.0`, Dialyzer `5.3.1.1`, and ELP CLI
-`1.1.0+build-2026-01-15`. The historical report below predates the ELP
-installation and is retained as a measurement record; it is not evidence that
-the current strict preflight has passed.
+This is the current strict-policy evaluation of the fixed `server_flexible`
+revision. The target checkout and submodule gitlinks matched the manifest. CRG
+did not modify the target repository, generated outputs, or project
+configuration.
+
+## Toolchain
+
+The required baseline was available during preflight:
+
+| Component | Observed |
+| --- | --- |
+| Erlang/OTP | `27.3.4.16` (`ERTS 15.2.7.12`) |
+| `rebar3` | `3.27.0` |
+| Dialyzer | `5.3.1.1` |
+| ELP CLI | `1.1.0+build-2026-01-15` |
+| Dialyzer PLT | `_build/default/rebar3_27.3.4.16_plt`, SHA256 `e926642461efeadc3e571a2225d2c0ac69181a259d11946d608a658783e8254a` |
+
+Generated-data markers were present and consistent: `DATA_REV=53569`,
+structure revision `53569`, and config version
+`2cdad7c1e46279b6a6275058ee344b86`.
 
 ## Corpus
 
-The checked-in corpus contains manually reviewed callers, header/record,
-behaviour, supervisor MFA, Common Test, EUnit, generated-data, unresolved,
-fallback, and stale-cache cases. Against the existing pinned graph profile
-(`/tmp/crg-profile.db`, 1,099 files, 47,694 nodes, 131,175 edges), the eight
-resolved relation cases produced:
-
-| Metric | Result | Gate |
-| --- | ---: | --- |
-| Resolved relation precision | 1.0 | pass |
-| Resolved relation recall | 1.0 | pass |
-| Function Recall@10 | 1.0 | pass |
-| Module Recall@10 | 1.0 | pass |
-| Impact coverage (depth 1) | 1.0 | pass |
-| Forbidden relation matches | 0 | pass |
-| Targeted-query p95 | 299.096 ms | pass, budget 2,000 ms |
-
-The unresolved case retained one `CALLS` candidate for
-`cfg_account_bag:find/1`. The fallback case observed `elp_unavailable`; the
-stale-cache case observed two `CACHE_REJECTED` records for unkeyed generated
-artifacts.
+The corpus declares local and remote callers, headers/records, behaviours,
+supervisor MFA, Common Test, EUnit, generated data, unresolved dynamic calls,
+and stale-cache cases. The corpus run was not reached because strict semantic
+preflight rejected the project-level xref result. Consequently precision,
+recall, Recall@10, impact coverage, and targeted latency are unmeasured in
+this current run; no historical metric is carried forward as current evidence.
 
 ## Lifecycle And Adoption
 
-The post-optimization lifecycle probe used disposable copies of the same clean
-pinned checkout. Three full-build samples (including the full postprocess
-boundary) were `28.169`, `27.448`, and `26.949 s`; the interpolated p95 is
-`28.097 s`, below the `30 s` budget. Three one-file incremental samples were
-`5.689`, `5.416`, and `5.091 s`, and two no-op samples were `0.233` and
-`0.237 s`. A standalone postprocess sample was `10.403 s`. These measurements
-cover the optimized stage behavior, but a complete evaluator rerun covering
-watch, forget, and all lifecycle parity checks was not completed, so those
-adoption gates remain unverified.
+The full-build lifecycle reached the required adapter preflight and executed
+`rebar3 xref`, but xref returned non-zero after reporting the project's
+undefined-call warnings. Strict policy treats that result as a blocking
+`xref_failed` error. The lifecycle stopped before semantic adapter envelopes
+could be verified, so incremental update, watch, forget, standalone
+postprocess, and lifecycle parity were not run.
 
-The performance report records the post-optimization samples and the commit
-that produced them in `server_flexible.performance.json`. Restore-to-HEAD and
-layout-only were not run in this pass.
+| Gate | Result | Reason |
+| --- | --- | --- |
+| Required tools available | pass | ELP, xref/rebar3, Dialyzer, and matching PLT were available |
+| Generated-data consistency | pass | `DATA_REV=53569` and config markers matched the manifest |
+| Full build | blocked | `erlang_semantic_execution_blocked`, `xref_failed` |
+| Corpus precision/recall/impact | not run | full build was blocked before corpus queries |
+| Incremental/watch/forget/postprocess | not run | lifecycle execution stopped at full build |
+| Adoption | blocked | required semantic lifecycle and all adoption gates are incomplete |
 
-The current checkout and submodule gitlinks are clean. Adapter runtime sandbox
-policy remains descriptive rather than enforced, and the strict
-required-adapter lifecycle has not been rerun after installing ELP. The
-adoption verdict remains `auxiliary_review_context_only`; Erlang is not a sole
-blocking-review source.
+The adoption verdict remains `auxiliary_review_context_only`. Erlang is not a
+sole source of blocking-review evidence until every gate in
+`erlang-support-plan.md` is green.
 
-Reproduction inputs:
+## Blocking Diagnostics
+
+- `project_config_script_not_executed` (info): `rebar.config.script` was
+  intentionally not executed during discovery.
+- `full_build_failed` (error): full build failed with
+  `RuntimeError: Erlang strict preflight blocked operation
+  (erlang_semantic_execution_blocked, xref_failed)`.
+- `graph_build_failed` (error): the same strict xref failure prevented graph
+  construction and all downstream evaluation.
+
+## Reproduction
+
+Inputs:
 
 - `server_flexible.manifest.json`
 - `corpus.json`
 - `server_flexible.performance.json`
-- `CRG_SERIAL_PARSE=1 .venv/bin/python -m code_review_graph.eval.erlang_adoption --manifest evaluate/erlang/server_flexible.manifest.json --corpus evaluate/erlang/corpus.json --target /tmp/crg-server-flexible-pinned-1788067717 --probe-root . --output-dir /tmp/crg-adoption-report-core`
+
+Command used for the current report:
+
+```text
+CRG_SERIAL_PARSE=1 .venv/bin/python -m code_review_graph.eval.erlang_adoption --manifest evaluate/erlang/server_flexible.manifest.json --corpus evaluate/erlang/corpus.json --target /tmp/crg-server-flexible-exec2.1My0wH --probe-root . --output-dir /tmp/crg-adoption-report-final
+```
