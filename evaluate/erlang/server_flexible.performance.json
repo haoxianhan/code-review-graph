@@ -3,11 +3,17 @@
   "kind": "erlang_performance_report",
   "target": {
     "name": "server_flexible",
-    "revision": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
-    "generated_data_revision": "35021",
+    "revision": "fd65517bb3d359d489520f1b3630493144962482",
+    "generated_data_revision": "53569",
     "manifest": "server_flexible.manifest.json"
   },
   "measurement": {
+    "status": "historical_samples_not_current_baseline",
+    "sample_target": {
+      "revision": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
+      "generated_data_revision": "35021",
+      "note": "Timing samples below were collected before the current fd65517/53569 strict adoption run and must not be used as current gate evidence."
+    },
     "machine": "vm-dev",
     "toolchain_baseline": {
       "otp_version": "27.3.4.16",
@@ -41,10 +47,18 @@
   },
   "budgets_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000},
   "gates": {
+    "scope": "historical_samples",
     "full_build_p95": {"observed_ms": 28097.307, "budget_ms": 30000, "pass": true},
     "targeted_query_p95": {"observed_ms": 299.096, "budget_ms": 2000, "pass": true},
     "layout_only": {"pass": false, "reason": "not_run"},
     "lifecycle_repeatability": {"pass": false, "reason": "A complete evaluator rerun covering watch, forget, and standalone parity was not completed after the optimization."}
+  },
+  "current_evaluation": {
+    "status": "blocked",
+    "revision": "fd65517bb3d359d489520f1b3630493144962482",
+    "generated_data_revision": "53569",
+    "gates": "not_run",
+    "blocking_reason": "rebar3 xref returned non-zero for project undefined-call warnings; strict semantic preflight stopped the lifecycle before corpus and timing gates."
   },
   "verdict": "auxiliary_review_context_only",
   "limitations": [
