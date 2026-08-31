@@ -1664,6 +1664,12 @@ def _extract_version(output: str, *, tool: str) -> str | None:
         # that exact token over an unrelated runtime version in stderr.
         match = re.search(r"\b(\d{2,3})(?:\.\d+)?\b", text)
         return match.group(1) if match else None
+    if tool == "elp":
+        # ELP release identity includes build metadata.  Dropping the suffix
+        # makes strict profiles reject the same executable that their
+        # manifest recorded.
+        match = re.search(r"(?:^|\s)elp\s+(\S+)", text, re.IGNORECASE)
+        return match.group(1) if match else None
     match = _VERSION_RE.search(text)
     return match.group(1) if match else None
 

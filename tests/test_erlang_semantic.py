@@ -487,8 +487,9 @@ def test_toolchain_version_probes_do_not_use_repository_cwd(monkeypatch, tmp_pat
             return CommandResult(0, "Dialyzer version v5.3.1.1")
         return CommandResult(127)
 
-    discover_toolchain(tmp_path, runner=run)
+    identity = discover_toolchain(tmp_path, runner=run)
 
     version_probes = [(command, cwd) for command, cwd in calls if command[0] != "git"]
     assert version_probes
     assert all(cwd != tmp_path.resolve() for _command, cwd in version_probes)
+    assert identity.elp_version == "1.1.0+build-2026-01-15"
