@@ -80,13 +80,13 @@ def test_missing_or_invalid_policy_is_observable(tmp_path: Path):
         ),
         (
             lambda manifest: manifest["invocation"].update(
-                argv=["elp", "query", "--unsafe", "{query_kind}", "{query_targets}"]
+                argv=["elp", "server", "--unsafe"]
             ),
             "approved flag",
         ),
         (
             lambda manifest: manifest["invocation"].update(
-                argv=["elp", "query", "{unknown}", "{query_kind}", "{query_targets}"]
+                argv=["elp", "server", "{unknown}"]
             ),
             "unsupported template placeholder",
         ),
@@ -94,13 +94,10 @@ def test_missing_or_invalid_policy_is_observable(tmp_path: Path):
             (
                 lambda manifest, character=character: manifest["invocation"].update(
                     argv=[
-                        "elp",
-                        "query",
-                        f"--format{character}evil",
-                        "json",
-                        "{query_kind}",
-                        "{query_targets}",
-                    ]
+                            "elp",
+                            "server",
+                            f"--format{character}evil",
+                        ]
                 ),
                 "shell metacharacters",
             )
@@ -109,13 +106,10 @@ def test_missing_or_invalid_policy_is_observable(tmp_path: Path):
         (
             lambda manifest: manifest["invocation"].update(
                 argv=[
-                    "elp",
-                    "query",
-                    "--format",
-                    "json value",
-                    "{query_kind}",
-                    "{query_targets}",
-                ]
+                        "elp",
+                        "server",
+                        "json value",
+                    ]
             ),
             "single argv token",
         ),

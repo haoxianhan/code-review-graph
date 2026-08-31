@@ -31,6 +31,43 @@ from code_review_graph.erlang_semantic import (
 )
 
 
+def test_elp_default_invocation_uses_server_protocol(tmp_path: Path, monkeypatch):
+    toolchain = _toolchain(tmp_path, elp_executable="/opt/elp", elp_version="1.1.0")
+    observed: dict[str, object] = {}
+
+    def fake_lsp(executable, root, query_kind, targets, *, environment, timeout):
+        observed.update(
+            executable=executable,
+            root=root,
+            query_kind=query_kind,
+            targets=targets,
+            environment=environment,
+            timeout=timeout,
+        )
+        return CommandResult(
+            0,
+            json.dumps(
+                {
+                    "evidence": [
+                        {
+                            "kind": "CALLS",
+                            "source": "src/caller.erl::caller.run/0",
+                            "target": "worker:run/1",
+                        }
+                    ]
+                }
+            ),
+        )
+
+    monkeypatch.setattr("code_review_graph.erlang_semantic._elp_lsp_query", fake_lsp)
+    result = ELPAdapter(toolchain).query(tmp_path, "callers_of", "worker:run/1")
+
+    assert result.status == STATUS_OK
+    assert result.command == ("/opt/elp", "server")
+    assert observed["query_kind"] == "callers_of"
+    assert observed["targets"] == ("worker:run/1",)
+
+
 def _toolchain(
     tmp_path: Path,
     *,

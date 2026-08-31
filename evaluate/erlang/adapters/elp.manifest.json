@@ -18,12 +18,12 @@
   },
   "invocation": {
     "mode": "argv",
-    "argv": ["elp", "query", "--format", "json", "{query_kind}", "{query_targets}"],
+    "argv": ["elp", "server"],
     "executable": "elp",
     "command_allowlist": {
       "executables": ["elp"],
-      "subcommands": ["query"],
-      "flags": ["--format", "json"],
+      "subcommands": ["server"],
+      "flags": [],
       "reject_shell_metacharacters": true
     },
     "shell": false,

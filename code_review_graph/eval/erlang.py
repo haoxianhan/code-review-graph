@@ -513,12 +513,19 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
                     "token is not an approved flag or template placeholder",
                 )
         if adapter == "elp":
-            for placeholder in allowed_placeholders:
-                if argv.count(placeholder) != 1:
+            if argv[1] == "server":
+                if any(argv.count(placeholder) for placeholder in allowed_placeholders):
                     raise _error(
                         f"{source}.invocation.argv",
-                        f"ELP command must contain exactly one {placeholder} placeholder",
+                        "ELP server invocation must not contain query placeholders",
                     )
+            else:
+                for placeholder in allowed_placeholders:
+                    if argv.count(placeholder) != 1:
+                        raise _error(
+                            f"{source}.invocation.argv",
+                            f"ELP command must contain exactly one {placeholder} placeholder",
+                        )
 
     timeout = _mapping(document["timeout"], f"{source}.timeout")
     default_seconds = timeout.get("default_seconds")

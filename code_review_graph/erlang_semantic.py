@@ -16,9 +16,9 @@ The public boundary is intentionally small:
 * :class:`EvidenceCache` persists only records whose :class:`AnalysisKey`
   matches exactly.
 
-The concrete ELP protocol is kept configurable through ``command_builder``.
-The default builder expects a bounded JSON command-line interface, which is a
-safe adapter contract while deployments choose their ELP invocation mode.
+ELP 1.1 exposes semantic relations through its LSP server.  The default
+adapter uses that protocol; ``command_builder`` remains available as a small
+test/deployment injection point for line-oriented JSON adapters.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -2296,6 +2297,378 @@ class _BaseAdapter:
 CommandBuilder = Callable[[str, str, tuple[str, ...]], Sequence[str]]
 
 
+def _lsp_uri(path: Path) -> str:
+    """Encode a local path using the URI form required by LSP."""
+    return "file://" + urllib.parse.quote(path.as_posix())
+
+
+def _lsp_path(uri: Any, root: Path) -> str | None:
+    """Convert a repository-local LSP URI to a canonical path."""
+    if not isinstance(uri, str) or not uri.startswith("file://"):
+        return None
+    parsed = urllib.parse.urlparse(uri)
+    try:
+        path = Path(urllib.parse.unquote(parsed.path)).resolve(strict=False)
+        path.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return path.as_posix()
+
+
+def _lsp_position(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        line = int(value.get("line"))
+        character = int(value.get("character"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if line < 0 or character < 0:
+        return None
+    return line, character
+
+
+def _lsp_item_endpoint(item: Mapping[str, Any], root: Path) -> tuple[str, str] | None:
+    """Return a stable function endpoint and its source path from a call item."""
+    path = _lsp_path(item.get("uri"), root)
+    name = str(item.get("name", "")).strip()
+    if not path or not name:
+        return None
+    module = Path(path).stem
+    return f"{path}::{module}.{name}", path
+
+
+def _read_lsp_message(stream: Any, timeout: float) -> Mapping[str, Any] | None:
+    """Read one Content-Length framed JSON-RPC message."""
+    import select
+
+    ready, _, _ = select.select([stream], [], [], timeout)
+    if not ready:
+        return None
+    header = b""
+    while b"\r\n\r\n" not in header:
+        chunk = os.read(stream.fileno(), 1)
+        if not chunk:
+            return None
+        header += chunk
+        if len(header) > 16_384:
+            raise ValueError("ELP LSP headers exceed the bounded size")
+    raw_headers, body = header.split(b"\r\n\r\n", 1)
+    length: int | None = None
+    for raw_line in raw_headers.split(b"\r\n"):
+        name, separator, value = raw_line.partition(b":")
+        if separator and name.lower() == b"content-length":
+            try:
+                length = int(value.strip())
+            except ValueError as exc:
+                raise ValueError("ELP LSP Content-Length is invalid") from exc
+            break
+    if length is None or length < 0 or length > _MAX_OUTPUT_CHARS:
+        raise ValueError("ELP LSP Content-Length is outside the bounded range")
+    while len(body) < length:
+        chunk = os.read(stream.fileno(), length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    payload = json.loads(body[:length].decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("ELP LSP response must be a JSON object")
+    return payload
+
+
+def _write_lsp_message(stream: Any, payload: Mapping[str, Any]) -> None:
+    body = _canonical_json(payload).encode("utf-8")
+    stream.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+    stream.flush()
+
+
+def _elp_lsp_query(
+    executable: str,
+    root: Path,
+    query_kind: str,
+    targets: tuple[str, ...],
+    *,
+    environment: Mapping[str, str],
+    timeout: float,
+) -> CommandResult:
+    """Execute one bounded ELP LSP query and return CRG JSON evidence.
+
+    ELP 1.1 exposes semantic relations through its LSP server, not a
+    ``query`` subcommand.  This small client handles the server's progress and
+    capability requests while keeping the adapter's persisted output in the
+    existing JSON evidence contract.
+    """
+    started = time.perf_counter()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            [executable, "server"],
+            cwd=str(root),
+            env=dict(environment),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # ELP emits high-volume telemetry while loading a repository.  A
+            # pipe that is not drained can block the JSON-RPC protocol; CRG
+            # keeps the bounded command result and diagnostics instead.
+            stderr=subprocess.DEVNULL,
+        )
+        if process.stdin is None or process.stdout is None:
+            raise OSError("ELP server pipes were not created")
+        next_id = 1
+        def request(
+            method: str, params: Mapping[str, Any], *, retries: int = 40
+        ) -> Mapping[str, Any]:
+            nonlocal next_id
+            request_id = next_id
+            next_id += 1
+            _write_lsp_message(
+                process.stdin,
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+            )
+            deadline = time.monotonic() + _safe_timeout(timeout)
+            attempts = 0
+            while time.monotonic() < deadline:
+                message = _read_lsp_message(process.stdout, 1.0)
+                if message is None:
+                    if process.poll() is not None:
+                        raise OSError("ELP LSP server exited before answering")
+                    continue
+                message_id = message.get("id")
+                method_name = message.get("method")
+                if method_name is not None and message_id is not None:
+                    # ELP sends configuration, registration, and progress
+                    # requests to the client while loading the project.
+                    response: dict[str, Any] = {
+                        "jsonrpc": "2.0",
+                        "id": message_id,
+                        "result": [{}] if method_name == "workspace/configuration" else None,
+                    }
+                    _write_lsp_message(process.stdin, response)
+                    continue
+                if message_id != request_id:
+                    continue
+                error = message.get("error")
+                if (
+                    isinstance(error, Mapping)
+                    and error.get("code") == -32801
+                    and attempts < retries
+                ):
+                    attempts += 1
+                    time.sleep(0.25)
+                    _write_lsp_message(
+                        process.stdin,
+                        {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+                    )
+                    continue
+                return message
+            raise TimeoutError(f"ELP LSP request timed out: {method}")
+
+        initialized = request(
+            "initialize",
+            {
+                "processId": None,
+                "rootUri": _lsp_uri(root),
+                "capabilities": {},
+                "workspaceFolders": [{"uri": _lsp_uri(root), "name": root.name}],
+            },
+        )
+        if "error" in initialized:
+            raise RuntimeError(str(initialized["error"]))
+        _write_lsp_message(process.stdin, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+        def target_parts(target: str) -> tuple[str | None, str]:
+            text = target.strip()
+            if "::" in text:
+                text = text.rsplit("::", 1)[1]
+            if ":" in text:
+                module, text = text.rsplit(":", 1)
+            elif "." in text:
+                module, text = text.rsplit(".", 1)
+            else:
+                module = None
+            module = module.strip("' ")
+            return module or None, text.strip()
+
+        def symbol_name(target: str) -> tuple[str, int | None]:
+            text = target_parts(target)[1]
+            match = re.fullmatch(r"([^/]+)/([0-9]+)", text)
+            if match:
+                return match.group(1), int(match.group(2))
+            return text, None
+
+        def target_module(target: str) -> str | None:
+            module, _name = target_parts(target)
+            return Path(module).stem if module and ("/" in module or "\\" in module) else module
+
+        def module_name(path: Path) -> str:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return path.stem
+            match = re.search(r"^-module\s*\(\s*'?([^'()]+)'?\s*\)", text, re.MULTILINE)
+            return match.group(1).strip() if match else path.stem
+
+        def function_position(path: Path, name: str, arity: int | None) -> tuple[int, int] | None:
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return None
+            pattern = re.compile(rf"^\s*({re.escape(name)})\s*\(([^)]*)\)")
+            for line_number, line in enumerate(lines):
+                match = pattern.match(line)
+                if not match:
+                    continue
+                arguments = match.group(2).strip()
+                found_arity = 0 if not arguments else arguments.count(",") + 1
+                if arity is None or found_arity == arity:
+                    return line_number, match.start(1)
+            return None
+
+        def candidate_files(target: str, module: str | None) -> Iterable[Path]:
+            path_part = target.split("::", 1)[0] if "::" in target else ""
+            if path_part:
+                path = Path(path_part)
+                if not path.is_absolute():
+                    path = root / path
+                if path.suffix == ".erl" and path.is_file():
+                    yield path.resolve(strict=False)
+                    return
+            for path in sorted(root.rglob("*.erl")):
+                if any(part in {".git", "_build", "deps"} for part in path.parts):
+                    continue
+                if module is None or module_name(path) == module:
+                    yield path
+
+        relation_values: list[dict[str, Any]] = []
+        for target in targets:
+            items: list[dict[str, Any]] = []
+            wanted_name, wanted_arity = symbol_name(target)
+            wanted_module = target_module(target)
+            for path in candidate_files(target, wanted_module):
+                position = function_position(path, wanted_name, wanted_arity)
+                if position is None:
+                    continue
+                uri = _lsp_uri(path)
+                _write_lsp_message(
+                    process.stdin,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/didOpen",
+                        "params": {
+                            "textDocument": {
+                                "uri": uri,
+                                "languageId": "erlang",
+                                "version": 1,
+                                "text": path.read_text(
+                                    encoding="utf-8", errors="replace"
+                                ),
+                            }
+                        },
+                    },
+                )
+                prepared = request(
+                    "textDocument/prepareCallHierarchy",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": position[0], "character": position[1]},
+                    },
+                )
+                prepared_values = prepared.get("result")
+                if isinstance(prepared_values, list):
+                    items.extend(item for item in prepared_values[:1] if isinstance(item, Mapping))
+                if items:
+                    break
+            for item in items[:10]:
+                if query_kind in {"callers_of", "enrichment", "tests_for", "impact"}:
+                    method = (
+                        "callHierarchy/incomingCalls"
+                        if query_kind != "impact"
+                        else "callHierarchy/outgoingCalls"
+                    )
+                    response = request(method, {"item": item})
+                    values = response.get("result", [])
+                    if not isinstance(values, list):
+                        continue
+                    for value in values:
+                        if not isinstance(value, Mapping):
+                            continue
+                        endpoint_key = "from" if method.endswith("incomingCalls") else "to"
+                        endpoint = value.get(endpoint_key)
+                        if not isinstance(endpoint, Mapping):
+                            continue
+                        source_endpoint = _lsp_item_endpoint(item, root)
+                        other_endpoint = _lsp_item_endpoint(endpoint, root)
+                        if source_endpoint is None or other_endpoint is None:
+                            continue
+                        source, _ = (other_endpoint if endpoint_key == "from" else source_endpoint)
+                        relation_target, _ = (
+                            source_endpoint if endpoint_key == "from" else other_endpoint
+                        )
+                        relation_values.append({
+                            "kind": "CALLS",
+                            "source": source,
+                            "target": relation_target,
+                            "metadata": {"lsp_method": method, "target_name": wanted_name},
+                        })
+                if query_kind in {"references", "enrichment", "tests_for"}:
+                    response = request(
+                        "textDocument/references",
+                        {
+                            "textDocument": {"uri": item["uri"]},
+                            "position": item["selectionRange"]["start"],
+                            "context": {"includeDeclaration": False},
+                        },
+                    )
+                    references = response.get("result", [])
+                    if isinstance(references, list):
+                        for reference in references:
+                            if not isinstance(reference, Mapping):
+                                continue
+                            path = _lsp_path(reference.get("uri"), root)
+                            if not path:
+                                continue
+                            start = reference.get("range", {}).get("start", {})
+                            line = (
+                                int(start.get("line", 0)) + 1
+                                if isinstance(start, Mapping)
+                                else 1
+                            )
+                            relation_values.append(
+                                {
+                                    "kind": (
+                                        "TESTED_BY"
+                                        if query_kind == "tests_for"
+                                        else "REFERENCES"
+                                    ),
+                                    "source": f"{path}::line-{line}",
+                                    "target": target,
+                                    "metadata": {"lsp_method": "textDocument/references"},
+                                }
+                            )
+        payload = {"evidence": relation_values}
+        if not relation_values:
+            payload["diagnostics"] = [
+                {"code": "elp_no_evidence", "message": "ELP returned no relation evidence"}
+            ]
+        return CommandResult(
+            0, _canonical_json(payload), duration_seconds=time.perf_counter() - started
+        )
+    except TimeoutError as exc:
+        return CommandResult(124, stderr=str(exc), duration_seconds=time.perf_counter() - started)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        return CommandResult(
+            1, stderr=_bounded_text(exc), duration_seconds=time.perf_counter() - started
+        )
+    finally:
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                process.kill()
+
+
+
 class ELPAdapter(_BaseAdapter):
     """Run targeted ELP queries through a configurable JSON command."""
 
@@ -2311,13 +2684,25 @@ class ELPAdapter(_BaseAdapter):
         **kwargs: Any,
     ) -> None:
         super().__init__(toolchain, **kwargs)
-        self.command_builder = command_builder or self._default_command
+        # A supplied runner is the established deterministic test/deployment
+        # injection point.  The real default path uses the ELP LSP protocol.
+        self._use_lsp = command_builder is None and kwargs.get("runner") is None
+        self.command_builder = command_builder or (
+            self._default_command if self._use_lsp else self._legacy_command
+        )
         self.expected_otp_version = expected_otp_version
 
     @staticmethod
     def _default_command(
         executable: str, query_kind: str, targets: tuple[str, ...]
     ) -> Sequence[str]:
+        return (executable, "server")
+
+    @staticmethod
+    def _legacy_command(
+        executable: str, query_kind: str, targets: tuple[str, ...]
+    ) -> Sequence[str]:
+        """Keep deterministic injected runners compatible with old fixtures."""
         return (executable, "query", "--format", "json", query_kind, *targets)
 
     def query(
@@ -2374,13 +2759,23 @@ class ELPAdapter(_BaseAdapter):
             str(item)
             for item in self.command_builder(executable, normalized_query, key.query_targets)
         )
-        result = _command_result(
-            self.runner,
-            command,
-            root=root,
-            environment=self.environment,
-            timeout=self.timeout,
-        )
+        if self._use_lsp:
+            result = _elp_lsp_query(
+                executable,
+                root,
+                normalized_query,
+                key.query_targets,
+                environment=self.environment,
+                timeout=self.timeout,
+            )
+        else:
+            result = _command_result(
+                self.runner,
+                command,
+                root=root,
+                environment=self.environment,
+                timeout=self.timeout,
+            )
         status = STATUS_OK
         if result.returncode == 124:
             status = STATUS_TIMEOUT
