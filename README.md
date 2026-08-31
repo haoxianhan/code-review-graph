@@ -165,13 +165,13 @@ Blade template references, and Laravel Route/Eloquent semantic edges when the
 source includes explicit framework imports, model inheritance, and receiver
 evidence.
 
-### Erlang support and auxiliary semantic context
+### Erlang support and project semantic context
 
-Erlang (`.erl`, `.hrl`, and `.app.src`) is a bundled Generic Tree-sitter
-baseline and works through the normal build, incremental, watch, and review
-workflows without a `languages.toml` entry. Optional ELP, `rebar3 xref`, and
-Dialyzer enrichment is revision-keyed and remains auxiliary review context;
-missing tools or stale evidence never disable Generic indexing. See the
+Erlang (`.erl`, `.hrl`, and `.app.src`) uses Generic Tree-sitter for structural
+indexing and ELP, `rebar3 xref`, and Dialyzer for required project semantics.
+For the configured `server_flexible` profile, missing or stale toolchain
+evidence is a blocking preflight error; Generic structure must not be reported
+as completed Erlang semantic support. See the
 [Erlang support plan](erlang-support-plan.md) and the checked-in evaluation
 artifacts under `evaluate/erlang/` for the adoption boundary.
 

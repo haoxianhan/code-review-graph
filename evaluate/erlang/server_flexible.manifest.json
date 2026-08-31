@@ -7,8 +7,8 @@
     "remote": "ssh://git@ysc2-gitlab.shiyue.com:10022/g_server/server.git"
   },
   "revision": {
-    "requested": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
-    "observed": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
+    "requested": "fd65517bb3d359d489520f1b3630493144962482",
+    "observed": "fd65517bb3d359d489520f1b3630493144962482",
     "working_tree_clean": true,
     "baseline_status": "clean",
     "dirty_paths": []
@@ -48,8 +48,8 @@
     ]
   },
   "generated_data": {
-    "revision": "35021",
-    "config_version": "dfc505397095d365a0a19899aa5b4467",
+    "revision": "53569",
+    "config_version": "2cdad7c1e46279b6a6275058ee344b86",
     "paths": [
       "tools/gen_data/include",
       "tools/gen_data/src",

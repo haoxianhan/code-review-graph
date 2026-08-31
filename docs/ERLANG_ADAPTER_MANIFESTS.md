@@ -16,9 +16,9 @@ erlang_adapter_manifest`. The sections have deliberately fixed meanings:
 - `timeout` defines the default and hard maximum, the timeout return code, and
   the required bounded action.
 - `failure` and `output.malformed` map missing tools, non-zero exits, timeouts,
-  and malformed output to an observable status and diagnostic code. The
-  fallback is always the Generic graph; adapter evidence is never promoted
-  from malformed output.
+  and malformed output to an observable status and diagnostic code. Required
+  project profiles fail closed; adapter evidence is never promoted from
+  malformed output.
 - `provenance` lists the fields that must be attached to evidence and
   diagnostics. In particular, source/generated-data revisions, configuration,
   query scope, command, duration, and cache state are retained.
@@ -33,19 +33,17 @@ erlang_adapter_manifest`. The sections have deliberately fixed meanings:
 
 ## Runtime status
 
-The current `ELPAdapter`, `XrefAdapter`, and `DialyzerAdapter` already use
-argv-only subprocesses, a repository cwd, a bounded timeout, a reduced
-environment, revision-aware cache keys, and fail-soft diagnostics. They do not
-yet load these checked-in manifests or install an OS-level sandbox around
-`rebar3`/ELP. Their manifests therefore set
-`runtime_policy_enforced: false`, `status: described_only`, and the common
-`adapter_manifest_policy_not_enforced` diagnostic. `inspect_adapter_manifests`
-reports this as `degraded`; an absent or invalid manifest is `unavailable`.
+The current `ELPAdapter`, `XrefAdapter`, and `DialyzerAdapter` use argv-only
+subprocesses, a repository cwd, bounded timeouts, a reduced environment,
+revision-aware cache keys, and observable diagnostics. The checked-in
+manifests declare the enforced execution contract used by the configured
+profile. An absent or invalid manifest is `unavailable`; a required adapter
+failure blocks that profile.
 
 The Generic parser is in-process, does not execute project code or use the
 network, and writes only CRG graph state. Its policy is marked `intrinsic`.
-This distinction keeps a valid Generic-only fallback available while making an
-un-enforced semantic boundary visible to evaluation and review tooling.
+This structural stage remains useful for diagnostics, but it cannot satisfy a
+configured profile's required semantic adapters.
 
 ## Validation
 

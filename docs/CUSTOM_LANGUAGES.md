@@ -157,14 +157,15 @@ inner `atom`) and whole call expressions (`call`, not the callee identifier).
 
 ## Erlang baseline boundary
 
-Erlang is bundled as a Generic baseline, so it does not belong in
-`languages.toml`. The baseline recognizes `.erl`, `.hrl`, and `.app.src` and
-supports generic nodes, includes, local call candidates, and lifecycle
-updates. Optional ELP, `rebar3 xref`, and Dialyzer evidence is revision-keyed
-and auxiliary: unavailable tools, malformed output, timeouts, and stale caches
-are reported as diagnostics while Generic indexing remains usable. Erlang is
-not promoted to sole blocking-review evidence until the real-project corpus
-passes the precision, recall, impact, latency, and lifecycle gates in
+Erlang has a Generic structural stage, so it does not belong in
+`languages.toml`. The stage recognizes `.erl`, `.hrl`, and `.app.src` and
+supports syntax nodes, includes, local call candidates, and lifecycle updates.
+For the configured `server_flexible` profile, ELP, `rebar3 xref`, and
+Dialyzer evidence are required, revision-keyed semantic inputs. Unavailable
+tools, malformed output, timeouts, and stale caches block that profile; the
+structural stage cannot be presented as completed Erlang semantic support.
+Erlang remains auxiliary review context until the real-project corpus passes
+the precision, recall, impact, latency, and lifecycle gates in
 `erlang-support-plan.md`.
 
 ## Worked example: custom language end to end
