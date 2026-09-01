@@ -35,6 +35,7 @@ from code_review_graph.incremental import (
     _WATCH_POSTPROCESS_PENDING_METADATA_KEY,
     _WATCH_SPLIT_MIN_DIRS,
     _create_watch_handler,
+    _git_ignored_paths,
     _load_ignore_patterns,
     _plan_watch_paths,
     _should_ignore,
@@ -1007,6 +1008,47 @@ class TestWatchLoop:
         # src is watched, node_modules is not.
         assert (str(tmp_path / "src"), True) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
+
+    def test_git_ignored_generated_erlang_batch_skips_semantic_rerun(self, tmp_path):
+        """Project-generated ignored files do not recursively restart adapters."""
+        import subprocess
+
+        from watchdog.events import FileModifiedEvent
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        generated = tmp_path / "generated" / "output.erl"
+        generated.parent.mkdir()
+        generated.write_text("-module(output).\n-export([run/0]).\nrun() -> ok.\n")
+        (tmp_path / ".gitignore").write_text("generated/**\n")
+        store = GraphStore(tmp_path / "graph.db")
+        seen: list[object] = []
+
+        def fake_incremental_update(*_args, **kwargs):
+            seen.append((kwargs["erlang_config"], kwargs["_skip_erlang_lifecycle"]))
+            return {"files_updated": 1, "errors": []}
+
+        try:
+            with patch(
+                "code_review_graph.incremental.incremental_update",
+                fake_incremental_update,
+            ):
+                handler = _create_watch_handler(
+                    tmp_path,
+                    store,
+                    None,
+                    erlang_config={"enabled": True, "strict": True},
+                )
+                handler.process([FileModifiedEvent(str(generated))])
+                handler.stop()
+            assert len(seen) == 1
+            assert seen[0][0] == {"enabled": True, "strict": True}
+            assert seen[0][1] is True
+        finally:
+            store.close()
+
+    def test_git_ignored_path_probe_is_scoped_to_git_projects(self, tmp_path):
+        """A failed/non-Git probe never suppresses ordinary watcher work."""
+        assert _git_ignored_paths(tmp_path, ["generated/output.erl"]) == set()
 
     def test_stop_bounds_a_debouncer_join_that_ignores_timeout(self, tmp_path):
         """A broken debouncer join cannot hold watcher teardown forever."""

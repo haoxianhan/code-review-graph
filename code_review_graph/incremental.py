@@ -456,6 +456,39 @@ def _append_mismatched_erlang_hashes(
     return changed_files
 
 
+def _git_ignored_paths(repo_root: Path, paths: Iterable[str]) -> set[str]:
+    """Return paths Git marks ignored without evaluating project config.
+
+    Project generators commonly write tracked-by-content Erlang files under
+    ``.gitignore`` entries.  Watch mode must still index their bytes, but a
+    generated-only batch must not recursively restart the project's semantic
+    preparation command.  ``git check-ignore --no-index`` gives us the
+    repository's own output boundary and also covers ignored paths that are
+    already tracked.  A VCS probe failure is deliberately treated as an empty
+    set so ordinary watcher behavior remains unchanged outside Git projects.
+    """
+    values = sorted({str(path).replace("\\", "/") for path in paths if str(path)})
+    if not values or detect_vcs(repo_root) != "git":
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--stdin"],
+            cwd=str(repo_root),
+            input="\n".join(values) + "\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode not in {0, 1}:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def _run_erlang_lifecycle(
     repo_root: Path,
     store: GraphStore,
@@ -2278,6 +2311,7 @@ def incremental_update(
     reconcile_stale: bool = True,
     *,
     erlang_config: Any = _ERLANG_CONFIG_UNSET,
+    _skip_erlang_lifecycle: bool = False,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     repo_root = _canonical_repo_root(repo_root)
@@ -2638,7 +2672,7 @@ def incremental_update(
                 changed_files=list(changed_files),
                 force=layout_changed,
             )
-            if files_updated > 0 or layout_changed
+            if not _skip_erlang_lifecycle and (files_updated > 0 or layout_changed)
             else None
         )
         stage_timing["erlang_integration_s"] = max(
@@ -3619,13 +3653,25 @@ def _create_watch_handler(
                     )
                     if not changed_files:
                         return
-                    result = incremental_update(
-                        repo_root,
-                        store,
-                        changed_files=changed_files,
-                        reconcile_stale=False,
-                        erlang_config=erlang_config,
-                    )
+                    skip_erlang_lifecycle = False
+                    if erlang_config is not _ERLANG_CONFIG_UNSET:
+                        ignored = _git_ignored_paths(repo_root, changed_files)
+                        if ignored == set(changed_files):
+                            # Generators are allowed to rewrite ignored source
+                            # files during strict project preparation.  Keep
+                            # their structural graph rows current, but do not
+                            # let that output-only batch invoke preparation
+                            # recursively.  A mixed batch retains strict
+                            # semantic execution for the user-edited source.
+                            skip_erlang_lifecycle = True
+                    update_kwargs: dict[str, Any] = {
+                        "changed_files": changed_files,
+                        "reconcile_stale": False,
+                        "erlang_config": erlang_config,
+                    }
+                    if skip_erlang_lifecycle:
+                        update_kwargs["_skip_erlang_lifecycle"] = True
+                    result = incremental_update(repo_root, store, **update_kwargs)
                     _raise_watch_update_errors(result, "incremental update")
                     _run_watch_postprocess(
                         repo_root,
