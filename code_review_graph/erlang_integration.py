@@ -28,7 +28,7 @@ import os
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -259,6 +259,9 @@ class ErlangIntegrationConfig:
     strict_rebar3_version: str | None = None
     strict_dialyzer_version: str | None = None
     plt_path: str | Path | None = None
+    project_compile_command: tuple[str, ...] = ()
+    project_dialyzer_command: tuple[str, ...] = ()
+    require_project_entrypoints: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled))
@@ -266,6 +269,21 @@ class ErlangIntegrationConfig:
         object.__setattr__(self, "queries", _normalise_queries(self.queries))
         object.__setattr__(self, "include_xref", _coerce_bool(self.include_xref))
         object.__setattr__(self, "include_dialyzer", _coerce_bool(self.include_dialyzer))
+        object.__setattr__(
+            self,
+            "project_compile_command",
+            tuple(str(item) for item in self.project_compile_command),
+        )
+        object.__setattr__(
+            self,
+            "project_dialyzer_command",
+            tuple(str(item) for item in self.project_dialyzer_command),
+        )
+        object.__setattr__(
+            self,
+            "require_project_entrypoints",
+            _coerce_bool(self.require_project_entrypoints),
+        )
         object.__setattr__(self, "timeout", _bounded_timeout(self.timeout))
         if self.expected_otp is not None:
             value = str(self.expected_otp).strip()
@@ -341,6 +359,9 @@ class ErlangIntegrationConfig:
             "strict_rebar3_version",
             "strict_dialyzer_version",
             "plt_path",
+            "project_compile_command",
+            "project_dialyzer_command",
+            "require_project_entrypoints",
         }
         values: dict[str, Any] = {}
         for key, item in value.items():
@@ -364,6 +385,9 @@ class ErlangIntegrationConfig:
             "strict_rebar3_version": self.strict_rebar3_version,
             "strict_dialyzer_version": self.strict_dialyzer_version,
             "plt_path": str(self.plt_path) if self.plt_path is not None else None,
+            "project_compile_command": list(self.project_compile_command),
+            "project_dialyzer_command": list(self.project_dialyzer_command),
+            "require_project_entrypoints": self.require_project_entrypoints,
         }
 
 
@@ -1633,6 +1657,55 @@ def _strict_preflight(
                 status=STATUS_UNAVAILABLE,
             )
         )
+    if settings.require_project_entrypoints:
+        expected_compile = settings.project_compile_command or ("./xserver.sh", "compile")
+        expected_dialyzer = settings.project_dialyzer_command or ("./xserver.sh", "dialyzer")
+        compile_entrypoint = (
+            root / expected_compile[0]
+            if expected_compile and expected_compile[0].startswith("./")
+            else None
+        )
+        dialyzer_entrypoint = (
+            root / expected_dialyzer[0]
+            if expected_dialyzer and expected_dialyzer[0].startswith("./")
+            else None
+        )
+        compile_valid = tuple(toolchain.project_compile_command) == tuple(expected_compile) and (
+            compile_entrypoint is None or compile_entrypoint.is_file()
+        )
+        dialyzer_valid = tuple(toolchain.project_dialyzer_command) == tuple(expected_dialyzer) and (
+            dialyzer_entrypoint is None or dialyzer_entrypoint.is_file()
+        )
+        if not compile_valid:
+            diagnostics.append(
+                _make_diagnostic(
+                    toolchain,
+                    tool="erlang_integration",
+                    query_kind="preflight",
+                    code="project_compile_entrypoint_mismatch",
+                    message="The configured project compile entrypoint is not available.",
+                    status=STATUS_MISMATCH,
+                    metadata={
+                        "expected": list(expected_compile),
+                        "observed": list(toolchain.project_compile_command),
+                    },
+                )
+            )
+        if not dialyzer_valid:
+            diagnostics.append(
+                _make_diagnostic(
+                    toolchain,
+                    tool="erlang_integration",
+                    query_kind="preflight",
+                    code="project_dialyzer_entrypoint_mismatch",
+                    message="The configured project Dialyzer entrypoint is not available.",
+                    status=STATUS_MISMATCH,
+                    metadata={
+                        "expected": list(expected_dialyzer),
+                        "observed": list(toolchain.project_dialyzer_command),
+                    },
+                )
+            )
     if settings.strict:
         if settings.plt_path is None:
             diagnostics.append(
@@ -1943,6 +2016,21 @@ def run_erlang_integration(
                 code="erlang_toolchain_discovery_failed",
                 message=f"Toolchain discovery failed: {type(exc).__name__}: {exc}",
             )
+    if toolchain is not None and (
+        settings.project_compile_command or settings.project_dialyzer_command
+    ):
+        toolchain = replace(
+            toolchain,
+            project_compile_command=(
+                settings.project_compile_command or toolchain.project_compile_command
+            ),
+            project_dialyzer_command=(
+                settings.project_dialyzer_command or toolchain.project_dialyzer_command
+            ),
+            dialyzer_command=(
+                settings.project_dialyzer_command or toolchain.dialyzer_command
+            ),
+        )
     if not _repository_matches(root, toolchain):
         return _repository_mismatch_result(root, toolchain)
     if settings.strict:
@@ -1993,6 +2081,7 @@ def run_erlang_integration(
             include_dialyzer=settings.include_dialyzer,
             plt_path=settings.plt_path,
             expected_otp_version=settings.expected_otp,
+            prepare_project=bool(settings.strict and settings.require_project_entrypoints),
         )
     except Exception as exc:
         return _failure_result(

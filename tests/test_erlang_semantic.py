@@ -206,6 +206,76 @@ def test_xref_stays_at_module_granularity_and_preserves_undefined_diagnostics(tm
     assert any(item.code == "xref_undefined_call" for item in result.diagnostics)
 
 
+def test_xref_warning_exit_is_diagnostic_success(tmp_path: Path):
+    adapter = XrefAdapter(
+        _toolchain(tmp_path),
+        runner=_runner(
+            CommandResult(
+                1,
+                (
+                    "apps/demo/src/demo.erl:4: Warning: demo:run/0 calls undefined "
+                    "function dep:run/0 (Xref)\n"
+                ),
+            )
+        ),
+    )
+
+    result = adapter.collect(tmp_path)
+
+    assert result.status == STATUS_OK
+    assert any(item.code == "xref_undefined_call" for item in result.diagnostics)
+    assert any(item.code == "xref_diagnostics" for item in result.diagnostics)
+
+
+def test_xref_nonzero_without_xref_warning_remains_failure(tmp_path: Path):
+    adapter = XrefAdapter(
+        _toolchain(tmp_path),
+        runner=_runner(CommandResult(1, stderr="error: rebar3 crashed")),
+    )
+
+    result = adapter.collect(tmp_path)
+
+    assert result.status == "failed"
+    assert result.diagnostics[0].code == "xref_failed"
+
+
+def test_enrichment_prepares_project_before_semantic_adapters(tmp_path: Path):
+    toolchain = replace(_toolchain(tmp_path), project_compile_command=("./xserver.sh", "compile"))
+    calls: list[tuple[str, ...]] = []
+
+    def run(command, *, cwd, env, timeout):
+        calls.append(tuple(command))
+        if tuple(command) == toolchain.xref_command:
+            return CommandResult(0, "alpha -> beta\n")
+        return CommandResult(0, "generated")
+
+    result = run_erlang_enrichment(
+        tmp_path,
+        toolchain=toolchain,
+        runner=run,
+        include_xref=True,
+        prepare_project=True,
+    )
+
+    assert result.ok
+    assert calls[:2] == [toolchain.project_compile_command, toolchain.xref_command]
+
+
+def test_enrichment_reports_project_preparation_failure(tmp_path: Path):
+    toolchain = replace(_toolchain(tmp_path), project_compile_command=("./xserver.sh", "compile"))
+
+    result = run_erlang_enrichment(
+        tmp_path,
+        toolchain=toolchain,
+        runner=_runner(CommandResult(1, stderr="compile failed")),
+        include_xref=True,
+        prepare_project=True,
+    )
+
+    assert result.status == "failed"
+    assert result.adapter_results[0].diagnostics[0].code == "project_compile_failed"
+
+
 def test_dialyzer_rejects_stale_plt_before_running_command(tmp_path: Path):
     plt = tmp_path / "dialyzer.plt"
     plt.write_bytes(b"current")
@@ -504,3 +574,35 @@ def test_toolchain_version_probes_do_not_use_repository_cwd(monkeypatch, tmp_pat
     assert version_probes
     assert all(cwd != tmp_path.resolve() for _command, cwd in version_probes)
     assert identity.elp_version == "1.1.0+build-2026-01-15"
+
+
+def test_server_entrypoints_are_recorded_for_project_toolchain(
+    monkeypatch, tmp_path: Path
+):
+    executable_paths = {
+        "erl": "/usr/bin/erl",
+        "elp": "/usr/bin/elp",
+        "rebar3": "/usr/bin/rebar3",
+        "dialyzer": "/usr/bin/dialyzer",
+    }
+    monkeypatch.setattr("code_review_graph.erlang_semantic.shutil.which", executable_paths.get)
+    (tmp_path / "xserver.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def run(command, *, cwd, env, timeout):
+        if command[0] == "git":
+            return CommandResult(0, "revision\n")
+        if command[0] == "/usr/bin/erl":
+            return CommandResult(0, "otp=27.3.4.16\nerts=15.2.7.12")
+        if command[0] == "/usr/bin/elp":
+            return CommandResult(0, "elp 1.1.0+build-2026-01-15")
+        if command[0] == "/usr/bin/rebar3":
+            return CommandResult(0, "rebar 3.27.0")
+        if command[0] == "/usr/bin/dialyzer":
+            return CommandResult(0, "Dialyzer version v5.3.1.1")
+        return CommandResult(127)
+
+    identity = discover_toolchain(tmp_path, runner=run)
+
+    assert identity.project_compile_command == ("./xserver.sh", "compile")
+    assert identity.project_dialyzer_command == ("./xserver.sh", "dialyzer")
+    assert identity.dialyzer_command == ("./xserver.sh", "dialyzer")

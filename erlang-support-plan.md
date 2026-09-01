@@ -158,6 +158,15 @@ generic CRG caller that has not selected this project profile may keep the
 integration disabled; it must not claim to have completed Erlang semantic
 analysis.
 
+For `server_flexible`, semantic work is prepared through the repository's
+authoritative entrypoints. A project checkout with `xserver.sh` must run
+`./xserver.sh compile` once before ELP or xref queries; Dialyzer is invoked as
+`./xserver.sh dialyzer`, which performs its own compile/preparation step and
+uses `_build/dialyzer/.dialyzer.plt`. `rebar3 xref` remains the xref task after
+that preparation. A preparation failure is a required-toolchain failure, while
+xref's non-zero exit for project warnings is retained as diagnostic output when
+the analysis completed.
+
 Commands that may evaluate configuration scripts, plugins, parse transforms,
 generate files, access the network, or write outside the analysis workspace
 run only in the adapter's controlled execution boundary. The boundary uses

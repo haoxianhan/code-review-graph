@@ -7,8 +7,8 @@
     "remote": "ssh://git@ysc2-gitlab.shiyue.com:10022/g_server/server.git"
   },
   "revision": {
-    "requested": "fd65517bb3d359d489520f1b3630493144962482",
-    "observed": "fd65517bb3d359d489520f1b3630493144962482",
+    "requested": "db6f93e95b432efcd1e337159fc3e4a235084476",
+    "observed": "db6f93e95b432efcd1e337159fc3e4a235084476",
     "working_tree_clean": true,
     "baseline_status": "clean",
     "dirty_paths": []
@@ -48,8 +48,8 @@
     ]
   },
   "generated_data": {
-    "revision": "53569",
-    "config_version": "2cdad7c1e46279b6a6275058ee344b86",
+    "revision": "57057",
+    "config_version": "a85752be96544fcc5518e193b4397c51",
     "paths": [
       "tools/gen_data/include",
       "tools/gen_data/src",
@@ -65,10 +65,15 @@
       "elp": {"command": ["elp", "version"], "path": "/home/haoxian/.nix-profile/bin/elp", "version": "1.1.0+build-2026-01-15", "status": "available"}
     },
     "plt": {
-      "path": "_build/default/rebar3_27.3.4.16_plt",
-      "sha256": "e926642461efeadc3e571a2225d2c0ac69181a259d11946d608a658783e8254a"
+      "path": "_build/dialyzer/.dialyzer.plt",
+      "sha256": "1730142f65c9296c34079f4242c7d7f08f1740fe6d619cf976f4b3abc4240a01"
     },
     "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl"},
+    "project_workflow": {
+      "preparation": {"command": ["./xserver.sh", "compile"], "cwd": "repository_root", "purpose": "full generation and release compile"},
+      "dialyzer": {"command": ["./xserver.sh", "dialyzer"], "cwd": "repository_root", "purpose": "project compile followed by project PLT and diagnostics"},
+      "xref": {"command": ["rebar3", "xref"], "cwd": "repository_root", "purpose": "module-level xref diagnostics after preparation"}
+    },
     "configuration": {
       "files": ["rebar.config", "rebar.config.script", "erlang_ls.config", ".elp_lint.toml"],
       "execute_during_discovery": false,

@@ -18,10 +18,10 @@
   },
   "invocation": {
     "mode": "argv",
-    "argv": ["rebar3", "dialyzer"],
-    "executable": "rebar3",
+    "argv": ["./xserver.sh", "dialyzer"],
+    "executable": "./xserver.sh",
     "command_allowlist": {
-      "executables": ["rebar3"],
+      "executables": ["./xserver.sh"],
       "subcommands": ["dialyzer"],
       "flags": [],
       "reject_shell_metacharacters": true

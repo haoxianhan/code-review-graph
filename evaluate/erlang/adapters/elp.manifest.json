@@ -31,6 +31,12 @@
     "stdin": "devnull",
     "environment_allowlist": ["PATH", "HOME", "LANG", "LC_ALL", "ELP_HOME", "ELP_OTP_VERSION"]
   },
+  "preparation": {
+    "argv": ["./xserver.sh", "compile"],
+    "cwd": "repository_root",
+    "required": true,
+    "reason": "server_flexible generated headers and release artifacts must be current before ELP"
+  },
   "timeout": {
     "default_seconds": 15,
     "max_seconds": 300,

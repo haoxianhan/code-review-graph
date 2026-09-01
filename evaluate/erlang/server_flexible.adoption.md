@@ -2,8 +2,8 @@
 
 - Verdict: `blocked`
 - Pass: `false`
-- Target revision: `fd65517bb3d359d489520f1b3630493144962482`
-- Generated-data revision: `53569`
+- Target revision: `db6f93e95b432efcd1e337159fc3e4a235084476` (`origin/develop`)
+- Generated-data revision: `57057`
 - Clean baseline: `true`
 - Read-only target: `true`
 
@@ -22,37 +22,42 @@ The required baseline was available during preflight:
 | `rebar3` | `3.27.0` |
 | Dialyzer | `5.3.1.1` |
 | ELP CLI | `1.1.0+build-2026-01-15` |
-| Dialyzer PLT | `_build/default/rebar3_27.3.4.16_plt`, SHA256 `e926642461efeadc3e571a2225d2c0ac69181a259d11946d608a658783e8254a` |
+| Dialyzer PLT | `_build/dialyzer/.dialyzer.plt`, SHA256 `1730142f65c9296c34079f4242c7d7f08f1740fe6d619cf976f4b3abc4240a01` |
 
-Generated-data markers were present and consistent: `DATA_REV=53569`,
-structure revision `53569`, and config version
-`2cdad7c1e46279b6a6275058ee344b86`.
+Generated-data markers were present and consistent: `DATA_REV=57057`,
+structure revision `57057`, and config version
+`a85752be96544fcc5518e193b4397c51`.
+
+The target was prepared in a disposable worktree with the project-authoritative
+commands `./xserver.sh compile` and `./xserver.sh dialyzer`. CRG does not modify
+the consumer checkout; generated outputs and the project PLT are observed as
+baseline inputs. `./xserver.sh dialyzer` includes the project compile step and
+produced the matching `_build/dialyzer/.dialyzer.plt`.
 
 ## Corpus
 
 The corpus declares local and remote callers, headers/records, behaviours,
 supervisor MFA, Common Test, EUnit, generated data, unresolved dynamic calls,
-and stale-cache cases. The corpus run was not reached because strict semantic
-preflight rejected the project-level xref result. Consequently precision,
-recall, Recall@10, impact coverage, and targeted latency are unmeasured in
-this current run; no historical metric is carried forward as current evidence.
+and stale-cache cases. It has not yet been rerun on this fixed develop/data
+baseline. Consequently precision, recall, Recall@10, impact coverage, and
+targeted latency are unmeasured in this current run; no historical metric is
+carried forward as current evidence.
 
 ## Lifecycle And Adoption
 
-The full-build lifecycle reached the required adapter preflight and executed
-`rebar3 xref`, but xref returned non-zero after reporting the project's
-undefined-call warnings. Strict policy treats that result as a blocking
-`xref_failed` error. The lifecycle stopped before semantic adapter envelopes
-could be verified, so incremental update, watch, forget, standalone
-postprocess, and lifecycle parity were not run.
+The prior lifecycle result was invalidated because it used a stale revision and
+treated xref's warning exit code as command failure. The adapter now preserves
+xref diagnostics when analysis completed and only blocks on an execution or
+malformed-output failure. A complete lifecycle rerun on the fixed
+`db6f93e95b432efcd1e337159fc3e4a235084476`/`57057` baseline is still required.
 
 | Gate | Result | Reason |
 | --- | --- | --- |
 | Required tools available | pass | ELP, xref/rebar3, Dialyzer, and matching PLT were available |
-| Generated-data consistency | pass | `DATA_REV=53569` and config markers matched the manifest |
-| Full build | blocked | `erlang_semantic_execution_blocked`, `xref_failed` |
-| Corpus precision/recall/impact | not run | full build was blocked before corpus queries |
-| Incremental/watch/forget/postprocess | not run | lifecycle execution stopped at full build |
+| Generated-data consistency | pass | `DATA_REV=57057` and config markers matched the manifest |
+| Full build | blocked | `./xserver.sh compile` failed during required P4 preparation (`P4 未登录`; `p4 login -s` could not reach `192.168.110.82:1667`) |
+| Corpus precision/recall/impact | not run | fixed baseline rerun remains pending |
+| Incremental/watch/forget/postprocess | not run | fixed baseline lifecycle rerun remains pending |
 | Adoption | blocked | required semantic lifecycle and all adoption gates are incomplete |
 
 The adoption verdict remains `auxiliary_review_context_only`. Erlang is not a
@@ -63,11 +68,18 @@ sole source of blocking-review evidence until every gate in
 
 - `project_config_script_not_executed` (info): `rebar.config.script` was
   intentionally not executed during discovery.
-- `full_build_failed` (error): full build failed with
-  `RuntimeError: Erlang strict preflight blocked operation
-  (erlang_semantic_execution_blocked, xref_failed)`.
-- `graph_build_failed` (error): the same strict xref failure prevented graph
-  construction and all downstream evaluation.
+- `project_compile_failed` (error): required `./xserver.sh compile` stopped at
+  the project's P4 preparation step because the P4 session/server was not
+  available. No semantic adapter was launched after this failure.
+- `lifecycle_rerun_required` (warning): incremental, watch, forget, and
+  standalone postprocess remain unmeasured until the project preparation
+  prerequisite is available.
+
+The failed attempt was made in `/tmp/crg-server-flexible-develop-20260901163430`
+with `GIT_BRANCH=develop` and `CLIENT_DATA_COMMIT_ID=57057`. The consumer
+checkout was not modified. Before retrying, the build environment must provide
+an authenticated, reachable P4 session for the project-required generation
+step; bypassing `./xserver.sh compile` would invalidate this baseline.
 
 ## Reproduction
 

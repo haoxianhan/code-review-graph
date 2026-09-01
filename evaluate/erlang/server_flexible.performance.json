@@ -3,16 +3,22 @@
   "kind": "erlang_performance_report",
   "target": {
     "name": "server_flexible",
-    "revision": "fd65517bb3d359d489520f1b3630493144962482",
-    "generated_data_revision": "53569",
+    "revision": "db6f93e95b432efcd1e337159fc3e4a235084476",
+    "generated_data_revision": "57057",
     "manifest": "server_flexible.manifest.json"
   },
   "measurement": {
     "status": "historical_samples_not_current_baseline",
+    "project_workflow": {
+      "preparation_command": ["./xserver.sh", "compile"],
+      "dialyzer_command": ["./xserver.sh", "dialyzer"],
+      "xref_command": ["rebar3", "xref"],
+      "baseline_preparation": "completed in disposable worktree"
+    },
     "sample_target": {
       "revision": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
       "generated_data_revision": "35021",
-      "note": "Timing samples below were collected before the current fd65517/53569 strict adoption run and must not be used as current gate evidence."
+      "note": "Timing samples below were collected before the current db6f93e95b432efcd1e337159fc3e4a235084476/57057 strict adoption run and must not be used as current gate evidence."
     },
     "machine": "vm-dev",
     "toolchain_baseline": {
@@ -55,10 +61,10 @@
   },
   "current_evaluation": {
     "status": "blocked",
-    "revision": "fd65517bb3d359d489520f1b3630493144962482",
-    "generated_data_revision": "53569",
+    "revision": "db6f93e95b432efcd1e337159fc3e4a235084476",
+    "generated_data_revision": "57057",
     "gates": "not_run",
-    "blocking_reason": "rebar3 xref returned non-zero for project undefined-call warnings; strict semantic preflight stopped the lifecycle before corpus and timing gates."
+    "blocking_reason": "The fixed develop baseline lifecycle stopped at required ./xserver.sh compile because the P4 preparation session was unavailable; semantic and timing gates remain unmeasured."
   },
   "verdict": "auxiliary_review_context_only",
   "limitations": [

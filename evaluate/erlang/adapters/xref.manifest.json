@@ -31,6 +31,12 @@
     "stdin": "devnull",
     "environment_allowlist": ["PATH", "HOME", "LANG", "LC_ALL", "ERL_LIBS", "REBAR_COLOR", "REBAR_CACHE_DIR"]
   },
+  "preparation": {
+    "argv": ["./xserver.sh", "compile"],
+    "cwd": "repository_root",
+    "required": true,
+    "reason": "server_flexible generated headers and release artifacts must be current before xref"
+  },
   "timeout": {
     "default_seconds": 15,
     "max_seconds": 300,
@@ -49,9 +55,9 @@
         "fallback": "none"
       },
       "nonzero_exit": {
-        "status": "failed",
-        "diagnostic_codes": ["xref_failed"],
-        "action": "omit_xref_evidence_and_keep_diagnostics",
+        "status": "degraded",
+        "diagnostic_codes": ["xref_diagnostics", "xref_undefined_call", "xref_warning"],
+        "action": "preserve_parseable_xref_diagnostics_when_analysis_completed; block only on execution failure",
         "fallback": "none"
       },
       "timeout": {

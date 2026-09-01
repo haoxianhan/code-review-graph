@@ -29,6 +29,8 @@ def test_server_manifest_loads_all_adapter_policies():
         assert adapter["invocation"]["shell"] is False
         assert adapter["provenance"]["command_recorded"] is True
         assert adapter["cache"]["stale_policy"].startswith("reject_")
+    assert adapters["dialyzer"]["invocation"]["argv"] == ["./xserver.sh", "dialyzer"]
+    assert adapters["xref"]["failure"]["events"]["nonzero_exit"]["status"] == "degraded"
 
 
 def test_adapter_manifests_capture_distinct_execution_contracts():

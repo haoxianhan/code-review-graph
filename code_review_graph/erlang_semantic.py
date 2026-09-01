@@ -115,6 +115,11 @@ _XREF_RELATION_RE = re.compile(
     r"(?P<target>[A-Za-z0-9_@'?-]+)\s*$",
     re.IGNORECASE,
 )
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_XREF_WARNING_RE = re.compile(r"\(Xref\)", re.IGNORECASE)
+_XREF_FATAL_RE = re.compile(
+    r"(?:^|\s)(?:error|failed|exception|crash)\b", re.IGNORECASE
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -214,6 +219,8 @@ _CONTROLLED_ENVIRONMENT_KEYS = frozenset(
         "REBAR_GLOBAL_CONFIG",
         "REBAR_CACHE_DIR",
         "ELP_HOME",
+        "CLIENT_DATA_COMMIT_ID",
+        "GIT_BRANCH",
         # ELP installations may be built against a specific OTP release.  A
         # deployment can provide that identity when the executable does not
         # expose it through its version output.
@@ -366,6 +373,8 @@ class ToolchainIdentity:
     dialyzer_invocation: tuple[str, ...] = ()
     xref_command: tuple[str, ...] = ()
     dialyzer_command: tuple[str, ...] = ()
+    project_compile_command: tuple[str, ...] = ()
+    project_dialyzer_command: tuple[str, ...] = ()
     dependency_roots: tuple[str, ...] = ()
     plt_identity: str | None = None
     environment: tuple[tuple[str, str], ...] = ()
@@ -428,6 +437,8 @@ class ToolchainIdentity:
             "dialyzer_invocation": list(self.dialyzer_invocation),
             "xref_command": list(self.xref_command),
             "dialyzer_command": list(self.dialyzer_command),
+            "project_compile_command": list(self.project_compile_command),
+            "project_dialyzer_command": list(self.project_dialyzer_command),
             "dependency_roots": list(self.dependency_roots),
             "plt_identity": self.plt_identity,
             "environment": {key: value for key, value in self.environment},
@@ -498,6 +509,8 @@ class ToolchainIdentity:
             dialyzer_invocation=_canonical_command(value.get("dialyzer_invocation")),
             xref_command=_canonical_command(value.get("xref_command")),
             dialyzer_command=_canonical_command(value.get("dialyzer_command")),
+            project_compile_command=_canonical_command(value.get("project_compile_command")),
+            project_dialyzer_command=_canonical_command(value.get("project_dialyzer_command")),
             dependency_roots=(
                 tuple(str(item) for item in value.get("dependency_roots", ()))
                 if isinstance(value.get("dependency_roots", ()), (list, tuple, set, frozenset))
@@ -1910,8 +1923,28 @@ def discover_toolchain(
         if path.is_dir()
     )
     plt_identity = compute_plt_identity(plt_path) if plt_path is not None else None
+    project_compile_command: tuple[str, ...] = ()
+    project_dialyzer_command: tuple[str, ...] = ()
+    project_entrypoint = root / "xserver.sh"
+    if project_entrypoint.is_file():
+        # server_flexible owns generation and release preparation in this
+        # wrapper.  Keep the command relative to the repository root so the
+        # recorded invocation is reproducible in a disposable checkout.
+        project_compile_command = ("./xserver.sh", "compile")
+        project_dialyzer_command = ("./xserver.sh", "dialyzer")
+        # Detached adoption worktrees have no symbolic branch for
+        # .project_setting to inspect.  Pin the known develop stream and the
+        # observed generated-data revision so project preparation is
+        # reproducible and cannot silently advance the P4 baseline.
+        command_env.setdefault("GIT_BRANCH", "develop")
+        if generated_data_revision and str(generated_data_revision).isdigit():
+            command_env.setdefault(
+                "CLIENT_DATA_COMMIT_ID", str(generated_data_revision)
+            )
     xref_command = (rebar3_executable, "xref") if rebar3_executable else ()
-    dialyzer_task_command = (rebar3_executable, "dialyzer") if rebar3_executable else ()
+    dialyzer_task_command = project_dialyzer_command or (
+        (rebar3_executable, "dialyzer") if rebar3_executable else ()
+    )
     tools = (
         ToolInfo(
             "otp",
@@ -1966,9 +1999,11 @@ def discover_toolchain(
         dialyzer_invocation=dialyzer_probe_command,
         xref_command=xref_command,
         dialyzer_command=dialyzer_task_command,
+        project_compile_command=project_compile_command,
+        project_dialyzer_command=project_dialyzer_command,
         dependency_roots=dependency_roots,
         plt_identity=plt_identity,
-        environment=_redacted_environment(supplied_env),
+        environment=_redacted_environment(command_env),
         tools=tools,
         diagnostics=tuple(diagnostics),
     )
@@ -2921,7 +2956,11 @@ class XrefAdapter(_BaseAdapter):
     tool_name = "xref"
 
     def __init__(
-        self, toolchain: ToolchainIdentity, *, command: Sequence[str] | None = None, **kwargs: Any
+        self,
+        toolchain: ToolchainIdentity,
+        *,
+        command: Sequence[str] | None = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(toolchain, **kwargs)
         self.command = tuple(command or toolchain.xref_command)
@@ -2945,29 +2984,63 @@ class XrefAdapter(_BaseAdapter):
             environment=self.environment,
             timeout=self.timeout,
         )
+        # rebar3 deliberately returns non-zero when its configured xref
+        # checks find warnings.  That is a successful diagnostic run, not a
+        # missing/broken xref executable.  Classify it as usable only when the
+        # output carries xref-tagged diagnostics and no fatal command error.
+        clean_output = _ANSI_ESCAPE_RE.sub("", "\n".join((result.stdout, result.stderr)))
+        xref_warning_run = bool(
+            result.returncode != 0
+            and _XREF_WARNING_RE.search(clean_output)
+            and not _XREF_FATAL_RE.search(clean_output)
+        )
         status = STATUS_OK
         if result.returncode == 124:
             status = STATUS_TIMEOUT
         elif result.returncode == 127:
             status = STATUS_UNAVAILABLE
-        elif result.returncode != 0:
+        elif result.returncode != 0 and not xref_warning_run:
             status = STATUS_FAILED
-        provenance = _make_provenance(key, status=status, command=self.command, result=result)
+        provenance = _make_provenance(
+            key,
+            status=status,
+            command=self.command,
+            result=result,
+        )
         evidence: list[EvidenceRecord] = []
         diagnostics: list[Diagnostic] = []
-        if status == STATUS_OK and result.stdout.strip():
+        if xref_warning_run:
+            diagnostics.append(
+                _diagnostic(
+                    key,
+                    code="xref_diagnostics",
+                    message=(
+                        "rebar3 xref completed with project diagnostics; "
+                        "the non-zero exit is not treated as tool failure."
+                    ),
+                    status=status,
+                    command=self.command,
+                    result=result,
+                    raw=result.stderr or result.stdout,
+                    severity="warning",
+                    metadata={"returncode": result.returncode},
+                )
+            )
+        if status == STATUS_OK and clean_output.strip():
             recognized = False
             try:
-                if result.stdout.lstrip().startswith(("{", "[")):
+                stdout = _ANSI_ESCAPE_RE.sub("", result.stdout)
+                output = stdout if stdout.strip() else _ANSI_ESCAPE_RE.sub("", result.stderr)
+                if output.lstrip().startswith(("{", "[")):
                     evidence, diagnostics, recognized = _parse_json_output(
-                        result.stdout,
+                        output,
                         key=key,
                         provenance=provenance,
                         default_kind="DEPENDS_ON",
                         module_level=True,
                     )
                 else:
-                    for raw_line in result.stdout.splitlines():
+                    for raw_line in output.splitlines():
                         line = raw_line.strip()
                         if not line:
                             continue
@@ -2984,6 +3057,22 @@ class XrefAdapter(_BaseAdapter):
                                     raw=line,
                                 )
                             )
+                            recognized = True
+                            continue
+                        if _XREF_WARNING_RE.search(line):
+                            diagnostics.append(
+                                _diagnostic(
+                                    key,
+                                    code="xref_warning",
+                                    message=line,
+                                    status=status,
+                                    command=self.command,
+                                    result=result,
+                                    raw=line,
+                                    severity="warning",
+                                )
+                            )
+                            recognized = True
                             continue
                         relation = _XREF_RELATION_RE.match(line)
                         if relation:
@@ -3014,7 +3103,7 @@ class XrefAdapter(_BaseAdapter):
                                 status=status,
                                 command=self.command,
                                 result=result,
-                                raw=result.stdout,
+                                raw=output,
                                 severity="info",
                             )
                         )
@@ -3031,7 +3120,7 @@ class XrefAdapter(_BaseAdapter):
                         status=status,
                         command=self.command,
                         result=result,
-                        raw=result.stdout,
+                        raw=output,
                     )
                 )
         elif status != STATUS_OK:
@@ -3382,6 +3471,50 @@ def _adapter_failure(
     )
 
 
+def _project_preparation_failure(
+    toolchain: ToolchainIdentity,
+    query: EnrichmentQuery,
+    result: CommandResult,
+) -> AdapterResult:
+    """Return a blocking result when project generation fails."""
+    key = AnalysisKey.from_toolchain(toolchain, query.tool, query.query_kind, query.targets)
+    status = (
+        STATUS_TIMEOUT
+        if result.returncode == 124
+        else STATUS_UNAVAILABLE
+        if result.returncode == 127
+        else STATUS_FAILED
+    )
+    provenance = _make_provenance(
+        key,
+        status=status,
+        command=toolchain.project_compile_command,
+        result=result,
+        details={"project_preparation": True},
+    )
+    diagnostic = _diagnostic(
+        key,
+        code=f"project_compile_{status}",
+        message=(
+            "Project preparation command failed before semantic analysis: "
+            + (result.stderr or result.stdout or "no diagnostic output")
+        ),
+        status=status,
+        command=toolchain.project_compile_command,
+        result=result,
+        raw=result.stderr or result.stdout,
+    )
+    return AdapterResult(
+        tool=query.tool,
+        status=status,
+        provenance=provenance,
+        diagnostics=(diagnostic,),
+        command=toolchain.project_compile_command,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+
+
 def run_erlang_enrichment(
     repo_root: str | Path,
     *,
@@ -3401,6 +3534,7 @@ def run_erlang_enrichment(
     include_dialyzer: bool = False,
     plt_path: str | Path | None = None,
     expected_otp_version: str | None = None,
+    prepare_project: bool = False,
 ) -> EnrichmentResult:
     """Run bounded Erlang semantic enrichment and reconcile its evidence.
 
@@ -3409,7 +3543,8 @@ def run_erlang_enrichment(
     dependency: callers receive immutable records and decide how (or whether)
     to project them into graph edges.  ELP is run only for explicit ``queries``
     or ``targets``.  xref and Dialyzer are opt-in because both may execute
-    project-level rebar3 tasks.
+    project-level tasks.  ``prepare_project`` is reserved for a project
+    profile whose manifest declares an authoritative generation entrypoint.
     """
     root = Path(repo_root).expanduser().resolve()
     if toolchain is None:
@@ -3479,6 +3614,30 @@ def run_erlang_enrichment(
     failures = False
     processed_scopes: set[tuple[str, str, tuple[str, ...]]] = set()
     reconciler = EvidenceReconciler()
+
+    if prepare_project and toolchain.project_compile_command:
+        preparation = _command_result(
+            runner or run_command,
+            toolchain.project_compile_command,
+            root=root,
+            environment=dict(toolchain.environment) or _controlled_environment(environment),
+            timeout=timeout,
+        )
+        if preparation.returncode != 0:
+            failed_results = tuple(
+                _project_preparation_failure(toolchain, query, preparation)
+                for query in query_values
+            )
+            return EnrichmentResult(
+                toolchain=toolchain,
+                diagnostics=tuple(
+                    diagnostic
+                    for result in failed_results
+                    for diagnostic in result.diagnostics
+                ),
+                adapter_results=failed_results,
+                status=STATUS_FAILED,
+            )
 
     for query in query_values:
         scope = (query.tool, query.query_kind, query.targets)

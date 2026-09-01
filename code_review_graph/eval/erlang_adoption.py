@@ -497,7 +497,9 @@ def _load_corpus_artifact(
     return load_corpus(path), path.resolve()
 
 
-def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationConfig | None:
+def _manifest_erlang_config(
+    manifest: Mapping[str, Any], target_root: str | Path | None = None
+) -> ErlangIntegrationConfig | None:
     """Build the strict project profile declared by the evaluation manifest."""
     adapters = manifest.get("adapters")
     if not isinstance(adapters, Mapping):
@@ -514,13 +516,25 @@ def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationCon
     expected_otp = runtime_values.get("otp_version") or runtime_values.get("otp_release")
     plt = tool_values.get("plt")
     plt_path = plt.get("path") if isinstance(plt, Mapping) else None
-    if isinstance(plt_path, str):
+    if isinstance(plt_path, str) and not Path(plt_path).is_absolute():
         target = manifest.get("target")
         target_path = target.get("path") if isinstance(target, Mapping) else None
-        if isinstance(target_path, str) and not Path(plt_path).is_absolute():
-            plt_path = str(Path(target_path) / plt_path)
+        root = target_root or target_path
+        if isinstance(root, (str, Path)):
+            plt_path = str(Path(root).expanduser().resolve(strict=False) / plt_path)
     tools = tool_values.get("tools")
     versions = tools if isinstance(tools, Mapping) else {}
+    workflow = tool_values.get("project_workflow")
+    workflow_values = workflow if isinstance(workflow, Mapping) else {}
+
+    def command(name: str) -> tuple[str, ...]:
+        value = workflow_values.get(name)
+        if not isinstance(value, Mapping):
+            return ()
+        raw = value.get("command")
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        return tuple(str(item) for item in raw)
     evaluation = manifest.get("evaluation")
     evaluation_values = evaluation if isinstance(evaluation, Mapping) else {}
     semantic_timeout = evaluation_values.get("semantic_timeout_seconds", 15.0)
@@ -547,6 +561,9 @@ def _manifest_erlang_config(manifest: Mapping[str, Any]) -> ErlangIntegrationCon
         strict_dialyzer_version=version("dialyzer"),
         plt_path=plt_path,
         timeout=semantic_timeout,
+        project_compile_command=command("preparation"),
+        project_dialyzer_command=command("dialyzer"),
+        require_project_entrypoints=bool(workflow_values),
     )
 
 
@@ -6908,7 +6925,7 @@ def run_adoption_evaluation(
     effective_erlang_config = (
         erlang_config
         if erlang_config is not None
-        else _manifest_erlang_config(manifest_doc)
+        else _manifest_erlang_config(manifest_doc, root)
     )
     observed_diagnostic_codes = {
         str(item.get("code"))
