@@ -3645,6 +3645,16 @@ def _lifecycle_parity_from_evidence(
         graph_changed = payload.get("graph_changed") if isinstance(payload, Mapping) else None
         baseline = _valid_fingerprint(item.get("baseline_fingerprint"))
         observed = _valid_fingerprint(item.get("observed_fingerprint"))
+        edit_evidence_present = any(
+            key in item for key in ("temporary_source_mutation", "source_restored")
+        )
+        edit_evidence_ok = (
+            not edit_evidence_present
+            or (
+                item.get("temporary_source_mutation") is True
+                and item.get("source_restored") is True
+            )
+        )
         expected = (
             item.get("update_evidence") is True
             and isinstance(errors, list)
@@ -3658,6 +3668,7 @@ def _lifecycle_parity_from_evidence(
             and baseline is not None
             and observed is not None
             and baseline == observed
+            and edit_evidence_ok
         )
     elif phase == "standalone_postprocess":
         reference = _valid_fingerprint(item.get("reference_fingerprint"))
@@ -3922,6 +3933,82 @@ def _materialize_forget_mirror(root: Path, mirror_root: Path) -> None:
             symlinks=True,
             ignore=shutil.ignore_patterns(".code-review-graph", ".self_key"),
         )
+
+
+def _run_isolated_incremental_update(
+    root: Path,
+    temp_root: Path,
+    target: str,
+    *,
+    erlang_config: Any,
+) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
+    """Exercise one real incremental update without writing the target.
+
+    The graph built for the adoption queries remains rooted at the immutable
+    target checkout.  A separate disposable mirror gets its own full build so
+    that incremental reconciliation sees matching file identities and hashes.
+    """
+    relative_target = _relative_path(target, root).replace("\\", "/")
+    parts = tuple(part for part in relative_target.split("/") if part)
+    if not parts or relative_target.startswith("/") or ".." in parts:
+        raise ValueError(f"incremental target is not contained by repository root: {target!r}")
+
+    with tempfile.TemporaryDirectory(
+        prefix="crg-incremental-smoke-", dir=str(temp_root)
+    ) as context:
+        context_root = Path(context)
+        mirror_root = context_root / "repo"
+        _materialize_forget_mirror(root, mirror_root)
+        candidate = mirror_root.joinpath(*parts)
+        original = candidate.read_bytes()
+        marker = b"\n% code-review-graph incremental smoke\n"
+        evidence: dict[str, Any] = {
+            "temporary_source_mutation": True,
+            "source_restored": False,
+            "source": relative_target,
+        }
+        mirror_store = GraphStore(context_root / "graph.db")
+        try:
+            build_result = _lifecycle_call(
+                full_build,
+                mirror_root,
+                mirror_store,
+                erlang_config=erlang_config,
+            )
+            build_payload = _checked_lifecycle_result(
+                build_result, "full_build", reject_errors=False
+            )
+            build_errors = build_payload.get("errors")
+            if isinstance(build_errors, list) and build_errors:
+                raise RuntimeError(
+                    f"incremental smoke mirror build reported {len(build_errors)} error(s)"
+                )
+            baseline_fingerprint = _portable_graph_fingerprint(mirror_store, mirror_root)
+            candidate.write_bytes(original + marker)
+            try:
+                update_result = _lifecycle_call(
+                    incremental_update,
+                    mirror_root,
+                    mirror_store,
+                    changed_files=[relative_target],
+                    erlang_config=erlang_config,
+                )
+                update_payload = _checked_lifecycle_result(
+                    update_result, "incremental_update"
+                )
+            finally:
+                candidate.write_bytes(original)
+                evidence["source_restored"] = candidate.read_bytes() == original
+            observed_fingerprint = _portable_graph_fingerprint(mirror_store, mirror_root)
+            return update_payload, baseline_fingerprint, observed_fingerprint, evidence
+        finally:
+            if not evidence["source_restored"]:
+                try:
+                    candidate.write_bytes(original)
+                    evidence["source_restored"] = candidate.read_bytes() == original
+                except (OSError, PermissionError):
+                    pass
+            mirror_store.close()
 
 
 def _checkout_snapshot(root: Path) -> str:
@@ -4195,7 +4282,7 @@ def _run_lifecycle(
             )
             return store, lifecycle, timings, diagnostics
 
-        baseline_fingerprint = graph_fingerprint(store, root)
+        baseline_fingerprint = _portable_graph_fingerprint(store, root)
         if lifecycle_runner is None:
             # Keep an exact snapshot of the completed full-build graph.  The
             # standalone phase must converge to this graph after applying the
@@ -4225,15 +4312,59 @@ def _run_lifecycle(
         incremental_targets = _preferred_lifecycle_sources(source_files, root)[:1]
 
         started = time.perf_counter()
+        incremental_edit: dict[str, Any] = {
+            "temporary_source_mutation": False,
+            "source_restored": False,
+        }
+        isolated_update_fingerprints: tuple[str, str] | None = None
         try:
+            update_result: Any | None = None
             if lifecycle_runner is None:
-                update_result = _lifecycle_call(
-                    incremental_update,
-                    root,
-                    store,
-                    changed_files=incremental_targets,
-                    erlang_config=erlang_config,
-                )
+                if incremental_targets:
+                    try:
+                        (
+                            update_result,
+                            isolated_baseline,
+                            isolated_observed,
+                            incremental_edit,
+                        ) = _run_isolated_incremental_update(
+                            root,
+                            temp_root,
+                            incremental_targets[0],
+                            erlang_config=erlang_config,
+                        )
+                        isolated_update_fingerprints = (
+                            isolated_baseline,
+                            isolated_observed,
+                        )
+                    except Exception as exc:
+                        diagnostics.append(
+                            _diagnostic(
+                                "incremental_update_failed",
+                                "error",
+                                "Incremental lifecycle phase failed in a disposable mirror.",
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                        )
+                        update_result = {
+                            "files_updated": 0,
+                            "total_nodes": 0,
+                            "total_edges": 0,
+                            "changed_files": incremental_targets,
+                            "dependent_files": [],
+                            "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
+                            "graph_changed": False,
+                        }
+                if not incremental_edit["temporary_source_mutation"]:
+                    incremental_targets = []
+                if not incremental_targets and update_result is None:
+                    update_result = _lifecycle_call(
+                        incremental_update,
+                        root,
+                        store,
+                        changed_files=[],
+                        erlang_config=erlang_config,
+                    )
             else:
                 update_result = _invoke_with_optional_config(
                     lifecycle_runner,
@@ -4245,7 +4376,10 @@ def _run_lifecycle(
                 )
             update_payload = _checked_lifecycle_result(update_result, "incremental_update")
             update_duration = time.perf_counter() - started
-            update_fingerprint = graph_fingerprint(store, root)
+            if isolated_update_fingerprints is None:
+                update_fingerprint = _portable_graph_fingerprint(store, root)
+            else:
+                _isolated_baseline, update_fingerprint = isolated_update_fingerprints
             raw_files_updated = update_payload.get("files_updated")
             files_updated = (
                 raw_files_updated
@@ -4276,6 +4410,7 @@ def _run_lifecycle(
                 "update_evidence": files_updated > 0,
                 "baseline_fingerprint": baseline_fingerprint,
                 "observed_fingerprint": update_fingerprint,
+                **incremental_edit,
             }
             if isinstance(update_payload.get("stage_timing"), Mapping):
                 lifecycle["incremental_update"]["stage_timing"] = dict(
@@ -6757,6 +6892,29 @@ def validate_evaluation_result(
                         "result.lifecycle.incremental_update: positive update evidence "
                         "requires changed_files and graph_changed=true"
                     )
+                edit_evidence_present = any(
+                    key in item
+                    for key in ("temporary_source_mutation", "source_restored", "source")
+                )
+                if edit_evidence_present:
+                    for field in ("temporary_source_mutation", "source_restored"):
+                        if not isinstance(item.get(field), bool):
+                            raise ValueError(
+                                f"result.lifecycle.incremental_update.{field}: "
+                                "expected boolean"
+                            )
+                    source = item.get("source")
+                    if item["temporary_source_mutation"] and (
+                        not isinstance(source, str) or not source
+                    ):
+                        raise ValueError(
+                            "result.lifecycle.incremental_update.source: "
+                            "required for temporary source mutation"
+                        )
+                    if source is not None and not isinstance(source, str):
+                        raise ValueError(
+                            "result.lifecycle.incremental_update.source: expected string"
+                        )
             elif name == "standalone_postprocess":
                 for field in ("idempotence", "reference_match"):
                     if not isinstance(item.get(field), bool):

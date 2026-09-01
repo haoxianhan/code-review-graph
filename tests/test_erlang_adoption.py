@@ -17,6 +17,7 @@ from code_review_graph.eval.erlang_adoption import (
     _available_semantic_tools,
     _case_tool_reason,
     _checked_lifecycle_result,
+    _checkout_snapshot,
     _lifecycle_parity_from_evidence,
     _manifest_erlang_config,
     _materialize_forget_mirror,
@@ -122,6 +123,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, dict, dict]:
 def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path, monkeypatch):
     repo, manifest, corpus = _fixture(tmp_path)
     monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    target_snapshot = _checkout_snapshot(repo)
 
     result = run_adoption_evaluation(manifest, corpus, probe_root=tmp_path)
 
@@ -135,6 +137,12 @@ def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path,
     assert result["metrics"]["latency"]["by_operation"]["targeted_query"]["p95_ms"] is not None
     assert result["lifecycle"]["full_build"]["status"] == "executed"
     assert result["lifecycle"]["incremental_update"]["status"] == "executed"
+    assert result["lifecycle"]["incremental_update"]["temporary_source_mutation"] is True
+    assert result["lifecycle"]["incremental_update"]["source_restored"] is True
+    assert (repo / "src" / "worker.erl").read_bytes() == (
+        b"-module(worker).\n-export([run/0]).\nrun() -> ok.\n"
+    )
+    assert _checkout_snapshot(repo) == target_snapshot
     assert result["lifecycle"]["standalone_postprocess"]["status"] == "executed"
     assert result["lifecycle"]["forget"]["status"] == "executed"
     assert result["lifecycle"]["watch"]["status"] == "not_run"
@@ -772,6 +780,7 @@ def test_validator_rejects_inconsistent_incremental_evidence(tmp_path: Path, mon
     forged = copy.deepcopy(result)
     incremental = forged["lifecycle"]["incremental_update"]
     # A zero-file update cannot claim that update evidence was observed.
+    incremental["result"]["files_updated"] = 0
     incremental["update_evidence"] = True
     with pytest.raises(ValueError, match="incremental_update.update_evidence"):
         validate_evaluation_result(forged)
