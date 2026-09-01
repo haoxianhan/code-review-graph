@@ -2625,12 +2625,21 @@ def incremental_update(
     }
     try:
         stage_started = time.perf_counter()
-        erlang_result = _run_erlang_lifecycle(
-            repo_root,
-            store,
-            config=erlang_config,
-            changed_files=list(changed_files),
-            force=layout_changed,
+        # A preparation command can touch generated Erlang files without
+        # changing their bytes.  Watchdog still reports those writes, but
+        # restarting the strict semantic chain for each one would make the
+        # project's own build recursively retrigger itself.  Hash changes,
+        # deletions, and layout changes remain semantic triggers.
+        erlang_result = (
+            _run_erlang_lifecycle(
+                repo_root,
+                store,
+                config=erlang_config,
+                changed_files=list(changed_files),
+                force=layout_changed,
+            )
+            if files_updated > 0 or layout_changed
+            else None
         )
         stage_timing["erlang_integration_s"] = max(
             0.0, round(time.perf_counter() - stage_started, 6)

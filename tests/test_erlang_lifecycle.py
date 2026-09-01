@@ -148,6 +148,42 @@ def test_erlang_noop_update_skips_header_resolver(tmp_path, monkeypatch):
         store.close()
 
 
+def test_erlang_unchanged_event_does_not_restart_semantic_lifecycle(tmp_path, monkeypatch):
+    """A generated write with identical bytes must not retrigger preparation."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_fixture(repo)
+    store = GraphStore(repo / "graph.db")
+    calls: list[list[str]] = []
+
+    try:
+        full_build(repo, store)
+
+        def fake_lifecycle(*_args, **kwargs):
+            calls.append(list(kwargs["changed_files"]))
+            return {"status": "ok"}
+
+        monkeypatch.setattr(
+            "code_review_graph.incremental._run_erlang_lifecycle", fake_lifecycle
+        )
+
+        unchanged = incremental_update(repo, store, changed_files=["src/sample.erl"])
+        assert unchanged["files_updated"] == 0
+        assert calls == []
+
+        source = repo / "src" / "sample.erl"
+        source.write_text(
+            source.read_text(encoding="utf-8") + "\nchanged() -> ok.\n",
+            encoding="utf-8",
+        )
+        changed = incremental_update(repo, store, changed_files=["src/sample.erl"])
+        assert changed["files_updated"] == 1
+        assert calls == [["src/sample.erl"]]
+    finally:
+        store.close()
+
+
 def test_full_build_postprocess_reuses_header_resolution(tmp_path, monkeypatch):
     """The full-build boundary must not scan Erlang headers twice."""
     monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
