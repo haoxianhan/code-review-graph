@@ -22,6 +22,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3717,12 +3718,7 @@ def _fresh_forget_fingerprint(
 
     with tempfile.TemporaryDirectory(prefix="crg-forget-baseline-", dir=str(temp_root)) as context:
         mirror_root = Path(context) / "repo"
-        shutil.copytree(
-            root,
-            mirror_root,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".code-review-graph"),
-        )
+        _materialize_forget_mirror(root, mirror_root)
         mirror_target = mirror_root.joinpath(*relative_parts)
         if mirror_target.is_symlink() or mirror_target.is_file():
             mirror_target.unlink()
@@ -3764,6 +3760,152 @@ def _fresh_forget_fingerprint(
             return _portable_graph_fingerprint(baseline_store, mirror_root)
         finally:
             baseline_store.close()
+
+
+def _materialize_forget_mirror(root: Path, mirror_root: Path) -> None:
+    """Create a disposable Git-capable mirror for authoritative project commands.
+
+    ``server_flexible``'s ``xserver.sh compile`` starts with Git/submodule
+    operations.  A plain ``copytree`` intentionally omits ``.git`` and makes
+    the command fail before it can establish forget parity.  The clone owns
+    its Git metadata and submodule checkouts, while the source worktree is
+    overlaid without copying credentials or any checkout metadata.
+    """
+    root = _canonical_path(root)
+    mirror_root = Path(mirror_root).expanduser().resolve(strict=False)
+    mirror_root.parent.mkdir(parents=True, exist_ok=True)
+    command_env = dict(os.environ)
+    command_env["GIT_TERMINAL_PROMPT"] = "0"
+
+    def run_git(arguments: Sequence[str], *, timeout: float = 300.0) -> None:
+        try:
+            result = subprocess.run(
+                ["git", *arguments],
+                env=command_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"could not prepare forget mirror with git: {type(exc).__name__}: {exc}"
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "git command failed").strip()
+            raise RuntimeError(
+                f"could not prepare forget mirror with git (exit {result.returncode}): "
+                f"{detail[:1000]}"
+            )
+
+    # ``--shared`` keeps this setup cheap and does not write into the source
+    # repository.  The mirror remains disposable and is removed with its
+    # surrounding TemporaryDirectory.
+    run_git(("clone", "--shared", "--no-checkout", str(root), str(mirror_root)))
+    try:
+        checkout = subprocess.run(
+            ["git", "-C", str(mirror_root), "checkout", "--detach", "HEAD"],
+            env=command_env,
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not checkout forget mirror: {type(exc).__name__}: {exc}"
+        ) from exc
+    if checkout.returncode != 0:
+        detail = (checkout.stderr or checkout.stdout or "git checkout failed").strip()
+        raise RuntimeError(f"could not checkout forget mirror: {detail[:1000]}")
+
+    try:
+        submodules = subprocess.run(
+            ["git", "-C", str(mirror_root), "submodule", "update", "--init", "--depth", "1"],
+            env=command_env,
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not initialize forget mirror submodules: {type(exc).__name__}: {exc}"
+        ) from exc
+    if submodules.returncode != 0:
+        detail = (submodules.stderr or submodules.stdout or "git submodule update failed").strip()
+        raise RuntimeError(f"could not initialize forget mirror submodules: {detail[:1000]}")
+
+    # Identify tracked root submodules so the overlay cannot replace their
+    # freshly initialized checkout with metadata-free source files.
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-s"],
+            env=command_env,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not inspect forget mirror submodules: {type(exc).__name__}: {exc}"
+        ) from exc
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "git ls-files failed").strip()
+        raise RuntimeError(f"could not inspect forget mirror submodules: {detail[:1000]}")
+    root_submodules = {
+        line.split("\t", 1)[1]
+        for line in listed.stdout.splitlines()
+        if line.startswith("160000 ") and "\t" in line
+    }
+    standalone_checkouts = {
+        "apps/server_proto"
+    } if (root / "apps" / "server_proto" / ".git").exists() else set()
+
+    def ignore_overlay(path: str, names: list[str]) -> list[str]:
+        source = Path(path)
+        try:
+            relative = source.relative_to(root).as_posix()
+        except ValueError:
+            relative = ""
+        ignored = {".git", ".code-review-graph", ".self_key"}
+        for name in names:
+            child = f"{relative}/{name}" if relative else name
+            if any(
+                child == submodule or child.startswith(f"{submodule}/")
+                for submodule in root_submodules
+            ):
+                ignored.add(name)
+            if any(
+                child == checkout or child.startswith(f"{checkout}/")
+                for checkout in standalone_checkouts
+            ):
+                ignored.add(name)
+        return [name for name in names if name in ignored]
+
+    shutil.copytree(
+        root,
+        mirror_root,
+        symlinks=True,
+        ignore=ignore_overlay,
+        dirs_exist_ok=True,
+    )
+
+    # ``apps/server_proto`` is a standalone checkout used by the project's
+    # update_submodules script but is not a root Git submodule.  Copy its
+    # independent repository metadata; unlike worktree ``.git`` files, this
+    # directory is self-contained and does not retain a path into the target.
+    for relative in sorted(standalone_checkouts):
+        source_checkout = root / relative
+        mirror_checkout = mirror_root / relative
+        mirror_checkout.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            source_checkout,
+            mirror_checkout,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".code-review-graph", ".self_key"),
+        )
 
 
 def _checkout_snapshot(root: Path) -> str:

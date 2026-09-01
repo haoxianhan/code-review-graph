@@ -19,6 +19,7 @@ from code_review_graph.eval.erlang_adoption import (
     _checked_lifecycle_result,
     _lifecycle_parity_from_evidence,
     _manifest_erlang_config,
+    _materialize_forget_mirror,
     _relation_matches,
     _repository_gates,
     _run_case,
@@ -137,6 +138,19 @@ def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path,
     assert result["lifecycle"]["watch"]["status"] == "not_run"
     assert not (repo / ".code-review-graph").exists()
     validate_evaluation_result(result)
+
+
+def test_forget_mirror_has_independent_git_metadata(tmp_path: Path):
+    repo, _manifest, _corpus = _fixture(tmp_path)
+    (repo / ".self_key").write_text("P4PASSWD=should-not-be-copied\n", encoding="utf-8")
+    mirror = tmp_path / "forget-mirror"
+
+    _materialize_forget_mirror(repo, mirror)
+
+    assert _git(mirror, "rev-parse", "--show-toplevel") == str(mirror)
+    assert _git(mirror, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
+    assert (mirror / ".git").is_dir()
+    assert not (mirror / ".self_key").exists()
 
 
 def test_manifest_can_raise_bounded_semantic_timeout(tmp_path: Path):
