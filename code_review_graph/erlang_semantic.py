@@ -189,7 +189,11 @@ def _safe_timeout(value: float | int | None) -> float:
         timeout = _DEFAULT_TIMEOUT_SECONDS
     if not (timeout > 0.0) or timeout != timeout or timeout == float("inf"):
         return _DEFAULT_TIMEOUT_SECONDS
-    return min(timeout, 300.0)
+    # Project-scoped Erlang preparation can legitimately exceed five minutes
+    # on a cold server_flexible checkout (generation, release compilation,
+    # and dependency work are part of its authoritative command).  Keep a
+    # finite upper bound while allowing that workflow to complete.
+    return min(timeout, 900.0)
 
 
 def _redacted_environment(environment: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:

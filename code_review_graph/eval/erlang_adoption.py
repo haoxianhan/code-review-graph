@@ -544,7 +544,7 @@ def _manifest_erlang_config(
     evaluation_values = evaluation if isinstance(evaluation, Mapping) else {}
     semantic_timeout = evaluation_values.get("semantic_timeout_seconds", 15.0)
     try:
-        semantic_timeout = min(max(float(semantic_timeout), 0.1), 300.0)
+        semantic_timeout = min(max(float(semantic_timeout), 0.1), 900.0)
     except (TypeError, ValueError, OverflowError):
         semantic_timeout = 15.0
 

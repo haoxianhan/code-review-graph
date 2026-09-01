@@ -155,12 +155,12 @@ def test_forget_mirror_has_independent_git_metadata(tmp_path: Path):
 
 def test_manifest_can_raise_bounded_semantic_timeout(tmp_path: Path):
     manifest = load_manifest(DEFAULT_MANIFEST, load_adapters=False)
-    manifest["evaluation"] = {"semantic_timeout_seconds": 300}
+    manifest["evaluation"] = {"semantic_timeout_seconds": 900}
 
     config = _manifest_erlang_config(manifest)
 
     assert config is not None
-    assert config.timeout == 300.0
+    assert config.timeout == 900.0
 
 
 def test_manifest_profile_adds_corpus_probe_for_required_elp(tmp_path: Path):

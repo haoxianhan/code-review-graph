@@ -160,7 +160,7 @@ def _bounded_timeout(value: Any) -> float:
         return _DEFAULT_TIMEOUT
     if parsed <= 0 or parsed != parsed or parsed == float("inf"):
         return _DEFAULT_TIMEOUT
-    return min(parsed, 300.0)
+    return min(parsed, 900.0)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
