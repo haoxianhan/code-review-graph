@@ -15,6 +15,7 @@ from code_review_graph.eval.erlang_adoption import (
     _adoption_gates,
     _aggregate_metrics,
     _available_semantic_tools,
+    _bounded_watch_smoke_timeout,
     _case_tool_reason,
     _checked_lifecycle_result,
     _checkout_snapshot,
@@ -724,6 +725,13 @@ def test_isolated_watch_smoke_timeout_is_bounded_and_cleans_up(tmp_path: Path, m
     with pytest.raises(TimeoutError, match="live phase"):
         _run_isolated_watch_smoke(root, tmp_path, timeout=0.1)
     assert not list(tmp_path.glob("crg-watch-smoke-*"))
+
+
+def test_watch_smoke_timeout_preserves_strict_project_budget():
+    """The live watch window accepts the manifest's multi-minute budget."""
+    assert _bounded_watch_smoke_timeout(1_200.0) == 900.0
+    assert _bounded_watch_smoke_timeout(120.0) == 120.0
+    assert _bounded_watch_smoke_timeout(0.01) == 0.1
 
 
 @pytest.mark.parametrize("field", ["events", "updates", "notifications"])

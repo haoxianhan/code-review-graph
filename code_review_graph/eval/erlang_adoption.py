@@ -4098,6 +4098,15 @@ def _checkout_snapshot(root: Path) -> str:
     return digest.hexdigest()
 
 
+_MAX_WATCH_SMOKE_TIMEOUT = 900.0
+_WATCH_SMOKE_CLEANUP_TIMEOUT = 30.0
+
+
+def _bounded_watch_smoke_timeout(timeout: float) -> float:
+    """Bound the live watch window without truncating strict project work."""
+    return min(max(float(timeout), 0.1), _MAX_WATCH_SMOKE_TIMEOUT)
+
+
 def _run_isolated_watch_smoke(
     root: Path,
     temp_root: Path,
@@ -4112,7 +4121,14 @@ def _run_isolated_watch_smoke(
     transient health marker under its repository root.  The mirror has its own
     graph store and is removed by the caller's temporary-directory lifecycle.
     """
-    bounded_timeout = min(max(float(timeout), 0.1), 30.0)
+    # The watch operation includes the same strict Erlang incremental path as
+    # the rest of the lifecycle.  A configured project may legitimately need
+    # several minutes for one semantic update, so use the manifest's bounded
+    # timeout instead of a fixed 30-second ceiling.  Keep teardown separately
+    # bounded below so an in-flight adapter cannot hold report generation
+    # indefinitely after the smoke deadline expires.
+    bounded_timeout = _bounded_watch_smoke_timeout(timeout)
+    cleanup_timeout = min(bounded_timeout, _WATCH_SMOKE_CLEANUP_TIMEOUT)
     with tempfile.TemporaryDirectory(prefix="crg-watch-smoke-", dir=str(temp_root)) as context:
         context_root = Path(context)
         mirror_root = context_root / "repo"
@@ -4263,7 +4279,7 @@ def _run_isolated_watch_smoke(
         finally:
             stop_event.set()
             if thread is not None and thread.is_alive():
-                thread.join(bounded_timeout)
+                thread.join(cleanup_timeout)
             if thread is None or not thread.is_alive():
                 store.close()
             else:
