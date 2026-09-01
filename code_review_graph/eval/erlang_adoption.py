@@ -4099,7 +4099,6 @@ def _checkout_snapshot(root: Path) -> str:
 
 
 _MAX_WATCH_SMOKE_TIMEOUT = 900.0
-_WATCH_SMOKE_CLEANUP_TIMEOUT = 30.0
 
 
 def _bounded_watch_smoke_timeout(timeout: float) -> float:
@@ -4124,11 +4123,11 @@ def _run_isolated_watch_smoke(
     # The watch operation includes the same strict Erlang incremental path as
     # the rest of the lifecycle.  A configured project may legitimately need
     # several minutes for one semantic update, so use the manifest's bounded
-    # timeout instead of a fixed 30-second ceiling.  Keep teardown separately
-    # bounded below so an in-flight adapter cannot hold report generation
-    # indefinitely after the smoke deadline expires.
+    # timeout instead of a fixed 30-second ceiling.  The same finite budget is
+    # used for teardown so an in-flight adapter cannot close the mirror's
+    # SQLite connection while its worker thread is still executing.
     bounded_timeout = _bounded_watch_smoke_timeout(timeout)
-    cleanup_timeout = min(bounded_timeout, _WATCH_SMOKE_CLEANUP_TIMEOUT)
+    cleanup_timeout = bounded_timeout
     with tempfile.TemporaryDirectory(prefix="crg-watch-smoke-", dir=str(temp_root)) as context:
         context_root = Path(context)
         mirror_root = context_root / "repo"
@@ -4170,6 +4169,9 @@ def _run_isolated_watch_smoke(
         ready_event = threading.Event()
         update_event = threading.Event()
         callback_count = 0
+        callback_active = 0
+        callbacks_idle = threading.Event()
+        callbacks_idle.set()
         callback_lock = threading.Lock()
         failures: list[BaseException] = []
         thread: threading.Thread | None = None
@@ -4197,14 +4199,22 @@ def _run_isolated_watch_smoke(
             reference_fingerprint = _portable_graph_fingerprint(store, mirror_root)
 
             def on_files_updated(updated_store: GraphStore) -> dict[str, Any]:
-                nonlocal callback_count
+                nonlocal callback_active, callback_count
                 with callback_lock:
                     callback_count += 1
-                result = run_post_processing(updated_store, repo_root=mirror_root)
-                if isinstance(result, Mapping) and result.get("warnings"):
-                    raise RuntimeError("watch smoke postprocess returned warnings")
-                update_event.set()
-                return result if isinstance(result, dict) else {}
+                    callback_active += 1
+                    callbacks_idle.clear()
+                try:
+                    result = run_post_processing(updated_store, repo_root=mirror_root)
+                    if isinstance(result, Mapping) and result.get("warnings"):
+                        raise RuntimeError("watch smoke postprocess returned warnings")
+                    update_event.set()
+                    return result if isinstance(result, dict) else {}
+                finally:
+                    with callback_lock:
+                        callback_active -= 1
+                        if callback_active == 0:
+                            callbacks_idle.set()
 
             def run_watcher() -> None:
                 try:
@@ -4257,6 +4267,7 @@ def _run_isolated_watch_smoke(
                 restored = False
             stop_event.set()
             thread.join(max(0.0, min(bounded_timeout, deadline - time.monotonic())))
+            callbacks_idle.wait(max(0.0, min(cleanup_timeout, deadline - time.monotonic())))
             if thread.is_alive():
                 raise TimeoutError("watch smoke did not stop before timeout")
             if failures:
@@ -4280,7 +4291,9 @@ def _run_isolated_watch_smoke(
             stop_event.set()
             if thread is not None and thread.is_alive():
                 thread.join(cleanup_timeout)
-            if thread is None or not thread.is_alive():
+            callbacks_idle.wait(cleanup_timeout)
+            watcher_stopped = thread is None or not thread.is_alive()
+            if watcher_stopped and callbacks_idle.is_set():
                 store.close()
             else:
                 # A filesystem event may already be inside incremental update
@@ -4290,7 +4303,9 @@ def _run_isolated_watch_smoke(
                 # daemon finalizer close it after the watcher exits; the
                 # evaluator still returns within its requested bound.
                 def close_after_watch() -> None:
-                    thread.join()
+                    if thread is not None:
+                        thread.join()
+                    callbacks_idle.wait()
                     store.close()
 
                 threading.Thread(
