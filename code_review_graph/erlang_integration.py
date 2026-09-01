@@ -113,6 +113,32 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off", "disable", "disabled"})
 _MFA_RE = re.compile(r"^(?:(?P<module>[^:/]+):)?(?P<name>[^/]+)/(?P<arity>\d+)$")
 
 
+def _adapter_execution_summary(
+    results: Iterable[Any],
+) -> dict[str, Mapping[str, Any]]:
+    """Expose an aggregate execution status for each semantic adapter."""
+    grouped: dict[str, list[Any]] = {}
+    for result in results:
+        tool = str(getattr(result, "tool", "")).strip().casefold()
+        if tool:
+            grouped.setdefault(tool, []).append(result)
+    summary: dict[str, Mapping[str, Any]] = {}
+    for tool, values in sorted(grouped.items()):
+        statuses = [str(getattr(item, "status", "not_run")).casefold() for item in values]
+        status = "ok" if statuses and all(item == STATUS_OK for item in statuses) else next(
+            (item for item in statuses if item != STATUS_OK), "not_run"
+        )
+        query_kinds = sorted(
+            {
+                str(getattr(getattr(item, "provenance", None), "query_kind", ""))
+                for item in values
+                if getattr(getattr(item, "provenance", None), "query_kind", "")
+            }
+        )
+        summary[tool] = {"status": status, "query_kinds": query_kinds}
+    return summary
+
+
 def _canonical_root(value: str | Path) -> Path:
     try:
         return Path(value).expanduser().resolve(strict=False)
@@ -401,6 +427,7 @@ class ErlangIntegrationResult:
     provenance: Mapping[str, Any] = field(default_factory=dict)
     counts: Mapping[str, int] = field(default_factory=dict)
     toolchain: ToolchainIdentity | None = None
+    adapters: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -421,6 +448,11 @@ class ErlangIntegrationResult:
             "diagnostics": [item.to_dict() for item in self.diagnostics[:_MAX_EVIDENCE]],
             "provenance": _bounded_json_value(dict(self.provenance), _MAX_PROVENANCE_CHARS),
             "counts": {str(key): int(item) for key, item in self.counts.items()},
+            "adapters": {
+                str(name): dict(details)
+                for name, details in sorted(self.adapters.items())
+                if isinstance(details, Mapping)
+            },
         }
         if self.toolchain is not None:
             value["toolchain"] = self.toolchain.to_dict()
@@ -2249,6 +2281,7 @@ def run_erlang_integration(
         provenance=provenance,
         counts=counts,
         toolchain=toolchain,
+        adapters=_adapter_execution_summary(enrichment.adapter_results),
     )
 
     # Keep a compact, deterministic summary for status/query callers.  The

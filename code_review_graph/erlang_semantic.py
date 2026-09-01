@@ -199,7 +199,10 @@ def _redacted_environment(environment: Mapping[str, str] | None) -> tuple[tuple[
     pairs: list[tuple[str, str]] = []
     for raw_key, raw_value in environment.items():
         key = str(raw_key)
-        if any(token in key.upper() for token in ("PASSWORD", "SECRET", "TOKEN", "KEY")):
+        if any(
+            token in key.upper()
+            for token in ("PASSWORD", "PASSWD", "SECRET", "TOKEN", "KEY")
+        ):
             continue
         pairs.append((key, str(raw_value)))
     return tuple(sorted(pairs))
@@ -210,6 +213,7 @@ _CONTROLLED_ENVIRONMENT_KEYS = frozenset(
         "PATH",
         "HOME",
         "USER",
+        "SSH_AUTH_SOCK",
         "LANG",
         "LC_ALL",
         "ERL_LIBS",
@@ -219,6 +223,12 @@ _CONTROLLED_ENVIRONMENT_KEYS = frozenset(
         "REBAR_GLOBAL_CONFIG",
         "REBAR_CACHE_DIR",
         "ELP_HOME",
+        # server_flexible sources these values from its local .self_key.  They
+        # are execution-only inputs for the authoritative project preparation
+        # command; P4PASSWD is excluded from recorded toolchain metadata.
+        "P4PORT",
+        "P4USER",
+        "P4PASSWD",
         "CLIENT_DATA_COMMIT_ID",
         "GIT_BRANCH",
         # ELP installations may be built against a specific OTP release.  A
@@ -3616,11 +3626,13 @@ def run_erlang_enrichment(
     reconciler = EvidenceReconciler()
 
     if prepare_project and toolchain.project_compile_command:
+        project_environment = _controlled_environment(environment)
+        project_environment.update(dict(toolchain.environment))
         preparation = _command_result(
             runner or run_command,
             toolchain.project_compile_command,
             root=root,
-            environment=dict(toolchain.environment) or _controlled_environment(environment),
+            environment=project_environment,
             timeout=timeout,
         )
         if preparation.returncode != 0:

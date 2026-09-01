@@ -27,10 +27,12 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from ..erlang_integration import ErlangIntegrationConfig
+from ..erlang_semantic import EnrichmentQuery
 from ..forget import forget_files
 from ..graph import GraphEdge, GraphNode, GraphStore
 from ..incremental import full_build, incremental_update, watch
@@ -498,7 +500,9 @@ def _load_corpus_artifact(
 
 
 def _manifest_erlang_config(
-    manifest: Mapping[str, Any], target_root: str | Path | None = None
+    manifest: Mapping[str, Any],
+    target_root: str | Path | None = None,
+    corpus: Mapping[str, Any] | None = None,
 ) -> ErlangIntegrationConfig | None:
     """Build the strict project profile declared by the evaluation manifest."""
     adapters = manifest.get("adapters")
@@ -549,9 +553,47 @@ def _manifest_erlang_config(
             return str(value["version"])
         return None
 
+    # A strict adoption lifecycle must execute every required adapter.  The
+    # corpus supplies a stable representative function target for ELP; this
+    # keeps the probe project-scoped without fabricating semantic evidence for
+    # the scoring queries themselves.
+    probe_queries: tuple[EnrichmentQuery, ...] = ()
+    if isinstance(corpus, Mapping):
+        cases = corpus.get("cases")
+        if isinstance(cases, Sequence) and not isinstance(cases, (str, bytes, bytearray)):
+            for case in cases:
+                if not isinstance(case, Mapping):
+                    continue
+                query = case.get("query")
+                target = query.get("target") if isinstance(query, Mapping) else None
+                if not isinstance(target, Mapping):
+                    continue
+                file_name = target.get("file")
+                symbol = target.get("symbol")
+                arity = target.get("arity")
+                if (
+                    isinstance(file_name, str)
+                    and file_name
+                    and isinstance(symbol, str)
+                    and symbol
+                    and isinstance(arity, int)
+                    and not isinstance(arity, bool)
+                    and arity >= 0
+                ):
+                    module = Path(file_name).stem
+                    probe_queries = (
+                        EnrichmentQuery(
+                            "elp",
+                            "enrichment",
+                            (f"{file_name}::{module}.{symbol}/{arity}",),
+                        ),
+                    )
+                    break
+
     return ErlangIntegrationConfig(
         enabled=True,
         strict=True,
+        queries=probe_queries,
         include_xref=True,
         include_dialyzer=True,
         expected_otp=str(expected_otp) if expected_otp else None,
@@ -565,6 +607,16 @@ def _manifest_erlang_config(
         project_dialyzer_command=command("dialyzer"),
         require_project_entrypoints=bool(workflow_values),
     )
+
+
+def _isolate_erlang_cache(
+    config: Any, temp_root: str | Path
+) -> ErlangIntegrationConfig | None:
+    """Keep evaluator-owned semantic cache outside the read-only checkout."""
+    if config is None:
+        return None
+    profile = ErlangIntegrationConfig.from_value(config)
+    return replace(profile, cache_dir=Path(temp_root).resolve() / "erlang-cache")
 
 
 def _invoke_with_optional_config(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -4356,7 +4408,18 @@ def _run_lifecycle(
                         erlang_config=erlang_config,
                     )
                     _checked_lifecycle_result(forget_build_result, "full_build")
-                target = sorted(files)[0]
+                # Forgetting an app descriptor can make the authoritative
+                # project compile fail before CRG can compare graph parity.
+                # Prefer a source/header target while retaining a descriptor
+                # fallback for repositories without Erlang source files.
+                forget_candidates = [
+                    path
+                    for path in files
+                    if _relative_path(path, root).endswith((".erl", ".hrl"))
+                    and not set(_relative_path(path, root).split("/"))
+                    & {"_checkouts", "deps", "_build"}
+                ]
+                target = sorted(forget_candidates or files)[0]
                 started = time.perf_counter()
                 if lifecycle_runner is None:
                     # ``forget_files`` uses ``None`` to mean "consult the
@@ -6925,7 +6988,7 @@ def run_adoption_evaluation(
     effective_erlang_config = (
         erlang_config
         if erlang_config is not None
-        else _manifest_erlang_config(manifest_doc, root)
+        else _manifest_erlang_config(manifest_doc, root, corpus_doc)
     )
     observed_diagnostic_codes = {
         str(item.get("code"))
@@ -6942,6 +7005,9 @@ def run_adoption_evaluation(
         if can_build and not dry_run:
             temp_context = tempfile.TemporaryDirectory(prefix="crg-erlang-adoption-")
             try:
+                lifecycle_erlang_config = _isolate_erlang_cache(
+                    effective_erlang_config, temp_context.name
+                )
                 store, lifecycle, timings, lifecycle_diagnostics = _run_lifecycle(
                     root,
                     Path(temp_context.name),
@@ -6949,7 +7015,7 @@ def run_adoption_evaluation(
                     lifecycle_runner=lifecycle_runner,
                     watch_smoke=watch_smoke,
                     watch_timeout=timeout,
-                    erlang_config=effective_erlang_config,
+                    erlang_config=lifecycle_erlang_config,
                 )
                 diagnostics.extend(lifecycle_diagnostics)
                 build_failed = lifecycle.get("full_build", {}).get("status") in {

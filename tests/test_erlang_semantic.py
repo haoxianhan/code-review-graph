@@ -276,6 +276,43 @@ def test_enrichment_reports_project_preparation_failure(tmp_path: Path):
     assert result.adapter_results[0].diagnostics[0].code == "project_compile_failed"
 
 
+def test_project_preparation_receives_p4_environment_without_recording_password(
+    tmp_path: Path,
+):
+    toolchain = replace(
+        _toolchain(tmp_path),
+        project_compile_command=("./xserver.sh", "compile"),
+    )
+    observed: dict[str, str] = {}
+
+    def run(command, *, cwd, env, timeout):
+        if tuple(command) == toolchain.project_compile_command:
+            observed.update(env)
+        return CommandResult(0, json.dumps({"evidence": []}))
+
+    result = run_erlang_enrichment(
+        tmp_path,
+        toolchain=toolchain,
+        runner=run,
+        environment={
+            "P4PORT": "ssl:p4.example.test:1667",
+            "P4USER": "build-user",
+            "P4PASSWD": "secret-value",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        },
+        queries={"enrichment": "src/demo.erl::demo.run/0"},
+        prepare_project=True,
+    )
+
+    assert result.ok
+    assert observed["P4PORT"] == "ssl:p4.example.test:1667"
+    assert observed["P4USER"] == "build-user"
+    assert observed["P4PASSWD"] == "secret-value"
+    assert observed["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert all("secret-value" not in json.dumps(item.to_dict()) for item in result.diagnostics)
+    assert all("secret-value" not in json.dumps(item.to_dict()) for item in result.adapter_results)
+
+
 def test_dialyzer_rejects_stale_plt_before_running_command(tmp_path: Path):
     plt = tmp_path / "dialyzer.plt"
     plt.write_bytes(b"current")

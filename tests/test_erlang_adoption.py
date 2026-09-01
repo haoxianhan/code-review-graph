@@ -149,6 +149,31 @@ def test_manifest_can_raise_bounded_semantic_timeout(tmp_path: Path):
     assert config.timeout == 300.0
 
 
+def test_manifest_profile_adds_corpus_probe_for_required_elp(tmp_path: Path):
+    manifest = load_manifest(DEFAULT_MANIFEST, load_adapters=False)
+    corpus = {
+        "cases": [
+            {
+                "query": {
+                    "target": {
+                        "file": "apps/demo/src/demo.erl",
+                        "symbol": "run",
+                        "arity": 0,
+                    }
+                }
+            }
+        ]
+    }
+
+    config = _manifest_erlang_config(manifest, corpus=corpus)
+
+    assert config is not None
+    assert config.queries[0].tool == "elp"
+    assert config.queries[0].targets == (
+        "apps/demo/src/demo.erl::demo.run/0",
+    )
+
+
 def test_clause_children_do_not_make_function_anchor_ambiguous(
     tmp_path: Path, monkeypatch,
 ):

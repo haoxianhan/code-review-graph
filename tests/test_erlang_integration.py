@@ -189,6 +189,7 @@ def test_changed_erlang_file_gets_default_targeted_enrichment_query(
             runner=_elp_runner({"evidence": []}, calls),
         )
         assert result.status == "ok"
+        assert result.to_dict()["adapters"]["elp"]["status"] == "ok"
         assert result.counts["queries"] == 1
         assert calls == [
             (
