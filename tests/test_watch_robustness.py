@@ -1243,6 +1243,54 @@ class TestWatchLoop:
                 handler.stop()
             store.close()
 
+    def test_outer_stop_during_callback_does_not_transfer_finalizer_ownership(
+        self, tmp_path
+    ):
+        """An outer shutdown remains the sole finalizer after callback return."""
+        from watchdog.events import FileCreatedEvent
+
+        source = tmp_path / "outer-stop.py"
+        source.write_text("def outer_stop():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        stopper: threading.Thread | None = None
+
+        def blocking_callback(_store):
+            callback_entered.set()
+            release_callback.wait(5)
+
+        handler = _create_watch_handler(tmp_path, store, blocking_callback)
+        try:
+            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0):
+                handler.start()
+                handler.dispatch(FileCreatedEvent(str(source)))
+                assert callback_entered.wait(5), "debounced callback never ran"
+
+                stopper = threading.Thread(target=handler.stop, daemon=True)
+                stopper.start()
+                deadline = time.monotonic() + 5
+                with handler._lifecycle_condition:
+                    while not handler._finalizing and time.monotonic() < deadline:
+                        handler._lifecycle_condition.wait(
+                            timeout=max(0.0, deadline - time.monotonic())
+                        )
+                    assert handler._finalizing
+                    assert handler._finalizer_ident != threading.get_ident()
+
+                release_callback.set()
+                stopper.join(timeout=5)
+                assert not stopper.is_alive(), "outer stop did not finish"
+                assert handler._finalized
+                with handler._lifecycle_condition:
+                    assert not handler._callback_stop_requested
+                handler.raise_if_failed()
+        finally:
+            release_callback.set()
+            if stopper is None or not stopper.is_alive():
+                handler.stop()
+            store.close()
+
     def test_async_base_exception_becomes_a_lifecycle_failure(self, tmp_path):
         """Fatal callback exceptions must not silently kill the debouncer thread."""
         from watchdog.events import FileCreatedEvent

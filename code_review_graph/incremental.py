@@ -3693,6 +3693,7 @@ def _create_watch_handler(
             self._finalizing = False
             self._finalized = False
             self._finalizer_ident: int | None = None
+            self._callback_stop_requested = False
             self._inflight = 0
             self._dispatching = 0
             self._dispatching_local = threading.local()
@@ -3916,8 +3917,17 @@ def _create_watch_handler(
 
         def flush(self) -> None:
             """Request shutdown and drain accepted work exactly once."""
+            callback_active = bool(getattr(self._processing_local, "active", False))
+            if callback_active:
+                # Only a callback that explicitly requested stop may hand
+                # finalization back to the debouncer thread.  An ordinary
+                # outer shutdown sets ``_stopping`` while a callback is
+                # unwinding; letting that callback claim finalization races
+                # the outer thread's join and can deadlock teardown.
+                with self._lifecycle_condition:
+                    self._callback_stop_requested = True
             self.begin_shutdown()
-            if getattr(self._processing_local, "active", False):
+            if callback_active:
                 # The enclosing process/process_debounced call finalizes after
                 # it releases the processor's work lock.  Returning here is
                 # essential for callback re-entry: waiting for that same batch
@@ -3934,7 +3944,10 @@ def _create_watch_handler(
             # as observer callbacks, but the potentially slow parser and user
             # callback run outside the lifecycle lock.
             self._run_batch(events)
-            if self._stopping and not self._finalized:
+            with self._lifecycle_condition:
+                callback_stop_requested = self._callback_stop_requested
+                self._callback_stop_requested = False
+            if callback_stop_requested and not self._finalized:
                 self._finalize_stop(wait_for_other=False)
 
         def process_debounced(self, events: list[FileSystemEvent]) -> None:
@@ -3945,7 +3958,10 @@ def _create_watch_handler(
             # re-entrant case ``flush`` cannot join or drain from the
             # debouncer thread, so the callback thread must hand off to the
             # non-reentrant finalization path after its batch has returned.
-            if self._stopping and not self._finalized:
+            with self._lifecycle_condition:
+                callback_stop_requested = self._callback_stop_requested
+                self._callback_stop_requested = False
+            if callback_stop_requested and not self._finalized:
                 self._finalize_stop(wait_for_other=False)
 
         def finish_initialization(self) -> None:
