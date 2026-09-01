@@ -3,12 +3,12 @@
   "kind": "erlang_performance_report",
   "target": {
     "name": "server_flexible",
-    "revision": "db6f93e95b432efcd1e337159fc3e4a235084476",
-    "generated_data_revision": "57057",
+    "revision": "bff80c584614b455faf0b21eef9362980bec1c55",
+    "generated_data_revision": "59381",
     "manifest": "server_flexible.manifest.json"
   },
   "measurement": {
-    "status": "historical_samples_not_current_baseline",
+    "status": "measured_auxiliary",
     "project_workflow": {
       "preparation_command": ["./xserver.sh", "compile"],
       "dialyzer_command": ["./xserver.sh", "dialyzer"],
@@ -16,9 +16,9 @@
       "baseline_preparation": "completed in disposable worktree"
     },
     "sample_target": {
-      "revision": "bc8a4424ffd70006ba482f15aa7c61199af34b71",
-      "generated_data_revision": "35021",
-      "note": "Timing samples below were collected before the current db6f93e95b432efcd1e337159fc3e4a235084476/57057 strict adoption run and must not be used as current gate evidence."
+      "revision": "bff80c584614b455faf0b21eef9362980bec1c55",
+      "generated_data_revision": "59381",
+      "note": "Samples were collected by the strict adoption evaluator on the pinned origin/develop disposable checkout."
     },
     "machine": "vm-dev",
     "toolchain_baseline": {
@@ -31,45 +31,45 @@
     "kernel": "6.18.45",
     "cpu_count": 8,
     "memory": "23 GiB",
-    "profile_db": "/tmp/crg-profile.db",
+    "profile_db": null,
     "parse_policy": "serial (CRG_SERIAL_PARSE=1)",
-    "warmup": "one completed full build before recorded samples",
-    "implementation_commit": "99db8a4",
-    "sample_scope": "full_build values include full_build + full postprocess; incremental values are one-file updates on a disposable copy; no-op values are empty incremental updates",
-    "cache_policy": "fresh graph for full build; revision-keyed cache rejected when unkeyed",
+    "warmup": "project caches were prepared by the authoritative workflow",
+    "implementation_commit": "aadf280",
+    "sample_scope": "strict adoption evaluator lifecycle samples on a disposable pinned checkout",
+    "cache_policy": "revision-keyed cache rejected when unkeyed",
     "target_files": 1099,
     "erlang_files": 975,
-    "nodes": 47694,
-    "edges": 131175
+    "nodes": null,
+    "edges": null
   },
   "samples": {
-    "full_build": {"status": "measured", "seconds": [28.169474, 27.447808, 26.949014], "p50_seconds": 27.447808, "p95_seconds": 28.097307},
-    "incremental_update": {"status": "measured", "seconds": [5.689000, 5.415779, 5.091224], "p50_seconds": 5.415779, "p95_seconds": 5.661678},
-    "restore_update": {"status": "not_run", "seconds": [], "p50_seconds": null, "p95_seconds": null, "status_note": "No isolated restore-to-HEAD sample was collected after the optimization."},
-    "layout_only": {"status": "not_run", "seconds": [], "reason": "No isolated layout-only lifecycle operation exists in the current evaluator."},
-    "no_op_update": {"status": "measured", "seconds": [0.238000, 0.232887, 0.236981], "p50_seconds": 0.236981, "p95_seconds": 0.237898},
-    "resolve_bare_call_targets": {"status": "measured", "seconds": [2.828000], "p50_seconds": 2.828000, "p95_seconds": 2.828000},
-    "standalone_postprocess": {"status": "measured", "seconds": [10.403000], "p50_seconds": 10.403000, "p95_seconds": 10.403000}
+    "full_build": {"status": "measured", "seconds": [484.451933], "p50_seconds": 484.451933, "p95_seconds": 484.451933},
+    "incremental_update": {"status": "measured", "seconds": [873.734555], "p50_seconds": 873.734555, "p95_seconds": 873.734555},
+    "restore_update": {"status": "not_run", "seconds": [], "p50_seconds": null, "p95_seconds": null, "reason": "The evaluator recorded source restoration inside the incremental lifecycle but not as a separate timed sample."},
+    "layout_only": {"status": "not_run", "seconds": [], "p50_seconds": null, "p95_seconds": null, "reason": "No isolated layout-only lifecycle operation exists in the current evaluator."},
+    "no_op_update": {"status": "not_run", "seconds": [], "p50_seconds": null, "p95_seconds": null},
+    "resolve_bare_call_targets": {"status": "measured", "seconds": [8.666835], "p50_seconds": 8.666835, "p95_seconds": 8.666835},
+    "standalone_postprocess": {"status": "measured", "seconds": [14.794073], "p50_seconds": 14.794073, "p95_seconds": 14.794073}
   },
   "budgets_ms": {"full_build_p95": 30000, "targeted_query_p95": 2000},
   "gates": {
-    "scope": "historical_samples",
-    "full_build_p95": {"observed_ms": 28097.307, "budget_ms": 30000, "pass": true},
-    "targeted_query_p95": {"observed_ms": 299.096, "budget_ms": 2000, "pass": true},
+    "scope": "pinned_origin_develop_disposable_checkout",
+    "full_build_p95": {"observed_ms": 484451.933, "budget_ms": 30000, "pass": false},
+    "targeted_query_p95": {"observed_ms": 303.328, "budget_ms": 2000, "pass": true},
     "layout_only": {"pass": false, "reason": "not_run"},
-    "lifecycle_repeatability": {"pass": false, "reason": "A complete evaluator rerun covering watch, forget, and standalone parity was not completed after the optimization."}
+    "lifecycle_repeatability": {"pass": false, "reason": "Watch smoke did not stop before the 900-second bound."}
   },
   "current_evaluation": {
-    "status": "blocked",
-    "revision": "db6f93e95b432efcd1e337159fc3e4a235084476",
-    "generated_data_revision": "57057",
-    "gates": "not_run",
-    "blocking_reason": "The fixed develop baseline lifecycle stopped at required ./xserver.sh compile because the P4 preparation session was unavailable; semantic and timing gates remain unmeasured."
+    "status": "auxiliary",
+    "revision": "bff80c584614b455faf0b21eef9362980bec1c55",
+    "generated_data_revision": "59381",
+    "gates": "precision_recall_impact_and_semantic_pass; latency_and_watch_fail",
+    "blocking_reason": "Latency budget and watch lifecycle parity are not green."
   },
   "verdict": "auxiliary_review_context_only",
   "limitations": [
-    "Historical lifecycle samples were collected before the strict ELP requirement was installed; rerun required-adapter lifecycle checks before adoption.",
-    "Adapter runtime sandbox policy is descriptive and not enforced by the evaluator.",
-    "Layout-only was not run, and complete lifecycle repeatability remains unverified."
+    "The fixed corpus has one sample per expensive lifecycle operation; repeat sampling is still required for a stable p95.",
+    "The real watch smoke exceeded the 900-second stop bound in the large disposable graph.",
+    "Layout-only remains not_run, and adapter runtime sandbox policy is descriptive rather than enforced by the evaluator."
   ]
 }
