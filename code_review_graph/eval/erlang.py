@@ -551,10 +551,10 @@ def validate_adapter_manifest(manifest: object, source: str = "<adapter-manifest
         )
     if adapter != "generic" and (default_seconds <= 0 or max_seconds <= 0):
         raise _error(f"{source}.timeout", "external adapters require a positive timeout")
-    if max_seconds < default_seconds or max_seconds > 300:
+    if max_seconds < default_seconds or max_seconds > 900:
         raise _error(
             f"{source}.timeout.max_seconds",
-            "must bound the default timeout and be <= 300",
+            "must bound the default timeout and be <= 900",
         )
     if probe_seconds > max_seconds:
         raise _error(

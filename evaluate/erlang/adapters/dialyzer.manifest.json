@@ -33,7 +33,7 @@
   },
   "timeout": {
     "default_seconds": 15,
-    "max_seconds": 300,
+    "max_seconds": 900,
     "version_probe_seconds": 2,
     "on_exceeded": "status_timeout_and_omit_diagnostics",
     "return_code": 124

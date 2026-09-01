@@ -213,7 +213,7 @@ def test_parent_manifest_rejects_child_traversal(tmp_path: Path, child: str):
     [
         ("sandbox", "read_paths", ["../outside"], "must not escape"),
         ("cache", "key_fields", ["repository"], "missing fields"),
-        ("timeout", "max_seconds", 301, "must bound"),
+        ("timeout", "max_seconds", 901, "must bound"),
         ("timeout", "default_seconds", float("nan"), "finite"),
         ("timeout", "max_seconds", float("inf"), "finite"),
     ],
@@ -232,7 +232,7 @@ def test_policy_validator_rejects_unsafe_or_incomplete_contracts(
 def test_policy_validator_rejects_probe_timeout_above_hard_limit():
     source = DEFAULT_ADAPTER_MANIFEST_DIR / "elp.manifest.json"
     manifest = json.loads(source.read_text(encoding="utf-8"))
-    manifest["timeout"]["version_probe_seconds"] = 301
+    manifest["timeout"]["version_probe_seconds"] = 901
 
     with pytest.raises(ValueError, match="must not exceed max_seconds"):
         validate_adapter_manifest(manifest, "elp.manifest.json")
