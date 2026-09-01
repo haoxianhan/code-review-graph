@@ -3324,6 +3324,29 @@ def _case_anchor_paths(case: Mapping[str, Any], root: str | Path = ".") -> list[
     return sorted(paths)
 
 
+def _preferred_lifecycle_sources(paths: Sequence[str], root: Path) -> list[str]:
+    """Choose stable production Erlang sources for lifecycle probes."""
+    normalized = [str(path) for path in paths]
+
+    def relative(path: str) -> str:
+        return _relative_path(path, root).replace("\\", "/")
+
+    production = [
+        path
+        for path in normalized
+        if relative(path).startswith("apps/server_")
+        and "/src/" in relative(path)
+        and relative(path).endswith(".erl")
+    ]
+    source = [
+        path
+        for path in normalized
+        if relative(path).endswith(".erl")
+        and not set(relative(path).split("/")) & {"_checkouts", "deps", "_build"}
+    ]
+    return sorted(production or source or normalized)
+
+
 def _case_tool_reason(case: Mapping[str, Any], available_tools: set[str]) -> str | None:
     query_kind = (
         str(case.get("query", {}).get("kind", "")).casefold()
@@ -3808,13 +3831,19 @@ def _run_isolated_watch_smoke(
             symlinks=True,
             ignore=shutil.ignore_patterns(".git", ".code-review-graph"),
         )
-        source_files = sorted(
-            path
-            for path in mirror_root.rglob("*")
-            if path.is_file()
-            and not path.is_symlink()
-            and path.suffix in {".erl", ".hrl"}
-        )
+        source_files = [
+            Path(path)
+            for path in _preferred_lifecycle_sources(
+                [
+                    str(path)
+                    for path in mirror_root.rglob("*")
+                    if path.is_file()
+                    and not path.is_symlink()
+                    and path.suffix in {".erl", ".hrl"}
+                ],
+                mirror_root,
+            )
+        ]
         if not source_files:
             raise RuntimeError("watch smoke requires an Erlang source file")
 
@@ -4035,7 +4064,7 @@ def _run_lifecycle(
             for path in store.get_all_files()
             if _relative_path(path, root).endswith((".erl", ".hrl", ".app.src"))
         )
-        incremental_targets = source_files[:1]
+        incremental_targets = _preferred_lifecycle_sources(source_files, root)[:1]
 
         started = time.perf_counter()
         try:
@@ -4412,13 +4441,7 @@ def _run_lifecycle(
                 # project compile fail before CRG can compare graph parity.
                 # Prefer a source/header target while retaining a descriptor
                 # fallback for repositories without Erlang source files.
-                forget_candidates = [
-                    path
-                    for path in files
-                    if _relative_path(path, root).endswith((".erl", ".hrl"))
-                    and not set(_relative_path(path, root).split("/"))
-                    & {"_checkouts", "deps", "_build"}
-                ]
+                forget_candidates = _preferred_lifecycle_sources(files, root)
                 target = sorted(forget_candidates or files)[0]
                 started = time.perf_counter()
                 if lifecycle_runner is None:
