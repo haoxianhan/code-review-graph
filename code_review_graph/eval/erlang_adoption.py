@@ -3729,6 +3729,7 @@ def _fresh_forget_fingerprint(
     target: str,
     *,
     erlang_config: Any,
+    runtime_key: Path | None = None,
 ) -> str:
     """Build a clean checkout without *target* and return its graph digest.
 
@@ -3745,7 +3746,12 @@ def _fresh_forget_fingerprint(
 
     with tempfile.TemporaryDirectory(prefix="crg-forget-baseline-", dir=str(temp_root)) as context:
         mirror_root = Path(context) / "repo"
-        _materialize_forget_mirror(root, mirror_root)
+        _materialize_forget_mirror(
+            root,
+            mirror_root,
+            include_runtime_key=runtime_key is not None or (root / ".self_key").is_file(),
+            runtime_key=runtime_key,
+        )
         mirror_target = mirror_root.joinpath(*relative_parts)
         if mirror_target.is_symlink() or mirror_target.is_file():
             mirror_target.unlink()
@@ -3789,7 +3795,13 @@ def _fresh_forget_fingerprint(
             baseline_store.close()
 
 
-def _materialize_forget_mirror(root: Path, mirror_root: Path) -> None:
+def _materialize_forget_mirror(
+    root: Path,
+    mirror_root: Path,
+    *,
+    include_runtime_key: bool = False,
+    runtime_key: Path | None = None,
+) -> None:
     """Create a disposable Git-capable mirror for authoritative project commands.
 
     ``server_flexible``'s ``xserver.sh compile`` starts with Git/submodule
@@ -3919,6 +3931,17 @@ def _materialize_forget_mirror(root: Path, mirror_root: Path) -> None:
         dirs_exist_ok=True,
     )
 
+    if include_runtime_key:
+        source_key = runtime_key or (root / ".self_key")
+        source_key = _canonical_path(source_key)
+        mirror_key = mirror_root / ".self_key"
+        if source_key.is_file() and not mirror_key.exists():
+            # Project scripts source this file for P4 settings.  A symlink
+            # keeps the credential bytes in the user-owned source checkout;
+            # the disposable mirror never receives a copy and the link is
+            # removed with the surrounding temporary directory.
+            mirror_key.symlink_to(source_key)
+
     # ``apps/server_proto`` is a standalone checkout used by the project's
     # update_submodules script but is not a root Git submodule.  Copy its
     # independent repository metadata; unlike worktree ``.git`` files, this
@@ -3941,6 +3964,7 @@ def _run_isolated_incremental_update(
     target: str,
     *,
     erlang_config: Any,
+    runtime_key: Path | None = None,
 ) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
     """Exercise one real incremental update without writing the target.
 
@@ -3959,7 +3983,12 @@ def _run_isolated_incremental_update(
         context_root = Path(context)
         mirror_root = context_root / "repo"
         if (root / ".git").exists():
-            _materialize_forget_mirror(root, mirror_root)
+            _materialize_forget_mirror(
+                root,
+                mirror_root,
+                include_runtime_key=runtime_key is not None or (root / ".self_key").is_file(),
+                runtime_key=runtime_key,
+            )
         else:
             # Small in-memory fixtures do not have project Git metadata.  They
             # still exercise the watcher boundary, while strict project
@@ -3972,7 +4001,12 @@ def _run_isolated_incremental_update(
             )
         candidate = mirror_root.joinpath(*parts)
         original = candidate.read_bytes()
-        marker = b"\n% code-review-graph incremental smoke\n"
+        marker = b" % code-review-graph incremental smoke"
+        mutated = (
+            original[:-1] + marker + b"\n"
+            if original.endswith(b"\n")
+            else original + marker
+        )
         evidence: dict[str, Any] = {
             "temporary_source_mutation": True,
             "source_restored": False,
@@ -3995,7 +4029,7 @@ def _run_isolated_incremental_update(
                     f"incremental smoke mirror build reported {len(build_errors)} error(s)"
                 )
             baseline_fingerprint = _portable_graph_fingerprint(mirror_store, mirror_root)
-            candidate.write_bytes(original + marker)
+            candidate.write_bytes(mutated)
             try:
                 update_result = _lifecycle_call(
                     incremental_update,
@@ -4070,6 +4104,7 @@ def _run_isolated_watch_smoke(
     *,
     timeout: float,
     erlang_config: Any = None,
+    runtime_key: Path | None = None,
 ) -> dict[str, Any]:
     """Run one real watcher cycle against a disposable checkout mirror.
 
@@ -4082,7 +4117,12 @@ def _run_isolated_watch_smoke(
         context_root = Path(context)
         mirror_root = context_root / "repo"
         if (root / ".git").exists():
-            _materialize_forget_mirror(root, mirror_root)
+            _materialize_forget_mirror(
+                root,
+                mirror_root,
+                include_runtime_key=runtime_key is not None or (root / ".self_key").is_file(),
+                runtime_key=runtime_key,
+            )
         else:
             # Small in-memory fixtures do not have project Git metadata. They
             # still exercise the watcher boundary, while strict project
@@ -4253,6 +4293,7 @@ def _run_lifecycle(
     watch_smoke: bool = False,
     watch_timeout: float = 5.0,
     erlang_config: Any = None,
+    runtime_key: Path | None = None,
 ) -> tuple[GraphStore, dict[str, Any], dict[str, Sequence[float]], list[dict[str, Any]]]:
     """Build a temporary graph and exercise bounded non-watch lifecycle paths."""
     store = GraphStore(temp_root / "graph.db")
@@ -4349,6 +4390,7 @@ def _run_lifecycle(
                             temp_root,
                             incremental_targets[0],
                             erlang_config=erlang_config,
+                            runtime_key=runtime_key,
                         )
                         isolated_update_fingerprints = (
                             isolated_baseline,
@@ -4580,6 +4622,7 @@ def _run_lifecycle(
                     temp_root,
                     timeout=watch_timeout,
                     erlang_config=erlang_config,
+                    runtime_key=runtime_key,
                 )
                 if _checkout_snapshot(root) != target_snapshot:
                     raise RuntimeError("isolated watch smoke changed the target checkout")
@@ -4805,6 +4848,7 @@ def _run_lifecycle(
                         temp_root,
                         target,
                         erlang_config=erlang_config,
+                        runtime_key=runtime_key,
                     )
                     forget_parity = (
                         target_absent
@@ -7319,6 +7363,11 @@ def run_adoption_evaluation(
     manifest_target = manifest_doc.get("target", {})
     configured_root = manifest_target.get("path") if isinstance(manifest_target, Mapping) else None
     root = _canonical_path(target_root or str(configured_root or ""))
+    runtime_key: Path | None = None
+    if isinstance(configured_root, str) and configured_root:
+        configured_key = _canonical_path(Path(configured_root) / ".self_key")
+        if configured_key.is_file():
+            runtime_key = configured_key
     # This must precede discover_environment: its observation helpers join
     # manifest/corpus path fields to the target and may read them.
     _validate_artifact_paths(manifest_doc, corpus_doc, root)
@@ -7378,6 +7427,7 @@ def run_adoption_evaluation(
                     watch_smoke=watch_smoke,
                     watch_timeout=timeout,
                     erlang_config=lifecycle_erlang_config,
+                    runtime_key=runtime_key,
                 )
                 diagnostics.extend(lifecycle_diagnostics)
                 build_failed = lifecycle.get("full_build", {}).get("status") in {

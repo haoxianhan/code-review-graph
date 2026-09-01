@@ -164,6 +164,24 @@ def test_forget_mirror_has_independent_git_metadata(tmp_path: Path):
     assert not (mirror / ".self_key").exists()
 
 
+def test_project_mirror_uses_external_runtime_key_without_copying_it(tmp_path: Path):
+    repo, _manifest, _corpus = _fixture(tmp_path)
+    runtime_key = tmp_path / "runtime.self_key"
+    runtime_key.write_text("P4PASSWD=secret\n", encoding="utf-8")
+    mirror = tmp_path / "project-mirror"
+
+    _materialize_forget_mirror(
+        repo,
+        mirror,
+        include_runtime_key=True,
+        runtime_key=runtime_key,
+    )
+
+    assert (mirror / ".self_key").is_symlink()
+    assert (mirror / ".self_key").resolve() == runtime_key.resolve()
+    assert (mirror / ".self_key").read_bytes() == runtime_key.read_bytes()
+
+
 def test_portable_fingerprint_ignores_checkout_scoped_semantic_ids(tmp_path: Path):
     """Equivalent semantic projections from temporary mirrors hash equally."""
     from code_review_graph.graph import GraphStore
@@ -757,7 +775,7 @@ def test_lifecycle_parity_is_derived_from_phase_evidence(tmp_path: Path, monkeyp
         "full_build": lambda item: item["result"]["errors"].append(
             {"message": "forged build error"}
         ),
-        "incremental_update": lambda item: item.update({"parity": True}),
+            "incremental_update": lambda item: item.update({"source_restored": False}),
         "standalone_postprocess": lambda item: item.update(
             {"observed_fingerprint": "f" * 64}
         ),
@@ -783,6 +801,7 @@ def test_validator_rejects_inconsistent_incremental_evidence(tmp_path: Path, mon
     # A zero-file update cannot claim that update evidence was observed.
     incremental["result"]["files_updated"] = 0
     incremental["update_evidence"] = True
+    incremental["parity"] = False
     with pytest.raises(ValueError, match="incremental_update.update_evidence"):
         validate_evaluation_result(forged)
 
