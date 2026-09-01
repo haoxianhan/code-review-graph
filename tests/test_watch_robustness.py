@@ -1355,6 +1355,40 @@ class TestWatchLoop:
             handler.stop()
             store.close()
 
+    def test_finish_initialization_merges_pending_events(self, tmp_path):
+        """Startup events are reconciled in one batch after preparation."""
+        from watchdog.events import FileModifiedEvent
+
+        source_a = tmp_path / "a.py"
+        source_b = tmp_path / "b.py"
+        source_a.write_text("def a():\n    return 1\n", encoding="utf-8")
+        source_b.write_text("def b():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(tmp_path / "graph.db")
+        batches: list[list[str]] = []
+
+        def fake_incremental_update(*_args, **kwargs):
+            batches.append(list(kwargs["changed_files"]))
+            return {"errors": [], "files_updated": len(kwargs["changed_files"])}
+
+        handler = _create_watch_handler(tmp_path, store, None, initializing=True)
+        try:
+            with patch(
+                "code_review_graph.incremental.incremental_update",
+                fake_incremental_update,
+            ):
+                handler.process(
+                    [
+                        FileModifiedEvent(str(source_a)),
+                        FileModifiedEvent(str(source_b)),
+                    ]
+                )
+                handler.finish_initialization()
+
+            assert batches == [["a.py", "b.py"]]
+        finally:
+            handler.stop()
+            store.close()
+
     def test_finalizer_reentry_from_initialization_callback_does_not_deadlock(self, tmp_path):
         """A callback run by finalization must not wait for its own finalizer."""
         from watchdog.events import FileCreatedEvent

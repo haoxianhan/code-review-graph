@@ -3649,6 +3649,11 @@ def _create_watch_handler(
                     if not self._pending_events:
                         self._initializing = False
                         return
+                    # Project preparation can touch many generated Erlang
+                    # files while the observer is already subscribed.  Merge
+                    # the accepted startup events into one batch so strict
+                    # semantic preparation runs once per drain, not once per
+                    # generated file.
                     events = self._pending_events
                     self._pending_events = []
                 self._process_now(events)
