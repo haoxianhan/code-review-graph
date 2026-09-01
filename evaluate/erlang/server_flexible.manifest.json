@@ -7,8 +7,8 @@
     "remote": "ssh://git@ysc2-gitlab.shiyue.com:10022/g_server/server.git"
   },
   "revision": {
-    "requested": "db6f93e95b432efcd1e337159fc3e4a235084476",
-    "observed": "db6f93e95b432efcd1e337159fc3e4a235084476",
+    "requested": "bff80c584614b455faf0b21eef9362980bec1c55",
+    "observed": "bff80c584614b455faf0b21eef9362980bec1c55",
     "working_tree_clean": true,
     "baseline_status": "clean",
     "dirty_paths": []
@@ -48,7 +48,7 @@
     ]
   },
   "generated_data": {
-    "revision": "57057",
+    "revision": "59381",
     "config_version": "a85752be96544fcc5518e193b4397c51",
     "paths": [
       "tools/gen_data/include",
@@ -66,7 +66,7 @@
     },
     "plt": {
       "path": "_build/dialyzer/.dialyzer.plt",
-      "sha256": "1730142f65c9296c34079f4242c7d7f08f1740fe6d619cf976f4b3abc4240a01"
+      "sha256": "c971c38076838b17bf014a15342c993e18cdb001cef637f8f42a972bd83e46f2"
     },
     "runtime": {"otp_release": "27", "otp_version": "27.3.4.16", "erts_version": "15.2.7.12", "executable_path": "/etc/profiles/per-user/haoxian/bin/erl"},
     "project_workflow": {
