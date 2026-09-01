@@ -20,6 +20,8 @@ from code_review_graph.eval.erlang_adoption import (
     _lifecycle_parity_from_evidence,
     _manifest_erlang_config,
     _materialize_forget_mirror,
+    _portable_graph_fingerprint,
+    _portable_graph_value,
     _relation_matches,
     _repository_gates,
     _run_case,
@@ -151,6 +153,60 @@ def test_forget_mirror_has_independent_git_metadata(tmp_path: Path):
     assert _git(mirror, "rev-parse", "HEAD") == _git(repo, "rev-parse", "HEAD")
     assert (mirror / ".git").is_dir()
     assert not (mirror / ".self_key").exists()
+
+
+def test_portable_fingerprint_ignores_checkout_scoped_semantic_ids(tmp_path: Path):
+    """Equivalent semantic projections from temporary mirrors hash equally."""
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.parser import EdgeInfo
+
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+
+    def add_projection(store_path: Path, root: Path, evidence_id: str, analysis_key: str):
+        store = GraphStore(store_path)
+        source = root / "src" / "caller.erl"
+        target = root / "src" / "worker.erl"
+        store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=f"{source}::caller.run/0",
+                target=f"{target}::worker.run/0",
+                file_path=str(source),
+                line=3,
+                extra={
+                    "_crg_erlang_semantic": True,
+                    "_crg_erlang_projection_owned": True,
+                    "_crg_erlang_repository": str(root),
+                    "semantic_evidence_id": evidence_id,
+                    "semantic_evidence_ids": [evidence_id],
+                    "semantic_provenance": {
+                        "repository": str(root),
+                        "analysis_key": analysis_key,
+                        "source_revision": "same-revision",
+                        "tool": "elp",
+                        "tool_version": "same-version",
+                    },
+                },
+            )
+        )
+        store.commit()
+        return store
+
+    first = add_projection(tmp_path / "first.db", first_root, "evidence-a", "analysis-a")
+    second = add_projection(tmp_path / "second.db", second_root, "evidence-b", "analysis-b")
+    try:
+        assert _portable_graph_fingerprint(first, first_root) == _portable_graph_fingerprint(
+            second, second_root
+        )
+        assert _portable_graph_value(
+            {"semantic_evidence_ids": ["a", "b"]}, first_root
+        ) == {"semantic_evidence_ids": ["<stable-evidence-identity>"] * 2}
+    finally:
+        first.close()
+        second.close()
 
 
 def test_manifest_can_raise_bounded_semantic_timeout(tmp_path: Path):

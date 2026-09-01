@@ -1089,7 +1089,7 @@ def graph_fingerprint(store: GraphStore, root: str | Path) -> str:
     return hashlib.sha256(_canonical_json({"nodes": nodes, "edges": edges}).encode()).hexdigest()
 
 
-def _portable_graph_value(value: Any, root: Path) -> Any:
+def _portable_graph_value(value: Any, root: Path, *, _key: str | None = None) -> Any:
     """Normalize checkout-specific path prefixes in graph evidence.
 
     A fresh forget baseline is built in a temporary mirror, so absolute paths
@@ -1099,7 +1099,23 @@ def _portable_graph_value(value: Any, root: Path) -> Any:
     supplied checkout with stable repository-relative spellings.
     """
     if isinstance(value, Mapping):
-        return {key: _portable_graph_value(item, root) for key, item in value.items()}
+        return {
+            key: _portable_graph_value(item, root, _key=str(key))
+            for key, item in value.items()
+        }
+    # Evidence ids and analysis keys are intentionally scoped to a concrete
+    # checkout.  A fresh forget mirror must produce different ids even when
+    # its graph and toolchain evidence are equivalent, so exclude only these
+    # opaque identity values from the portable parity digest.  Keep the
+    # surrounding edge endpoints and substantive provenance fields intact.
+    if _key in {"semantic_evidence_id", "analysis_key"}:
+        return "<stable-evidence-identity>"
+    if _key == "semantic_evidence_ids":
+        if isinstance(value, (list, tuple)):
+            return ["<stable-evidence-identity>"] * len(value)
+        return "<stable-evidence-identity>"
+    if _key in {"repository", "_crg_erlang_repository"}:
+        return "."
     if isinstance(value, list):
         return [_portable_graph_value(item, root) for item in value]
     if isinstance(value, tuple):
