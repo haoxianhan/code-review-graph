@@ -137,6 +137,7 @@ def test_clean_fixture_executes_graph_lifecycle_and_scores_query(tmp_path: Path,
     assert result["metrics"]["latency"]["by_operation"]["targeted_query"]["p95_ms"] is not None
     assert result["lifecycle"]["full_build"]["status"] == "executed"
     assert result["lifecycle"]["incremental_update"]["status"] == "executed"
+    assert result["lifecycle"]["incremental_update"]["parity"] is True
     assert result["lifecycle"]["incremental_update"]["temporary_source_mutation"] is True
     assert result["lifecycle"]["incremental_update"]["source_restored"] is True
     assert (repo / "src" / "worker.erl").read_bytes() == (

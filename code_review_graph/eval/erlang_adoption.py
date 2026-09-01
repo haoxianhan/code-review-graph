@@ -3958,7 +3958,18 @@ def _run_isolated_incremental_update(
     ) as context:
         context_root = Path(context)
         mirror_root = context_root / "repo"
-        _materialize_forget_mirror(root, mirror_root)
+        if (root / ".git").exists():
+            _materialize_forget_mirror(root, mirror_root)
+        else:
+            # Small in-memory fixtures do not have project Git metadata.  They
+            # still exercise the watcher boundary, while strict project
+            # profiles use the Git-capable branch above.
+            shutil.copytree(
+                root,
+                mirror_root,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".code-review-graph", ".self_key"),
+            )
         candidate = mirror_root.joinpath(*parts)
         original = candidate.read_bytes()
         marker = b"\n% code-review-graph incremental smoke\n"
@@ -4070,12 +4081,18 @@ def _run_isolated_watch_smoke(
     with tempfile.TemporaryDirectory(prefix="crg-watch-smoke-", dir=str(temp_root)) as context:
         context_root = Path(context)
         mirror_root = context_root / "repo"
-        shutil.copytree(
-            root,
-            mirror_root,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".code-review-graph"),
-        )
+        if (root / ".git").exists():
+            _materialize_forget_mirror(root, mirror_root)
+        else:
+            # Small in-memory fixtures do not have project Git metadata. They
+            # still exercise the watcher boundary, while strict project
+            # profiles use the Git-capable branch above.
+            shutil.copytree(
+                root,
+                mirror_root,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".code-review-graph", ".self_key"),
+            )
         source_files = [
             Path(path)
             for path in _preferred_lifecycle_sources(
@@ -4337,6 +4354,12 @@ def _run_lifecycle(
                             isolated_baseline,
                             isolated_observed,
                         )
+                        # The incremental smoke graph lives in a disposable
+                        # mirror, so compare its post-update state with that
+                        # mirror's own full-build reference.  The target graph
+                        # may contain checkout-scoped semantic evidence whose
+                        # IDs are intentionally different.
+                        baseline_fingerprint = isolated_baseline
                     except Exception as exc:
                         diagnostics.append(
                             _diagnostic(
