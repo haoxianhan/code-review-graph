@@ -4101,6 +4101,29 @@ def _checkout_snapshot(root: Path) -> str:
 _MAX_WATCH_SMOKE_TIMEOUT = 900.0
 
 
+def _exception_chain_summary(exc: BaseException, *, max_length: int = 2_000) -> str:
+    """Return a bounded, credential-safe summary of an exception chain."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 8:
+        seen.add(id(current))
+        message = str(current).strip()
+        message = re.sub(
+            r"(?i)\b[A-Z0-9_]*(?:password|passwd|secret|token|key)\s*=\s*[^\s;]+",
+            lambda match: match.group(0).split("=", 1)[0] + "=<redacted>",
+            message,
+        )
+        if len(message) > 500:
+            message = message[:497] + "..."
+        parts.append(type(current).__name__ + (f": {message}" if message else ""))
+        current = current.__cause__ or current.__context__
+    summary = " <- ".join(parts) or type(exc).__name__
+    if len(summary) > max_length:
+        return summary[: max_length - 3] + "..."
+    return summary
+
+
 def _bounded_watch_smoke_timeout(timeout: float) -> float:
     """Bound the live watch window without truncating strict project work."""
     return min(max(float(timeout), 0.1), _MAX_WATCH_SMOKE_TIMEOUT)
@@ -4244,7 +4267,10 @@ def _run_isolated_watch_smoke(
             deadline = time.monotonic() + bounded_timeout
             ready = ready_event.wait(max(0.0, deadline - time.monotonic()))
             if failures:
-                raise RuntimeError("watch smoke failed during startup") from failures[0]
+                raise RuntimeError(
+                    "watch smoke failed during startup: "
+                    + _exception_chain_summary(failures[0])
+                ) from failures[0]
             if not ready:
                 raise TimeoutError("watch smoke did not reach its live phase before timeout")
 
@@ -4272,7 +4298,8 @@ def _run_isolated_watch_smoke(
                 raise TimeoutError("watch smoke did not stop before timeout")
             if failures:
                 raise RuntimeError(
-                    "watch smoke failed while processing the trigger"
+                    "watch smoke failed while processing the trigger: "
+                    + _exception_chain_summary(failures[0])
                 ) from failures[0]
             if not updated or not restored or callback_count < 2:
                 raise TimeoutError(

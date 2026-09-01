@@ -19,6 +19,7 @@ from code_review_graph.eval.erlang_adoption import (
     _case_tool_reason,
     _checked_lifecycle_result,
     _checkout_snapshot,
+    _exception_chain_summary,
     _lifecycle_parity_from_evidence,
     _manifest_erlang_config,
     _materialize_forget_mirror,
@@ -732,6 +733,20 @@ def test_watch_smoke_timeout_preserves_strict_project_budget():
     assert _bounded_watch_smoke_timeout(1_200.0) == 900.0
     assert _bounded_watch_smoke_timeout(120.0) == 120.0
     assert _bounded_watch_smoke_timeout(0.01) == 0.1
+
+
+def test_exception_chain_summary_preserves_cause_without_credentials():
+    try:
+        try:
+            raise ValueError("P4_TOKEN=secret-value; parser failed")
+        except ValueError as cause:
+            raise RuntimeError("watch update failed") from cause
+    except RuntimeError as exc:
+        summary = _exception_chain_summary(exc)
+
+    assert "RuntimeError: watch update failed" in summary
+    assert "ValueError: P4_TOKEN=<redacted>" in summary
+    assert "secret-value" not in summary
 
 
 @pytest.mark.parametrize("field", ["events", "updates", "notifications"])
